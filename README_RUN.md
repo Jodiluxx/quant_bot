@@ -99,6 +99,16 @@ $env:BINANCE_FUTURES_TESTNET_API_KEY="..."
 $env:BINANCE_FUTURES_TESTNET_API_SECRET="..."
 ```
 
+Safety Kill Switch v7.16 adds an Autobot safety screen. It can pause new paper
+entries, turn on observe-only mode, block after daily limits, and cool down
+after a series of SL/loss exits.
+
+Optional forced observe-only mode:
+
+```powershell
+$env:BOT_OBSERVE_ONLY="1"
+```
+
 ## Trading note
 
 A working bot is not the same as a safe strategy. Before trading live, test on paper trading and check risk per trade, max drawdown, fees, slippage, and liquidation distance.

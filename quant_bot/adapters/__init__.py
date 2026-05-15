@@ -12,6 +12,7 @@ __all__ = [
     "market_data",
     "paper",
     "risk",
+    "safety",
     "signals",
     "telegram_app",
 ]

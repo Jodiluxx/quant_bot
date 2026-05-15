@@ -14316,7 +14316,367 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.15 Execution Gateway Dry-Run"
+# ============================================================
+# v7.16 — SAFETY KILL SWITCH / OBSERVE-ONLY MODE
+# ============================================================
+# This layer gates new paper entries before they reach execution planning.
+# It does not close existing positions; it prevents the bot from adding risk
+# when the journal says conditions are bad.
+
+_base_paper_candidate_block_reason_v715 = _paper_candidate_block_reason
+_base_paper_open_candidate_v715 = _paper_open_candidate
+_base_paper_close_position_v715 = _paper_close_position
+_base_autobot_keyboard_v715 = autobot_keyboard
+_base_async_handle_update_v715 = async_handle_update
+
+SAFETY_STATE_FILE = "safety_state.json"
+SAFETY_MAX_DAILY_LOSS_PCT = RISK_MAX_DAILY_REALIZED_LOSS_PCT
+SAFETY_MAX_CONSECUTIVE_SL = 3
+SAFETY_COOLDOWN_AFTER_SL_MIN = 240
+_safety_lock_v716 = threading.RLock()
+
+
+def _safety_load_state_v716():
+    try:
+        if os.path.exists(SAFETY_STATE_FILE):
+            with open(SAFETY_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("chats", {})
+                data.setdefault("events", [])
+                return data
+    except Exception as e:
+        print(f"  [safety_v716] load error: {e}")
+    return {"chats": {}, "events": []}
+
+
+def _safety_save_state_v716(state):
+    try:
+        state.setdefault("chats", {})
+        state["events"] = list(state.get("events") or [])[-1000:]
+        with open(SAFETY_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [safety_v716] save error: {e}")
+
+
+def _safety_chat_state_v716(state, chat_id):
+    key = _paper_chat_key(chat_id)
+    chats = state.setdefault("chats", {})
+    chat = chats.setdefault(key, {
+        "observe_only": False,
+        "pause_until": None,
+        "pause_reason": None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return key, chat
+
+
+def _safety_parse_dt_v716(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _safety_record_event_v716(state, chat_key, event_type, payload=None):
+    state.setdefault("events", []).append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "chat_id": str(chat_key),
+        "type": event_type,
+        "payload": payload or {},
+    })
+
+
+def set_safety_observe_only(chat_id, enabled, reason=None):
+    with _safety_lock_v716:
+        state = _safety_load_state_v716()
+        key, chat = _safety_chat_state_v716(state, chat_id)
+        chat["observe_only"] = bool(enabled)
+        chat["observe_reason"] = reason or ("manual" if enabled else None)
+        chat["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _safety_record_event_v716(state, key, "observe_only_on" if enabled else "observe_only_off", {"reason": reason})
+        _safety_save_state_v716(state)
+    return bool(enabled)
+
+
+def set_safety_pause(chat_id, minutes=None, reason=None):
+    minutes = int(minutes or 0)
+    with _safety_lock_v716:
+        state = _safety_load_state_v716()
+        key, chat = _safety_chat_state_v716(state, chat_id)
+        if minutes > 0:
+            until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            chat["pause_until"] = until.isoformat()
+            chat["pause_reason"] = reason or f"manual pause {minutes}m"
+            event_type = "pause_on"
+        else:
+            chat["pause_until"] = None
+            chat["pause_reason"] = None
+            event_type = "pause_off"
+        chat["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _safety_record_event_v716(state, key, event_type, {"minutes": minutes, "reason": reason})
+        _safety_save_state_v716(state)
+    return True
+
+
+def _safety_daily_paper_net_v716(chat_id):
+    today = datetime.now(timezone.utc).date().isoformat()
+    net = 0.0
+    wins = 0
+    losses = 0
+    trades = 0
+    for trade in _paper_closed_trades(chat_id):
+        ts = str(trade.get("closed_at") or trade.get("opened_at") or "")
+        if not ts.startswith(today):
+            continue
+        amount = _safe_float(trade.get("net_usd"), 0) or 0
+        net += amount
+        trades += 1
+        if amount > 0:
+            wins += 1
+        elif amount < 0:
+            losses += 1
+    bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "net_usd": net,
+        "net_pct": net / bal * 100 if bal else 0.0,
+    }
+
+
+def _safety_consecutive_sl_v716(chat_id):
+    trades = sorted(_paper_closed_trades(chat_id), key=_sort_key_v77, reverse=True)
+    count = 0
+    for trade in trades[:20]:
+        reason = str(trade.get("exit_reason") or "").upper()
+        net = _safe_float(trade.get("net_usd"), 0) or 0
+        if "SL" in reason or net < 0:
+            count += 1
+            continue
+        break
+    return count
+
+
+def _safety_active_pause_v716(chat):
+    until = _safety_parse_dt_v716(chat.get("pause_until"))
+    if until and until > datetime.now(timezone.utc):
+        return until
+    return None
+
+
+def _safety_auto_cooldown_if_needed_v716(chat_id, consecutive_sl):
+    if consecutive_sl < SAFETY_MAX_CONSECUTIVE_SL:
+        return None
+    with _safety_lock_v716:
+        state = _safety_load_state_v716()
+        key, chat = _safety_chat_state_v716(state, chat_id)
+        active = _safety_active_pause_v716(chat)
+        if active:
+            return active
+        until = datetime.now(timezone.utc) + timedelta(minutes=SAFETY_COOLDOWN_AFTER_SL_MIN)
+        chat["pause_until"] = until.isoformat()
+        chat["pause_reason"] = f"auto cooldown after {consecutive_sl} consecutive SL/losses"
+        chat["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _safety_record_event_v716(state, key, "auto_pause_after_sl", {
+            "consecutive_sl": consecutive_sl,
+            "minutes": SAFETY_COOLDOWN_AFTER_SL_MIN,
+        })
+        _safety_save_state_v716(state)
+        return until
+
+
+def build_safety_decision(chat_id, candidate=None):
+    state = _safety_load_state_v716()
+    _, chat = _safety_chat_state_v716(state, chat_id)
+    blockers = []
+    warnings = []
+    env_observe = _env_bool_v715("BOT_OBSERVE_ONLY", False) or _env_bool_v715("QUANT_BOT_OBSERVE_ONLY", False)
+    if env_observe or chat.get("observe_only"):
+        blockers.append("режим только наблюдать включён")
+
+    pause_until = _safety_active_pause_v716(chat)
+    if pause_until:
+        left_min = max(1, int((pause_until - datetime.now(timezone.utc)).total_seconds() // 60))
+        blockers.append(f"kill switch пауза активна ещё {left_min} мин")
+
+    today_open = _paper_today_open_count(chat_id)
+    open_count = len(_paper_positions(chat_id))
+    daily = _safety_daily_paper_net_v716(chat_id)
+    consecutive_sl = _safety_consecutive_sl_v716(chat_id)
+    auto_pause_until = _safety_auto_cooldown_if_needed_v716(chat_id, consecutive_sl)
+    if auto_pause_until and not pause_until:
+        left_min = max(1, int((auto_pause_until - datetime.now(timezone.utc)).total_seconds() // 60))
+        blockers.append(f"автопауза после серии SL активна ещё {left_min} мин")
+
+    if today_open >= PAPER_TRADER_MAX_TRADES_PER_DAY:
+        blockers.append(f"дневной лимит сделок достигнут: {today_open}/{PAPER_TRADER_MAX_TRADES_PER_DAY}")
+    if open_count >= PAPER_TRADER_MAX_POSITIONS:
+        blockers.append(f"лимит открытых позиций достигнут: {open_count}/{PAPER_TRADER_MAX_POSITIONS}")
+    if daily["net_pct"] <= -SAFETY_MAX_DAILY_LOSS_PCT:
+        blockers.append(f"дневная paper-просадка {daily['net_pct']:.2f}% достигла лимита -{SAFETY_MAX_DAILY_LOSS_PCT:.2f}%")
+    if consecutive_sl >= max(1, SAFETY_MAX_CONSECUTIVE_SL - 1):
+        warnings.append(f"серия SL/losses: {consecutive_sl}/{SAFETY_MAX_CONSECUTIVE_SL}")
+
+    mode = execution_mode()
+    if mode.get("mode") == "live_off":
+        warnings.append("execution mode live_off: новые биржевые действия запрещены")
+
+    blockers = list(dict.fromkeys(x for x in blockers if x))
+    warnings = list(dict.fromkeys(x for x in warnings if x))
+    return {
+        "allowed": not blockers,
+        "status": "ALLOW" if not blockers else "BLOCK",
+        "blockers": blockers,
+        "warnings": warnings,
+        "open_positions": open_count,
+        "today_open": today_open,
+        "today": daily,
+        "consecutive_sl": consecutive_sl,
+        "observe_only": bool(env_observe or chat.get("observe_only")),
+        "pause_until": chat.get("pause_until"),
+        "pause_reason": chat.get("pause_reason"),
+    }
+
+
+def format_safety_status(chat_id):
+    decision = build_safety_decision(chat_id)
+    icon = "✅" if decision.get("allowed") else "⛔"
+    today = decision.get("today") or {}
+    lines = [
+        "🛑 Safety / Kill Switch v7.16",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Статус новых входов: {icon} {decision.get('status')}",
+        f"Только наблюдать: {'ON' if decision.get('observe_only') else 'OFF'}",
+        f"Открытые позиции: {decision.get('open_positions')}/{PAPER_TRADER_MAX_POSITIONS}",
+        f"Сделок сегодня: {decision.get('today_open')}/{PAPER_TRADER_MAX_TRADES_PER_DAY}",
+        f"Paper PnL сегодня: {today.get('net_usd', 0):+.3f} USDT ({today.get('net_pct', 0):+.2f}%)",
+        f"Серия SL/losses: {decision.get('consecutive_sl')}/{SAFETY_MAX_CONSECUTIVE_SL}",
+    ]
+    pause_until = _safety_parse_dt_v716(decision.get("pause_until"))
+    if pause_until and pause_until > datetime.now(timezone.utc):
+        lines.append(f"Пауза до: {_fmt_dt_short(pause_until.isoformat())}")
+        if decision.get("pause_reason"):
+            lines.append(f"Причина: {decision.get('pause_reason')}")
+    if decision.get("blockers"):
+        lines += ["", "Блокеры:"] + [f"• {x}" for x in decision.get("blockers")[:6]]
+    if decision.get("warnings"):
+        lines += ["", "Предупреждения:"] + [f"• {x}" for x in decision.get("warnings")[:5]]
+    lines += [
+        "",
+        "Смысл: бот не должен «отыгрываться». Если статистика портится, правильное действие — пауза и анализ журнала.",
+    ]
+    return "\n".join(lines)
+
+
+def _paper_candidate_block_reason(chat_id, candidate):
+    reason = _base_paper_candidate_block_reason_v715(chat_id, candidate)
+    if reason:
+        return reason
+    decision = build_safety_decision(chat_id, candidate)
+    if not decision.get("allowed"):
+        return "Safety: " + "; ".join(decision.get("blockers", [])[:2])
+    return None
+
+
+def _paper_open_candidate(chat_id, candidate):
+    decision = build_safety_decision(chat_id, candidate)
+    if not decision.get("allowed"):
+        return None, "Safety заблокировал новую paper-сделку: " + "; ".join(decision.get("blockers", [])[:3])
+    return _base_paper_open_candidate_v715(chat_id, candidate)
+
+
+def _paper_close_position(pos_id, exit_price, reason):
+    trade = _base_paper_close_position_v715(pos_id, exit_price, reason)
+    if trade:
+        try:
+            _safety_auto_cooldown_if_needed_v716(trade.get("chat_id"), _safety_consecutive_sl_v716(trade.get("chat_id")))
+        except Exception as e:
+            print(f"  [safety_v716] close hook error: {e}")
+    return trade
+
+
+def safety_status_keyboard_v716(chat_id):
+    decision = build_safety_decision(chat_id)
+    observe = bool(decision.get("observe_only"))
+    return {"inline_keyboard": [
+        [{"text": "🟡 Выключить observe-only" if observe else "🟡 Включить observe-only", "callback_data": "safety_toggle_observe"}],
+        [
+            {"text": "⛔ Пауза 4 часа", "callback_data": "safety_pause_4h"},
+            {"text": "✅ Снять паузу", "callback_data": "safety_resume"},
+        ],
+        [{"text": "🤖 Назад: Автобот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def autobot_keyboard(chat_id):
+    kb = _base_autobot_keyboard_v715(chat_id)
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [{"text": "🛑 Safety / Kill Switch", "callback_data": "safety_status"}])
+    return {"inline_keyboard": rows}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+
+            if data == "safety_status":
+                await async_answer_callback(session, callback_id, "Safety")
+                await async_send_plain_v76(session, chat_id, format_safety_status(chat_id), safety_status_keyboard_v716(chat_id))
+                return
+            if data == "safety_toggle_observe":
+                decision = build_safety_decision(chat_id)
+                new_value = not bool(decision.get("observe_only"))
+                set_safety_observe_only(chat_id, new_value, "manual toggle")
+                await async_answer_callback(session, callback_id, "Observe ON" if new_value else "Observe OFF")
+                await async_send_plain_v76(session, chat_id, format_safety_status(chat_id), safety_status_keyboard_v716(chat_id))
+                return
+            if data == "safety_pause_4h":
+                set_safety_pause(chat_id, SAFETY_COOLDOWN_AFTER_SL_MIN, "manual 4h pause")
+                await async_answer_callback(session, callback_id, "Пауза")
+                await async_send_plain_v76(session, chat_id, format_safety_status(chat_id), safety_status_keyboard_v716(chat_id))
+                return
+            if data == "safety_resume":
+                set_safety_pause(chat_id, 0, "manual resume")
+                await async_answer_callback(session, callback_id, "Пауза снята")
+                await async_send_plain_v76(session, chat_id, format_safety_status(chat_id), safety_status_keyboard_v716(chat_id))
+                return
+
+        await _base_async_handle_update_v715(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v716] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Kill Switch</b> — аварийная пауза для новых входов. Она нужна не чтобы «чинить рынок», а чтобы не увеличивать риск после плохой серии.
+
+<b>Observe-only</b> — режим «только наблюдать». Бот продолжает анализировать рынок и вести отчёты, но новые paper-сделки не открывает.
+
+<b>Серия SL</b> — несколько закрытий по стопу подряд. После такой серии нельзя пытаться отыграться; сначала нужна пауза и разбор журнала.
+"""
+
+
+BOT_VERSION_LABEL = "v7.16 Safety Kill Switch"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -14358,6 +14718,7 @@ RUNTIME_LAYERS = [
     ("v7.13", "Paper Trader soft timeframe quality weighting from calibrated signal stats"),
     ("v7.14", "Paper Trader realism: slippage, partial TP1, break-even SL, max hold and stale exits"),
     ("v7.15", "Execution Gateway dry-run order plans with live trading blocked"),
+    ("v7.16", "Safety kill switch, observe-only mode and SL-series cooldown"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -14400,6 +14761,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "execution_mode": execution_mode,
     "build_execution_order_plan": build_execution_order_plan,
     "format_execution_status": format_execution_status,
+    "build_safety_decision": build_safety_decision,
+    "format_safety_status": format_safety_status,
     "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
@@ -14474,6 +14837,10 @@ def validate_runtime_architecture():
         errors.append("execution order plan builder is missing")
     if not callable(globals().get("format_execution_status")):
         errors.append("execution status report is missing")
+    if not callable(globals().get("build_safety_decision")):
+        errors.append("safety decision helper is missing")
+    if not callable(globals().get("format_safety_status")):
+        errors.append("safety status report is missing")
     mode = _execution_mode_v715()
     if mode not in EXECUTION_ALLOWED_MODES:
         errors.append(f"invalid execution mode: {mode}")
