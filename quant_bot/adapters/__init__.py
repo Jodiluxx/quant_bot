@@ -8,6 +8,7 @@ from __future__ import annotations
 __all__ = [
     "analytics",
     "backtesting",
+    "execution",
     "market_data",
     "paper",
     "risk",

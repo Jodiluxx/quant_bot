@@ -13861,7 +13861,462 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.14 Paper Trader Realism"
+# ============================================================
+# v7.15 — EXECUTION GATEWAY / DRY-RUN ORDER PLANS
+# ============================================================
+# This layer is deliberately not a live trading connector. It builds a clear
+# order plan, checks risk and records the decision. Testnet submission is a
+# separate future step after the plan journal looks correct.
+
+_base_paper_open_candidate_v714 = _paper_open_candidate
+_base_autobot_keyboard_v714 = autobot_keyboard
+_base_async_handle_update_v714 = async_handle_update
+
+EXECUTION_STATE_FILE = "execution_gateway_state.json"
+EXECUTION_ALLOWED_MODES = {"paper", "dry_run", "testnet", "live_off"}
+EXECUTION_DEFAULT_MODE = "paper"
+EXECUTION_MAX_DAILY_PLANS = PAPER_TRADER_MAX_TRADES_PER_DAY
+EXECUTION_MAX_OPEN_POSITIONS = PAPER_TRADER_MAX_POSITIONS
+BINANCE_FUTURES_TESTNET_REST = os.getenv(
+    "BINANCE_FUTURES_TESTNET_REST",
+    "https://testnet.binancefuture.com",
+).strip()
+_execution_lock_v715 = threading.RLock()
+
+
+def _env_bool_v715(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _execution_mode_v715():
+    raw = (
+        os.getenv("BOT_EXECUTION_MODE")
+        or os.getenv("QUANT_BOT_EXECUTION_MODE")
+        or EXECUTION_DEFAULT_MODE
+    )
+    mode = str(raw or "").strip().lower()
+    if mode in {"live", "mainnet", "real", "prod", "production"}:
+        return "live_off"
+    if mode not in EXECUTION_ALLOWED_MODES:
+        return "live_off"
+    return mode
+
+
+def execution_mode():
+    mode = _execution_mode_v715()
+    key = os.getenv("BINANCE_FUTURES_TESTNET_API_KEY") or os.getenv("BINANCE_TESTNET_API_KEY")
+    secret = os.getenv("BINANCE_FUTURES_TESTNET_API_SECRET") or os.getenv("BINANCE_TESTNET_API_SECRET")
+    return {
+        "mode": mode,
+        "allowed_modes": sorted(EXECUTION_ALLOWED_MODES),
+        "live_orders_enabled": False,
+        "testnet_rest": BINANCE_FUTURES_TESTNET_REST,
+        "testnet_keys_present": bool(key and secret),
+        "testnet_submit_requested": _env_bool_v715("BINANCE_TESTNET_ORDER_SUBMIT", False),
+        "message": "v7.15 строит ордер-планы и журнал, но не отправляет реальные Binance-ордера.",
+    }
+
+
+def _execution_load_state_v715():
+    try:
+        if os.path.exists(EXECUTION_STATE_FILE):
+            with open(EXECUTION_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {
+                    "plans": data.get("plans", []) if isinstance(data.get("plans", []), list) else [],
+                    "events": data.get("events", []) if isinstance(data.get("events", []), list) else [],
+                }
+    except Exception as e:
+        print(f"  [execution_v715] load error: {e}")
+    return {"plans": [], "events": []}
+
+
+def _execution_save_state_v715(state):
+    try:
+        state = {
+            "plans": list(state.get("plans") or [])[-1000:],
+            "events": list(state.get("events") or [])[-1000:],
+        }
+        with open(EXECUTION_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [execution_v715] save error: {e}")
+
+
+def _execution_record_plan_v715(plan):
+    if not isinstance(plan, dict):
+        return None
+    with _execution_lock_v715:
+        state = _execution_load_state_v715()
+        state.setdefault("plans", []).append(plan)
+        state.setdefault("events", []).append({
+            "type": "execution_plan",
+            "ts": plan.get("created_at") or datetime.now(timezone.utc).isoformat(),
+            "chat_id": plan.get("chat_id"),
+            "plan_id": plan.get("plan_id"),
+            "status": plan.get("status"),
+            "mode": plan.get("mode"),
+            "ticker": plan.get("ticker"),
+            "interval": plan.get("interval"),
+            "direction": plan.get("direction"),
+        })
+        _execution_save_state_v715(state)
+    return plan
+
+
+def _execution_last_plans_v715(chat_id=None, limit=5):
+    state = _execution_load_state_v715()
+    rows = list(state.get("plans") or [])
+    if chat_id is not None:
+        key = _paper_chat_key(chat_id)
+        rows = [p for p in rows if str(p.get("chat_id")) == key]
+    rows.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    return rows[:limit]
+
+
+def _execution_today_plan_count_v715(chat_id):
+    today = datetime.now(timezone.utc).date().isoformat()
+    key = _paper_chat_key(chat_id)
+    count = 0
+    for plan in _execution_load_state_v715().get("plans", []):
+        if str(plan.get("chat_id")) == key and str(plan.get("created_at", "")).startswith(today):
+            count += 1
+    return count
+
+
+def _execution_qty_est_v715(entry, notional):
+    entry = _safe_float(entry, 0) or 0
+    notional = _safe_float(notional, 0) or 0
+    return notional / entry if entry > 0 else 0.0
+
+
+def _execution_plan_id_v715(chat_id, ticker, interval, direction, strategy, setup_id=None, setup_slot=None):
+    slot = setup_slot or _paper_setup_slot_v79(interval)
+    clean_strategy = str(strategy or "unknown").replace(" ", "_")[:18]
+    clean_setup = str(setup_id or slot).split(":")[-1]
+    return f"exec:{_paper_chat_key(chat_id)}:{ticker}:{interval}:{direction}:{clean_strategy}:{clean_setup}"
+
+
+def _execution_risk_decision_v715(chat_id, ticker, interval, direction, entry, sl, tp1, tp2, data):
+    rr = 0.0
+    try:
+        rr = abs(tp1 - entry) / max(abs(entry - sl), 0.00000001)
+    except Exception:
+        rr = 0.0
+    risk_levels = {"sl": sl, "tp1": tp1, "tp2": tp2, "rr_ratio": rr}
+    try:
+        return build_trade_risk_decision(chat_id, ticker, interval, direction, entry, risk_levels, data)
+    except Exception as e:
+        return {
+            "allowed": False,
+            "status": "BLOCK",
+            "blockers": [f"risk manager error: {e}"],
+            "warnings": [],
+            "single_risk_usd": 0.0,
+            "single_risk_pct": 0.0,
+            "rr": rr,
+        }
+
+
+def build_execution_order_plan(chat_id, candidate, position=None, already_opened=False):
+    info = execution_mode()
+    mode = info["mode"]
+    candidate = candidate or {}
+    data = candidate.get("data") or {}
+    ep = candidate.get("entry_plan") or {}
+    position = position or {}
+    ticker = position.get("ticker") or candidate.get("ticker")
+    interval = position.get("interval") or candidate.get("interval")
+    direction = str(position.get("direction") or candidate.get("direction") or "").lower()
+    strategy = position.get("strategy") or candidate.get("strategy")
+    entry = _safe_float(position.get("entry_price"), None) or _safe_float(ep.get("live_price"), None) or _safe_float(data.get("price"), None)
+    sl = _safe_float(position.get("sl"), None) or _safe_float(ep.get("sl"), None) or _safe_float((data.get("risk_levels") or {}).get("sl"), None)
+    tp1 = _safe_float(position.get("tp1"), None) or _safe_float(ep.get("tp1"), None) or _safe_float((data.get("risk_levels") or {}).get("tp1"), None)
+    tp2 = _safe_float(position.get("tp2"), None) or _safe_float(ep.get("tp2"), None) or _safe_float((data.get("risk_levels") or {}).get("tp2"), tp1)
+    bal, size_pct, lev, margin, notional = _paper_position_notional(chat_id)
+    if position:
+        bal = _safe_float(position.get("balance"), bal) or bal
+        size_pct = _safe_float(position.get("size_pct"), size_pct) or size_pct
+        lev = int(position.get("leverage") or lev)
+        margin = _safe_float(position.get("margin"), margin) or margin
+        notional = _safe_float(position.get("notional"), notional) or notional
+
+    blockers = []
+    warnings = []
+    if mode == "live_off":
+        blockers.append("live/mainnet режим заблокирован кодом; разрешены только paper/dry_run/testnet")
+    if mode == "testnet" and not info.get("testnet_keys_present"):
+        blockers.append("testnet выбран, но BINANCE Futures Testnet API key/secret не заданы")
+    if not ticker or ticker not in TICKERS:
+        blockers.append("неизвестный тикер для ордер-плана")
+    if not interval or interval not in INTERVALS:
+        blockers.append("неизвестный таймфрейм для ордер-плана")
+    if direction not in {"long", "short"}:
+        blockers.append("нет направления long/short")
+    if not entry or not sl or not tp1:
+        blockers.append("не хватает entry/SL/TP для ордер-плана")
+
+    open_count = len(_paper_positions(chat_id))
+    today_count = _paper_today_open_count(chat_id)
+    plan_count = _execution_today_plan_count_v715(chat_id)
+    if already_opened:
+        if open_count > EXECUTION_MAX_OPEN_POSITIONS:
+            blockers.append(f"открытых paper-позиций {open_count}>{EXECUTION_MAX_OPEN_POSITIONS}")
+        if today_count > EXECUTION_MAX_DAILY_PLANS:
+            blockers.append(f"сделок сегодня {today_count}>{EXECUTION_MAX_DAILY_PLANS}")
+    else:
+        if open_count >= EXECUTION_MAX_OPEN_POSITIONS:
+            blockers.append(f"достигнут лимит открытых позиций {open_count}/{EXECUTION_MAX_OPEN_POSITIONS}")
+        if today_count >= EXECUTION_MAX_DAILY_PLANS:
+            blockers.append(f"достигнут дневной лимит сделок {today_count}/{EXECUTION_MAX_DAILY_PLANS}")
+    if plan_count >= EXECUTION_MAX_DAILY_PLANS:
+        warnings.append(f"ордер-планов сегодня уже {plan_count}/{EXECUTION_MAX_DAILY_PLANS}; проверь, нет ли лишних прогонов")
+
+    risk_decision = {}
+    if not any("не хватает entry/SL/TP" in x for x in blockers) and ticker and interval and direction in {"long", "short"}:
+        analysis_for_risk = dict(data)
+        if ep and not analysis_for_risk.get("entry_plan"):
+            analysis_for_risk["entry_plan"] = ep
+        risk_decision = _execution_risk_decision_v715(chat_id, ticker, interval, direction, entry, sl, tp1, tp2, analysis_for_risk)
+        blockers.extend(str(x) for x in (risk_decision.get("blockers") or [])[:6])
+        warnings.extend(str(x) for x in (risk_decision.get("warnings") or [])[:6])
+
+    blockers = list(dict.fromkeys(x for x in blockers if x))
+    warnings = list(dict.fromkeys(x for x in warnings if x))
+    setup_id = position.get("setup_id")
+    setup_slot = position.get("setup_slot")
+    if not setup_id:
+        try:
+            setup_id, _, setup_slot = _paper_setup_ids_v79(chat_id=chat_id, candidate=candidate)
+        except Exception:
+            setup_id, setup_slot = None, None
+
+    plan_id = _execution_plan_id_v715(chat_id, ticker, interval, direction, strategy, setup_id, setup_slot)
+    qty = _execution_qty_est_v715(entry, notional)
+    side = "BUY" if direction == "long" else "SELL"
+    close_side = "SELL" if direction == "long" else "BUY"
+    if blockers:
+        status = "BLOCKED"
+    elif mode == "paper":
+        status = "PAPER_ONLY"
+    elif mode == "dry_run":
+        status = "DRY_RUN_PLAN"
+    elif mode == "testnet":
+        status = "TESTNET_PLAN_ONLY"
+    else:
+        status = "BLOCKED"
+
+    return {
+        "plan_id": plan_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "chat_id": _paper_chat_key(chat_id),
+        "mode": mode,
+        "status": status,
+        "send_allowed": False,
+        "send_blockers": ["v7.15 не отправляет ордера; сначала копим dry-run/testnet-планы"],
+        "ticker": ticker,
+        "api_symbol": futures_api_symbol(ticker) if ticker in TICKERS else ticker,
+        "interval": interval,
+        "direction": direction,
+        "strategy": strategy,
+        "setup_id": setup_id,
+        "setup_slot": setup_slot,
+        "entry_order": {
+            "side": side,
+            "type": "MARKET",
+            "quantity_est": qty,
+            "notional_est": notional,
+            "margin_est": margin,
+            "leverage": lev,
+            "entry_reference": entry,
+            "client_order_id": str(plan_id).replace(":", "_")[-36:],
+        },
+        "protection_orders": [
+            {"side": close_side, "type": "STOP_MARKET", "stop_price": sl, "reduce_only": True, "label": "SL"},
+            {"side": close_side, "type": "TAKE_PROFIT_MARKET", "stop_price": tp1, "reduce_only": True, "label": "TP1"},
+            {"side": close_side, "type": "TAKE_PROFIT_MARKET", "stop_price": tp2, "reduce_only": True, "label": "TP2"},
+        ],
+        "risk": {
+            "balance": bal,
+            "size_pct": size_pct,
+            "leverage": lev,
+            "risk_usd": position.get("risk_usd") or risk_decision.get("single_risk_usd"),
+            "risk_pct": position.get("risk_pct") or risk_decision.get("single_risk_pct"),
+            "rr": risk_decision.get("rr"),
+            "risk_status": risk_decision.get("status"),
+        },
+        "blockers": blockers,
+        "warnings": warnings,
+    }
+
+
+def _attach_execution_plan_to_position_v715(chat_id, pos, plan):
+    if not pos or not plan:
+        return
+    pos_id = pos.get("pos_id")
+    with _paper_lock:
+        live = (_paper_state.get("positions") or {}).get(pos_id)
+        if live is not None:
+            live["execution_plan_id"] = plan.get("plan_id")
+            live["execution_status"] = plan.get("status")
+            live["execution_mode"] = plan.get("mode")
+            live["execution_send_allowed"] = False
+            live["execution_plan"] = {
+                "plan_id": plan.get("plan_id"),
+                "status": plan.get("status"),
+                "mode": plan.get("mode"),
+                "qty_est": (plan.get("entry_order") or {}).get("quantity_est"),
+                "notional_est": (plan.get("entry_order") or {}).get("notional_est"),
+                "blockers": list(plan.get("blockers") or [])[:5],
+                "warnings": list(plan.get("warnings") or [])[:5],
+            }
+            _paper_state.setdefault("events", []).append({
+                "type": "execution_plan_attached",
+                "ts": plan.get("created_at"),
+                "chat_id": _paper_chat_key(chat_id),
+                "pos_id": pos_id,
+                "plan_id": plan.get("plan_id"),
+                "status": plan.get("status"),
+                "mode": plan.get("mode"),
+            })
+            _paper_state["events"] = _paper_state["events"][-1000:]
+            pos.update(live)
+            _paper_save_state()
+
+
+def _paper_open_candidate(chat_id, candidate):
+    pos, err = _base_paper_open_candidate_v714(chat_id, candidate)
+    if err or not pos:
+        return pos, err
+    try:
+        plan = build_execution_order_plan(chat_id, candidate, position=pos, already_opened=True)
+        _execution_record_plan_v715(plan)
+        _attach_execution_plan_to_position_v715(chat_id, pos, plan)
+    except Exception as e:
+        print(f"  [execution_v715] plan attach error: {e}")
+    return pos, None
+
+
+def _fmt_execution_qty_v715(value):
+    try:
+        value = float(value)
+        if value >= 100:
+            return f"{value:.2f}"
+        if value >= 1:
+            return f"{value:.4f}"
+        return f"{value:.6f}"
+    except Exception:
+        return "—"
+
+
+def _execution_plan_line_v715(plan):
+    ticker = plan.get("ticker")
+    label = TICKERS.get(ticker, {}).get("label", ticker)
+    tf = INTERVALS.get(plan.get("interval"), {}).get("label", plan.get("interval"))
+    order = plan.get("entry_order") or {}
+    qty = _fmt_execution_qty_v715(order.get("quantity_est"))
+    notional = _safe_float(order.get("notional_est"), 0) or 0
+    when = _fmt_dt_short(plan.get("created_at"))
+    status = plan.get("status") or "—"
+    return (
+        f"• {when} | {label} {str(plan.get('direction')).upper()} | {tf}\n"
+        f"  {status} | qty≈{qty} | notional≈{notional:.2f} USDT"
+    )
+
+
+def format_execution_status(chat_id):
+    info = execution_mode()
+    plans = _execution_last_plans_v715(chat_id, 5)
+    open_positions = _paper_positions(chat_id)
+    mode_label = str(info.get("mode") or "paper").upper()
+    key_status = "есть" if info.get("testnet_keys_present") else "не заданы"
+    lines = [
+        "🧾 Execution Gateway v7.15",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Режим: {mode_label}",
+        "Live trading: ЗАБЛОКИРОВАН кодом",
+        f"Testnet keys: {key_status}",
+        f"Testnet REST: {info.get('testnet_rest')}",
+        f"Открытых paper-позиций: {len(open_positions)}/{EXECUTION_MAX_OPEN_POSITIONS}",
+        f"Сделок сегодня: {_paper_today_open_count(chat_id)}/{EXECUTION_MAX_DAILY_PLANS}",
+        f"Ордер-планов сегодня: {_execution_today_plan_count_v715(chat_id)}/{EXECUTION_MAX_DAILY_PLANS}",
+        "",
+        "Что делает этот слой:",
+        "• строит план входа, SL и TP;",
+        "• проверяет риск и лимиты;",
+        "• пишет журнал решений;",
+        "• пока не отправляет ордера на Binance.",
+    ]
+    if mode_label == "TESTNET" and not info.get("testnet_keys_present"):
+        lines += [
+            "",
+            "Чтобы позже включить Testnet, нужны отдельные Testnet API key/secret. Реальные mainnet-ключи сюда не нужны.",
+        ]
+    lines += ["", "Последние ордер-планы:"]
+    if plans:
+        lines.extend(_execution_plan_line_v715(p) for p in plans)
+    else:
+        lines.append("Пока нет записанных ордер-планов. Они появятся после новой paper-сделки.")
+    lines += [
+        "",
+        "Профессиональная логика: сначала dry-run журнал, потом Testnet, и только после статистики можно обсуждать live.",
+    ]
+    return "\n".join(lines)
+
+
+def execution_status_keyboard_v715():
+    return {"inline_keyboard": [
+        [{"text": "🤖 Назад: Автобот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def autobot_keyboard(chat_id):
+    kb = _base_autobot_keyboard_v714(chat_id)
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [{"text": "🧾 Execution / Testnet", "callback_data": "execution_status"}])
+    return {"inline_keyboard": rows}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data == "execution_status":
+                await async_answer_callback(session, callback_id, "Execution")
+                await async_send_plain_v76(session, chat_id, format_execution_status(chat_id), execution_status_keyboard_v715())
+                return
+        await _base_async_handle_update_v714(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v715] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Execution Gateway</b> — прослойка между сигналом и биржей. Она не должна «верить сигналу», а сначала строит ордер-план, проверяет риск, лимиты и только потом решает, можно ли вообще думать об исполнении.
+
+<b>Dry-run</b> — режим репетиции. Бот пишет, какой ордер он бы подготовил, но ничего не отправляет на биржу.
+
+<b>Order plan</b> — черновик сделки: side, примерное количество, notional, entry, SL, TP и причина блокировки/разрешения.
+
+<b>Testnet keys</b> — отдельные API-ключи демо-среды Binance Futures. Их нельзя путать с реальными mainnet-ключами.
+"""
+
+
+BOT_VERSION_LABEL = "v7.15 Execution Gateway Dry-Run"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -13902,6 +14357,7 @@ RUNTIME_LAYERS = [
     ("v7.12", "Probability calibration by forecast bucket, timeframe and direction"),
     ("v7.13", "Paper Trader soft timeframe quality weighting from calibrated signal stats"),
     ("v7.14", "Paper Trader realism: slippage, partial TP1, break-even SL, max hold and stale exits"),
+    ("v7.15", "Execution Gateway dry-run order plans with live trading blocked"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -13941,6 +14397,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_setup_analytics_report": format_setup_analytics_report,
     "format_probability_calibration_report": format_probability_calibration_report,
     "tf_quality_summary": tf_quality_summary_v713,
+    "execution_mode": execution_mode,
+    "build_execution_order_plan": build_execution_order_plan,
+    "format_execution_status": format_execution_status,
     "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
@@ -14011,6 +14470,13 @@ def validate_runtime_architecture():
         errors.append("paper partial TP1 helper is missing")
     if not callable(globals().get("_paper_manage_open_positions")):
         errors.append("paper realism position manager is missing")
+    if not callable(globals().get("build_execution_order_plan")):
+        errors.append("execution order plan builder is missing")
+    if not callable(globals().get("format_execution_status")):
+        errors.append("execution status report is missing")
+    mode = _execution_mode_v715()
+    if mode not in EXECUTION_ALLOWED_MODES:
+        errors.append(f"invalid execution mode: {mode}")
     if errors:
         raise RuntimeError("Runtime architecture validation failed: " + "; ".join(errors))
     return True

@@ -82,6 +82,23 @@ score penalty, but they are not fully banned.
 Paper Trader realism adds explicit slippage, 50% partial close on TP1, break-even
 SL for the remaining position, max-hold exits, and stale-signal exits.
 
+Execution Gateway v7.15 adds dry-run order plans. The bot records what it would
+prepare for an entry, SL and TP, checks risk limits, and shows the plan in the
+Autobot menu. It does not submit live Binance orders.
+
+Optional safe execution mode:
+
+```powershell
+$env:BOT_EXECUTION_MODE="paper"   # paper, dry_run, testnet, or live_off
+```
+
+For a later Binance Futures Testnet step, use separate Testnet keys only:
+
+```powershell
+$env:BINANCE_FUTURES_TESTNET_API_KEY="..."
+$env:BINANCE_FUTURES_TESTNET_API_SECRET="..."
+```
+
 ## Trading note
 
 A working bot is not the same as a safe strategy. Before trading live, test on paper trading and check risk per trade, max drawdown, fees, slippage, and liquidation distance.

@@ -4,3 +4,13 @@ $env:TELEGRAM_BOT_TOKEN="PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE"
 
 # Optional: PostgreSQL storage. If empty, the bot uses SQLite fallback.
 # $env:DATABASE_URL="postgresql://user:password@localhost:5432/quant_bot"
+
+# Optional: execution gateway mode.
+# Safe default is paper. Supported values: paper, dry_run, testnet, live_off.
+# v7.15 only builds and logs order plans; it does not send Binance orders.
+$env:BOT_EXECUTION_MODE="paper"
+
+# Optional: Binance Futures Testnet keys for a later Testnet package.
+# Use separate Testnet keys only, never real mainnet keys.
+# $env:BINANCE_FUTURES_TESTNET_API_KEY="PASTE_TESTNET_KEY_HERE"
+# $env:BINANCE_FUTURES_TESTNET_API_SECRET="PASTE_TESTNET_SECRET_HERE"
