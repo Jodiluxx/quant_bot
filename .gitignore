@@ -8,6 +8,10 @@ secrets.local*
 # Runtime state / private data
 *.sqlite
 *.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
 *.db
 paper_trader_state.json
 signal_journal.json

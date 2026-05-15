@@ -6,6 +6,7 @@ Each adapter exposes one business area. Today these functions delegate to
 from __future__ import annotations
 
 __all__ = [
+    "analytics",
     "backtesting",
     "market_data",
     "paper",

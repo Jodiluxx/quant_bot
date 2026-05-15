@@ -28,6 +28,7 @@ quant_bot/
     signals.py             signal engine and message formatting
     risk.py                entry plan and risk manager
     paper.py               Paper Trader and journal report
+    analytics.py           bot quality and performance diagnostics
     backtesting.py         backtest and walk-forward optimization
     telegram_app.py        Telegram UI, keyboards and async handlers
 ```
@@ -38,7 +39,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.9 Paper Data Quality Guard`.
+Current active runtime is `v7.10 Bot Performance Analytics`.
 
 Layer summary:
 
@@ -49,6 +50,7 @@ Layer summary:
 5. v7.0-v7.4: Paper Trader, all-asset scanner, Autobot menu, responsiveness
 6. v7.5-v7.8.4: reliable reports, clean journal, autostart tasks, sorted Autobot
 7. v7.9: Paper Trader setup IDs, duplicate guard, independent setup statistics
+8. v7.10: bot quality report, profit factor, average R, signal diagnostics
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

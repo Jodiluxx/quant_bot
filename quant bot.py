@@ -12496,6 +12496,282 @@ def format_paper_journal_home_v78(chat_id):
     return text
 
 
+# ============================================================
+# v7.10 — BOT PERFORMANCE ANALYTICS
+# ============================================================
+# This report does not tune the strategy by itself. It tells whether the bot
+# has enough clean data to tune anything, then shows the weakest and strongest
+# areas to investigate.
+
+_base_autobot_keyboard_v79 = autobot_keyboard
+_base_async_handle_update_v79 = async_handle_update
+
+
+def _fmt_pct_v710(value):
+    try:
+        return f"{float(value):.1f}%"
+    except Exception:
+        return "n/a"
+
+
+def _safe_ratio_v710(a, b):
+    try:
+        b = float(b)
+        return float(a) / b if abs(b) > 1e-12 else None
+    except Exception:
+        return None
+
+
+def _trade_r_multiple_v710(trade):
+    risk = _safe_float(trade.get("risk_usd"), 0) or 0
+    net = _safe_float(trade.get("net_usd"), 0) or 0
+    if risk <= 0:
+        return None
+    return net / risk
+
+
+def _profit_factor_v710(trades):
+    gross_win = sum(max(0.0, _safe_float(t.get("net_usd"), 0) or 0) for t in trades)
+    gross_loss = abs(sum(min(0.0, _safe_float(t.get("net_usd"), 0) or 0) for t in trades))
+    if gross_loss <= 0:
+        return None if gross_win <= 0 else float("inf")
+    return gross_win / gross_loss
+
+
+def _max_drawdown_usd_v710(trades):
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for trade in sorted(trades, key=_sort_key_v77):
+        equity += _safe_float(trade.get("net_usd"), 0) or 0
+        peak = max(peak, equity)
+        max_dd = min(max_dd, equity - peak)
+    return max_dd
+
+
+def _paper_stats_v710(trades):
+    wins = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) > 0]
+    losses = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) < 0]
+    r_values = [r for r in (_trade_r_multiple_v710(t) for t in trades) if r is not None]
+    return {
+        "n": len(trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "wr": len(wins) / len(trades) * 100 if trades else 0,
+        "net": sum(_safe_float(t.get("net_usd"), 0) or 0 for t in trades),
+        "pf": _profit_factor_v710(trades),
+        "avg_r": sum(r_values) / len(r_values) if r_values else None,
+        "max_dd": _max_drawdown_usd_v710(trades),
+    }
+
+
+def _paper_group_stats_v710(trades, key_name, min_n=1):
+    groups = {}
+    for trade in trades:
+        key = str(trade.get(key_name) or "unknown")
+        groups.setdefault(key, []).append(trade)
+    rows = []
+    for key, items in groups.items():
+        if len(items) < min_n:
+            continue
+        stats = _paper_stats_v710(items)
+        rows.append((key, stats))
+    rows.sort(key=lambda row: (row[1]["net"], row[1]["n"]), reverse=True)
+    return rows
+
+
+def _signal_eval_rows_v710(horizon="12b"):
+    rows = []
+    try:
+        journal = list(_load_signal_journal())
+    except Exception:
+        journal = []
+    for rec in journal:
+        if not isinstance(rec, dict):
+            continue
+        ev = (rec.get("evaluations") or {}).get(horizon) or {}
+        outcome = ev.get("outcome")
+        if outcome not in {"win", "loss", "neutral"}:
+            continue
+        rows.append({
+            "ticker": rec.get("ticker"),
+            "interval": rec.get("interval"),
+            "direction": rec.get("direction"),
+            "confidence": int(rec.get("confidence") or 0),
+            "outcome": outcome,
+        })
+    return rows
+
+
+def _signal_eval_summary_v710(rows, key_name=None, min_n=30):
+    groups = {}
+    for row in rows:
+        key = row.get(key_name) if key_name else "all"
+        groups.setdefault(str(key or "unknown"), []).append(row)
+    out = []
+    for key, items in groups.items():
+        if len(items) < min_n:
+            continue
+        wins = sum(1 for x in items if x["outcome"] == "win")
+        losses = sum(1 for x in items if x["outcome"] == "loss")
+        neutral = sum(1 for x in items if x["outcome"] == "neutral")
+        wr = wins / (wins + losses) * 100 if wins + losses else 0
+        out.append({"key": key, "n": len(items), "wins": wins, "losses": losses, "neutral": neutral, "wr": wr})
+    out.sort(key=lambda x: (x["wr"], x["n"]), reverse=True)
+    return out
+
+
+def _quality_verdict_v710(independent_setups):
+    if independent_setups < 30:
+        return "Данных мало: веса и фильтры пока лучше не крутить."
+    if independent_setups < 100:
+        return "Можно искать слабые места, но менять стратегию только осторожно."
+    if independent_setups < 300:
+        return "Уже можно тестировать небольшие улучшения через A/B и WFO."
+    return "Выборка уже полезная для серьёзной настройки, но всё равно нужен out-of-sample."
+
+
+def _pf_text_v710(pf):
+    if pf is None:
+        return "n/a"
+    if math.isinf(pf):
+        return "∞"
+    return f"{pf:.2f}"
+
+
+def _bot_quality_recommendations_v710(paper_stats, quality, signal_tf_rows):
+    recs = []
+    independent = quality.get("independent_market_closed_setups", 0)
+    if independent < 100:
+        recs.append("копить независимые paper-setup до 100+, иначе точность легко переобучить")
+    if quality.get("market_closed_duplicate_rows") or quality.get("market_open_duplicate_rows"):
+        recs.append("старые повторы в журнале считать отдельно; новые повторы уже блокируются")
+    if paper_stats["n"] and paper_stats["pf"] is not None and paper_stats["pf"] < 1.2:
+        recs.append("не повышать риск: profit factor пока слабый")
+    if paper_stats["avg_r"] is not None and paper_stats["avg_r"] < 0:
+        recs.append("проверить качество входов: средний результат в R ниже нуля")
+    weak_tf = [row for row in signal_tf_rows if row["n"] >= 50 and row["wr"] < 48]
+    if weak_tf:
+        recs.append("снизить приоритет слабых TF в Paper Trader: " + ", ".join(f"{x['key']} {x['wr']:.0f}%" for x in weak_tf[:3]))
+    if not recs:
+        recs.append("ничего резко не менять; продолжать сбор данных и смотреть устойчивость по неделям")
+    return recs[:5]
+
+
+def format_bot_quality_report(chat_id):
+    _paper_load_state()
+    trades = sorted(_paper_closed_trades(chat_id), key=_sort_key_v77)
+    positions = _paper_positions(chat_id)
+    paper_stats = _paper_stats_v710(trades)
+    quality_user = paper_data_quality_summary(chat_id)
+    quality_market = paper_data_quality_summary(None)
+    signal_rows = _signal_eval_rows_v710("12b")
+    signal_all = _signal_eval_summary_v710(signal_rows, None, min_n=1)
+    signal_tf = _signal_eval_summary_v710(signal_rows, "interval", min_n=30)
+
+    verdict = _quality_verdict_v710(quality_market.get("independent_market_closed_setups", 0))
+    lines = [
+        "📈 <b>Качество бота</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "<b>1. Достаточно ли данных?</b>",
+        f"Paper: {quality_user['closed_trades']} закрытых строк / {quality_user['independent_closed_setups']} независимых setup в этом чате",
+        f"Рынок всего: {quality_market['closed_trades']} строк / {quality_market['independent_market_closed_setups']} независимых рыночных setup",
+        f"Открыто сейчас: {len(positions)}/{PAPER_TRADER_MAX_POSITIONS}",
+        verdict,
+    ]
+
+    lines += [
+        "",
+        "<b>2. Paper результат</b>",
+        f"WR: {paper_stats['wins']}/{paper_stats['n']} = {_fmt_pct_v710(paper_stats['wr'])}",
+        f"Net: {paper_stats['net']:+.3f} USDT | PF: {_pf_text_v710(paper_stats['pf'])}",
+        f"Avg R: {paper_stats['avg_r']:+.2f}R" if paper_stats["avg_r"] is not None else "Avg R: n/a",
+        f"Max DD: {paper_stats['max_dd']:+.3f} USDT",
+    ]
+
+    strategy_rows = _paper_group_stats_v710(trades, "strategy")
+    if strategy_rows:
+        lines += ["", "<b>3. Стратегии</b>"]
+        for name, stats in strategy_rows[:5]:
+            lines.append(f"• {name}: n={stats['n']} | WR {_fmt_pct_v710(stats['wr'])} | PF {_pf_text_v710(stats['pf'])} | net {stats['net']:+.3f}")
+    else:
+        lines += ["", "<b>3. Стратегии</b>", "Пока нет закрытых paper-сделок."]
+
+    if signal_all:
+        s = signal_all[0]
+        lines += [
+            "",
+            "<b>4. Журнал сигналов, горизонт 12 свечей</b>",
+            f"Оценено: {s['n']} | win/loss/neutral: {s['wins']}/{s['losses']}/{s['neutral']} | WR {_fmt_pct_v710(s['wr'])}",
+        ]
+        if signal_tf:
+            best = signal_tf[:2]
+            weak = sorted(signal_tf, key=lambda x: x["wr"])[:2]
+            lines.append("Лучшие TF: " + " | ".join(f"{x['key']} {x['wr']:.0f}% n={x['n']}" for x in best))
+            lines.append("Слабые TF: " + " | ".join(f"{x['key']} {x['wr']:.0f}% n={x['n']}" for x in weak))
+    else:
+        lines += ["", "<b>4. Журнал сигналов</b>", "Оценённых сигналов пока нет."]
+
+    lines += [
+        "",
+        "<b>5. Что делать дальше</b>",
+    ]
+    for rec in _bot_quality_recommendations_v710(paper_stats, quality_market, signal_tf):
+        lines.append("• " + rec)
+    lines += [
+        "",
+        "Вывод: это диагностика, не гарантия. Риск повышаем только после устойчивой статистики, а не после пары удачных сделок.",
+    ]
+    return "\n".join(lines)
+
+
+def bot_quality_keyboard_v710():
+    return {"inline_keyboard": [
+        [{"text": "◀️ Назад", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def autobot_keyboard(chat_id):
+    kb = _base_autobot_keyboard_v79(chat_id)
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [{"text": "📈 Качество бота", "callback_data": "bot_quality"}])
+    return {"inline_keyboard": rows}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data == "bot_quality":
+                await async_answer_callback(session, callback_id, "Качество")
+                msg = await asyncio.to_thread(format_bot_quality_report, chat_id)
+                await async_send_plain_v76(session, chat_id, msg, bot_quality_keyboard_v710())
+                return
+        await _base_async_handle_update_v79(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v710] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Profit Factor</b> — отношение общей прибыли к общему убытку. Если PF около 1, преимущества почти нет. Если PF ниже 1, стратегия теряет деньги.
+
+<b>Avg R</b> — средний результат сделки в единицах риска. +1R значит заработали примерно один изначальный риск, -1R значит потеряли один риск.
+
+<b>Калибровка вероятности</b> — проверка, совпадает ли заявленная вероятность бота с реальной статистикой. Если бот часто пишет 70%, но выигрывает 50%, он переоценивает уверенность.
+"""
+
+
 LEARN_TEXTS["learn_new_terms"] += """
 
 <b>Setup ID</b> — уникальный номер торговой идеи: актив, таймфрейм, направление, стратегия и свеча. Он нужен, чтобы бот не открыл одну и ту же paper-сделку два раза.
@@ -12506,7 +12782,7 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.9 Paper Data Quality Guard"
+BOT_VERSION_LABEL = "v7.10 Bot Performance Analytics"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -12542,6 +12818,7 @@ RUNTIME_LAYERS = [
     ("v7.8.3", "Autobot screen cleaned; schedules and global auto toggle moved into Auto Settings"),
     ("v7.8.4", "remove schedule wording from Autobot screen"),
     ("v7.9", "Paper Trader setup_id, duplicate guard and independent setup data quality summary"),
+    ("v7.10", "Bot quality report with paper expectancy, profit factor and signal journal diagnostics"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -12576,6 +12853,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "paper_trader_scan_tickers": paper_trader_scan_tickers,
     "format_paper_report": format_paper_report,
     "paper_data_quality_summary": paper_data_quality_summary,
+    "format_bot_quality_report": format_bot_quality_report,
     "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
@@ -12634,6 +12912,8 @@ def validate_runtime_architecture():
         errors.append("paper data quality summary is missing")
     if not callable(globals().get("_paper_duplicate_reason_v79")):
         errors.append("paper duplicate guard is missing")
+    if not callable(globals().get("format_bot_quality_report")):
+        errors.append("bot quality report is missing")
     if errors:
         raise RuntimeError("Runtime architecture validation failed: " + "; ".join(errors))
     return True
