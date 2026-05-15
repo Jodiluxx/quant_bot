@@ -1,0 +1,37 @@
+# Local secrets
+secrets.local*
+!secrets.local.example.ps1
+*.secret*
+*.env
+.env
+
+# Runtime state / private data
+*.sqlite
+*.sqlite3
+*.db
+paper_trader_state.json
+signal_journal.json
+positions.json
+risk_state.json
+indicator_weights.json
+
+# Backups generated during patching
+*.bak*
+quant bot.py.bak*
+
+# Python / local environment
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.cache
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

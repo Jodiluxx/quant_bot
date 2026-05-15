@@ -1,0 +1,12345 @@
+"""
+Quant Signal Bot v5.7 — Platform Upgrade Layer
+Изменения vs v4:
+  1. Таймфреймы: 5m, 15m, 30m, 1h (убраны 4h и 1d)
+  2. Тикеры: только крипта — BTC, ETH, SOL, BNB, XRP (убраны все акции)
+  3. Полностью удалён Yahoo Finance, stock-логика, AUTO_STOCK_TICKERS, stock_auto_loop
+  4. MTF иерархия переделана под скальпера:
+       5m  → [15m, 1h]
+       15m → [30m, 1h]
+       30m → [1h]
+       1h  → []
+  5. Авто-loop: всегда каждые 5 минут, анализ всегда на 5m таймфрейме
+
+ИЗМЕНЕНИЯ v5.1 (5-min signal edition):
+  - Авто-рассылка: всегда каждые 5 минут, игнорирует интервал пользователя
+  - Таймфрейм анализа авто-сигналов жёстко = "5m"
+  - Cooldown между одинаковыми сигналами = 5 минут (300 сек) для всех интервалов
+  - Убрана кнопка "Настройки авто" (выбор интервала авто-сигнала неактуален)
+
+ИЗМЕНЕНИЯ v5.2 (flexible auto settings):
+  - Возвращена кнопка ⚙️ Настройки авто в главное меню
+  - Каждый пользователь может независимо выбрать:
+      * Интервал рассылки: 1m, 5m, 15m, 30m, 1h
+      * Таймфрейм анализа: 1m, 5m, 15m, 30m, 1h
+  - Настройки хранятся в user_auto_send_interval и user_auto_tf
+  - auto_loop теперь тикает каждую минуту и рассылает каждому пользователю
+    согласно его личному интервалу (отслеживается user_auto_last_sent)
+  - Cooldown адаптируется: равен интервалу рассылки пользователя
+"""
+
+import requests
+import numpy as np
+from scipy import stats
+from datetime import datetime, timezone, timedelta
+import time
+import threading
+import json
+import os
+import math
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def _make_session():
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+    return s
+
+_session = _make_session()
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+# ВАЖНО: токен Telegram должен храниться в переменной окружения:
+#   Windows PowerShell:  $env:TELEGRAM_BOT_TOKEN="123:ABC"
+#   Linux/macOS:         export TELEGRAM_BOT_TOKEN="123:ABC"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+INTERVALS = {
+    "1m":  {"label": "1 минута",  "limit": 500},
+    "5m":  {"label": "5 минут",   "limit": 500},
+    "15m": {"label": "15 минут",  "limit": 500},
+    "30m": {"label": "30 минут",  "limit": 500},
+    "1h":  {"label": "1 час",     "limit": 500},
+}
+
+MTF_HIERARCHY = {
+    "1m":  ["5m", "15m"],
+    "5m":  ["15m", "1h"],
+    "15m": ["30m", "1h"],
+    "30m": ["1h"],
+    "1h":  [],
+}
+
+# Допустимые интервалы рассылки (минуты)
+AUTO_SEND_INTERVALS = {
+    "1m":  {"label": "1 мин",  "minutes": 1},
+    "5m":  {"label": "5 мин",  "minutes": 5},
+    "15m": {"label": "15 мин", "minutes": 15},
+    "30m": {"label": "30 мин", "minutes": 30},
+    "1h":  {"label": "1 час",  "minutes": 60},
+}
+
+# Допустимые таймфреймы анализа для авто-сигналов
+AUTO_ANALYSIS_TFS = ["1m", "5m", "15m", "30m", "1h"]
+
+TICKERS = {
+    "BTCUSDT":  {"label": "₿ BTC",  "type": "crypto"},
+    "ETHUSDT":  {"label": "⟠ ETH",  "type": "crypto"},
+    "SOLUSDT":  {"label": "◎ SOL",  "type": "crypto"},
+    "BNBUSDT":  {"label": "🔶 BNB", "type": "crypto"},
+    "XRPUSDT":  {"label": "✕ XRP",  "type": "crypto"},
+    "DOGEUSDT": {"label": "🐕 DOGE", "type": "crypto"},
+    "SHIBUSDT": {"label": "🐶 SHIB", "type": "crypto"},
+}
+
+AUTO_CRYPTO_TICKERS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "SHIBUSDT"]
+
+# Дефолтные настройки авто для нового пользователя
+DEFAULT_AUTO_SEND_INTERVAL = "5m"   # интервал рассылки
+DEFAULT_AUTO_TF            = "5m"   # таймфрейм анализа
+
+MIN_VOTES_TREND     = 6
+MIN_VOTES_FLAT      = 8
+MIN_VOTES_VOLATILE  = 7
+MIN_SIGNAL_VOTES    = 6
+
+THRESHOLD   = 0.55
+WINDOW      = 3
+
+ATR_SL_MULT = 1.5
+ATR_TP_MULT = 2.5
+
+# Реалистичность бэктеста
+BACKTEST_FEE_RATE = 0.0004      # 0.04% taker fee за одну сторону
+BACKTEST_SLIPPAGE_RATE = 0.0002 # 0.02% проскальзывание за вход/выход
+BACKTEST_RISK_PER_TRADE = 0.01  # риск 1% equity на сделку
+BACKTEST_MAX_HOLD_BARS = 12     # максимум удержания сделки
+BACKTEST_INITIAL_EQUITY = 100.0
+BACKTEST_MAX_NOTIONAL_EQUITY_MULT = 3.0
+BACKTEST_APPROX_MAINT_MARGIN_RATE = 0.005
+BACKTEST_TRADE_LOG_LIMIT = 8
+
+# Журнал сигналов и самооценка качества
+SIGNAL_JOURNAL_FILE = "signal_journal.json"
+SIGNAL_JOURNAL_MAX_RECORDS = 5000
+SIGNAL_EVAL_HORIZONS = [3, 6, 12]          # через сколько закрытых свечей оценивать сигнал
+SIGNAL_EVAL_MIN_MOVE_ATR = 0.35            # минимальный полезный ход в ATR для win/loss
+MIN_RR_TO_TRADE = 1.35                     # ниже этого сигнал блокируется
+MAX_DISTANCE_FROM_EMA_ATR = 2.2            # не входить, если цена далеко убежала от EMA20
+MIN_CONFIDENCE_FOR_STRONG = 70
+MIN_CONFIDENCE_FOR_ACTION = 58
+
+WEIGHTS_FILE   = "indicator_weights.json"
+POSITIONS_FILE = "positions.json"
+
+CORR_PAIRS = [("BTCUSDT", "ETHUSDT")]
+CORR_THRESHOLD = 0.90
+
+user_intervals   = {}
+user_tickers     = {}
+seen_chat_ids    = set()
+auto_chat_ids    = set()
+
+# ── Новые per-user настройки авто ──────────────────────────
+user_auto_send_interval = {}   # chat_id → "1m" / "5m" / "15m" / "30m" / "1h"
+user_auto_tf            = {}   # chat_id → "1m" / "5m" / "15m" / "30m" / "1h"
+user_auto_last_sent     = {}   # chat_id → timestamp последней отправки
+# ───────────────────────────────────────────────────────────
+
+auto_interval    = {}   # оставлен для совместимости
+
+# ── Баланс и параметры позиции ─────────────────────────────
+user_balance    = {}   # chat_id → float (USDT)
+user_leverage   = {}   # chat_id → int
+user_size_pct   = {}   # chat_id → float (% от баланса)
+
+DEFAULT_BALANCE  = 19.0
+DEFAULT_LEVERAGE = 10
+DEFAULT_SIZE_PCT = 10.0
+
+_pending_balance_input = set()   # ожидаем ввод числа от пользователя
+_pending_open_context  = {}      # chat_id → (ticker, interval, direction)
+_pending_edit_field = {}   # chat_id → {"pos_id": ..., "field": "entry"|"sl"|"tp1"|"leverage"|"amount"}
+
+_fear_greed_cache    = {"value": None, "label": None, "ts": 0, "history": []}
+_indicator_weights   = {}
+_weights_last_update = 0
+_last_signal_cache   = {}
+
+
+# ============================================================
+# ФОРМАТИРОВАНИЕ ЦЕН
+# ============================================================
+def fmt_price(value, ticker=None):
+    """
+    Безопасное форматирование цен для BTC/ETH и дешёвых монет типа SHIB.
+    Проблема старого формата ${price:,.4f}: SHIB выглядел как $0.0000.
+    """
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    av = abs(v)
+    if av >= 1000:
+        return f"${v:,.2f}"
+    if av >= 1:
+        return f"${v:,.4f}"
+    if av >= 0.01:
+        return f"${v:.5f}"
+    if av >= 0.0001:
+        return f"${v:.7f}"
+    if av > 0:
+        return f"${v:.10f}"
+    return "$0"
+
+
+def fmt_money(value, decimals=2):
+    """Форматирование PnL/баланса в USDT."""
+    if value is None:
+        return "—"
+    try:
+        return f"${float(value):,.{decimals}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def format_main_status(chat_id):
+    """Короткий статус главного меню. Используется кнопкой Назад."""
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    iv = user_intervals.get(chat_id, "15m")
+    si = user_auto_send_interval.get(chat_id, DEFAULT_AUTO_SEND_INTERVAL)
+    tf = user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
+    sub_status = "🔔 включены" if chat_id in auto_chat_ids else "🔕 отключены"
+    n_pos = len(get_user_positions(chat_id))
+    return (
+        "🏠 <b>Главное меню</b>\n\n"
+        f"Ручной анализ: <b>{TICKERS[ticker]['label']}</b> | <b>{INTERVALS[iv]['label']}</b>\n"
+        f"Авто: <b>{sub_status}</b>\n"
+        f"  ⏰ Рассылка: <b>{AUTO_SEND_INTERVALS[si]['label']}</b>\n"
+        f"  📊 TF анализа: <b>{INTERVALS[tf]['label']}</b>\n"
+        f"Позиции: <b>{n_pos}</b>"
+    )
+
+# ============================================================
+# МЕНЕДЖЕР ПОЗИЦИЙ
+# ============================================================
+_positions      = {}
+_positions_lock = threading.Lock()
+
+
+def _load_positions():
+    global _positions
+    if os.path.exists(POSITIONS_FILE):
+        try:
+            with open(POSITIONS_FILE, "r") as f:
+                _positions = json.load(f)
+        except Exception:
+            _positions = {}
+
+
+def _save_positions():
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(_positions, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [positions] Ошибка сохранения: {e}")
+
+
+def open_position(chat_id, ticker, interval, direction,
+                  entry_price, sl, tp1, tp2, size_pct=1.0):
+    pos_id = f"{ticker}_{interval}_{int(time.time())}"
+    pos = {
+        "pos_id":        pos_id,
+        "chat_id":       chat_id,
+        "ticker":        ticker,
+        "interval":      interval,
+        "direction":     direction,
+        "entry_price":   entry_price,
+        "sl":            sl,
+        "tp1":           tp1,
+        "tp2":           tp2,
+        "size_pct":      size_pct,
+        "opened_at":     datetime.now(timezone.utc).isoformat(),
+        "tp1_hit":       False,
+        "last_advice":   "hold",
+        "last_advice_ts": 0.0,
+    }
+    with _positions_lock:
+        _positions[pos_id] = pos
+        _save_positions()
+    return pos_id
+
+
+def close_position(pos_id):
+    with _positions_lock:
+        pos = _positions.pop(pos_id, None)
+        _save_positions()
+    return pos
+
+
+def get_user_positions(chat_id):
+    with _positions_lock:
+        return [p for p in _positions.values() if p["chat_id"] == chat_id]
+
+
+def get_all_positions():
+    with _positions_lock:
+        return list(_positions.values())
+
+
+# ============================================================
+# АНАЛИЗ ВЫХОДА ИЗ ПОЗИЦИИ
+# ============================================================
+def analyze_exit(pos, current_price, closes, highs, lows, volumes):
+    direction = pos["direction"]
+    entry     = pos["entry_price"]
+    sl        = pos["sl"]
+    tp1       = pos["tp1"]
+    tp2       = pos["tp2"]
+    tp1_hit   = pos.get("tp1_hit", False)
+
+    reasons      = []
+    exit_signals = 0
+    hold_signals = 0
+
+    if direction == "long":
+        pnl_pct     = (current_price - entry) / entry * 100
+        dist_to_tp1 = (tp1 - current_price) / entry * 100
+        dist_to_tp2 = (tp2 - current_price) / entry * 100
+        at_tp1 = current_price >= tp1
+        at_tp2 = current_price >= tp2
+        sl_hit = current_price <= sl
+    else:
+        pnl_pct     = (entry - current_price) / entry * 100
+        dist_to_tp1 = (current_price - tp1) / entry * 100
+        dist_to_tp2 = (current_price - tp2) / entry * 100
+        at_tp1 = current_price <= tp1
+        at_tp2 = current_price <= tp2
+        sl_hit = current_price >= sl
+
+    if sl_hit:
+        return (
+            "close_sl",
+            f"🚨 СТОП-ЛОСС ПРОБИТ! Цена {fmt_price(current_price)}, SL был {fmt_price(sl)}. Закрывай немедленно!",
+            "critical"
+        )
+
+    if at_tp1 and not tp1_hit:
+        return (
+            "take_tp1",
+            f"🎯 TP ДОСТИГНУТ! Цена {fmt_price(current_price)}. Рекомендую фиксировать прибыль!",
+            "critical"
+        )
+
+    rsi = calc_rsi(closes)
+    st_dir, _ = calc_supertrend(highs, lows, closes)
+    macd, macd_sig = calc_macd(closes)
+    stoch_k, stoch_d = calc_stoch_rsi(closes)
+    _, obv_trend = calc_obv(closes, volumes)
+    ema20 = calc_ema(closes, 20)
+    ema50 = calc_ema(closes, 50)
+
+    # Volume в анализе выхода
+    _exit_vol_ratio = None
+    if len(volumes) >= 20:
+        _avg_v = sum(volumes[-20:-1]) / 19
+        _exit_vol_ratio = volumes[-1] / _avg_v if _avg_v > 0 else 1.0
+
+    if direction == "long":
+        if rsi is not None:
+            if rsi > 75:
+                exit_signals += 1
+                reasons.append(f"RSI={rsi:.0f} — сильная перекупленность")
+            elif rsi > 65:
+                exit_signals += 0.5
+                reasons.append(f"RSI={rsi:.0f} — перекупленность нарастает")
+            elif rsi < 50:
+                hold_signals += 1
+        if st_dir == -1:
+            exit_signals += 2
+            reasons.append("Supertrend развернулся вниз")
+        elif st_dir == 1:
+            hold_signals += 1.5
+        if macd is not None and macd_sig is not None:
+            if macd < macd_sig and macd > 0:
+                exit_signals += 1
+                reasons.append("MACD пересёк сигнальную вниз")
+            elif macd > macd_sig:
+                hold_signals += 1
+        if stoch_k is not None and stoch_d is not None:
+            if stoch_k > 80 and stoch_k < stoch_d:
+                exit_signals += 1
+                reasons.append(f"Stoch RSI K={stoch_k:.0f} пересёк D вниз")
+        if obv_trend is not None and obv_trend < 0:
+            exit_signals += 0.5
+            reasons.append("OBV падает — крупные начинают продавать")
+        if ema20 and ema50 and current_price < ema20:
+            exit_signals += 1
+            reasons.append(f"Цена ушла ниже EMA20 ({ema20:,.0f})")
+        if _exit_vol_ratio is not None and _exit_vol_ratio > 2.0:
+            if ema20 and current_price < ema20:
+                exit_signals += 1
+                reasons.append(f"Объём {_exit_vol_ratio:.1f}x при движении вниз — давление продавцов")
+    else:
+        if rsi is not None:
+            if rsi < 25:
+                exit_signals += 1
+                reasons.append(f"RSI={rsi:.0f} — сильная перепроданность")
+            elif rsi < 35:
+                exit_signals += 0.5
+                reasons.append(f"RSI={rsi:.0f} — перепроданность нарастает")
+            elif rsi > 50:
+                hold_signals += 1
+        if st_dir == 1:
+            exit_signals += 2
+            reasons.append("Supertrend развернулся вверх")
+        elif st_dir == -1:
+            hold_signals += 1.5
+        if macd is not None and macd_sig is not None:
+            if macd > macd_sig and macd < 0:
+                exit_signals += 1
+                reasons.append("MACD пересёк сигнальную вверх")
+            elif macd < macd_sig:
+                hold_signals += 1
+        if stoch_k is not None and stoch_d is not None:
+            if stoch_k < 20 and stoch_k > stoch_d:
+                exit_signals += 1
+                reasons.append(f"Stoch RSI K={stoch_k:.0f} пересёк D вверх")
+        if obv_trend is not None and obv_trend > 0:
+            exit_signals += 0.5
+            reasons.append("OBV растёт — крупные начинают покупать")
+        if ema20 and ema50 and current_price > ema20:
+            exit_signals += 1
+            reasons.append(f"Цена ушла выше EMA20 ({ema20:,.0f})")
+        if _exit_vol_ratio is not None and _exit_vol_ratio > 2.0:
+            if ema20 and current_price > ema20:
+                exit_signals += 1
+                reasons.append(f"Объём {_exit_vol_ratio:.1f}x при движении вверх — давление покупателей")
+
+    pnl_str = f"{pnl_pct:+.2f}%"
+
+    if exit_signals >= 3:
+        reason_text = " | ".join(reasons[:3]) if reasons else "Множество сигналов разворота"
+        verb = "зафиксируй прибыль!" if pnl_pct > 0 else "сократи убыток!"
+        emoji = "⚠️" if pnl_pct > 0 else "🔴"
+        return (
+            "close_reversal",
+            f"{emoji} Сигнал ВЫХОДА (сигналов разворота: {exit_signals:.0f}). PnL: {pnl_str}\n"
+            f"Причины: {reason_text}\nРекомендую: {verb}",
+            "warning"
+        )
+    elif exit_signals >= 1.5 and tp1_hit:
+        reason_text = " | ".join(reasons[:2]) if reasons else "Нарастающие сигналы разворота"
+        return (
+            "close_partial",
+            f"🟡 Нарастают сигналы разворота (счёт: {exit_signals:.1f}). PnL: {pnl_str}\n"
+            f"Причины: {reason_text}\nTP1 уже взят — рассмотри фиксацию оставшейся части.",
+            "info"
+        )
+    elif hold_signals >= 2 and exit_signals < 1:
+        tp_info = f", до TP1: {dist_to_tp1:.1f}%" if not tp1_hit else f", до TP2: {dist_to_tp2:.1f}%"
+        return (
+            "hold",
+            f"✅ ДЕРЖИ позицию — индикаторы поддерживают тренд (hold_score: {hold_signals:.0f}). "
+            f"PnL: {pnl_str}{tp_info}",
+            "info"
+        )
+    else:
+        tp_info = f"До TP1: {dist_to_tp1:.1f}%" if not tp1_hit else f"До TP2: {dist_to_tp2:.1f}%"
+        return (
+            "hold",
+            f"⏸ ЖДЁМ — нет чёткого сигнала ({tp_info}). PnL: {pnl_str}. "
+            f"Сигналы выхода: {exit_signals:.1f} | Держать: {hold_signals:.1f}",
+            "info"
+        )
+
+
+def format_position_update(pos, current_price, advice, reason, urgency):
+    direction = pos["direction"]
+    entry     = pos["entry_price"]
+    ticker    = pos["ticker"]
+    tk_label  = TICKERS[ticker]["label"]
+    interval  = pos["interval"]
+
+    if direction == "long":
+        pnl_pct = (current_price - entry) / entry * 100
+    else:
+        pnl_pct = (entry - current_price) / entry * 100
+
+    pnl_emoji  = "📈" if pnl_pct >= 0 else "📉"
+    dir_emoji  = "🟢 LONG" if direction == "long" else "🔴 SHORT"
+
+    urgency_header = {
+        "critical": "🚨🚨🚨 СРОЧНО! 🚨🚨🚨",
+        "warning":  "⚠️ ВНИМАНИЕ ⚠️",
+        "info":     "📊 Статус позиции",
+    }.get(urgency, "📊 Статус позиции")
+
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    lines = [
+        urgency_header, "",
+        f"📌 <b>{tk_label}</b> | {dir_emoji} | {INTERVALS[interval]['label']}",
+        f"⏰ {now}", "",
+        f"💵 Вход:    <b>{fmt_price(entry, ticker)}</b>",
+        f"💰 Сейчас: <b>{fmt_price(current_price, ticker)}</b>",
+        f"{pnl_emoji} PnL:    <b>{pnl_pct:+.2f}%</b>", "",
+        f"🔴 Stop Loss: {fmt_price(pos['sl'], ticker)}",
+        f"🎯 TP:  {fmt_price(pos['tp1'], ticker)}  {'✅ взят' if pos.get('tp1_hit') else '⏳ ожидание'}",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "💡 <b>Рекомендация:</b>",
+        reason,
+        "━━━━━━━━━━━━━━━━━━━━", "",
+        f"<i>ID позиции: {pos['pos_id']}</i>",
+    ]
+    return "\n".join(lines)
+
+
+def position_close_keyboard(pos_id):
+    return {"inline_keyboard": [
+        [
+            {"text": "✅ Закрыть позицию", "callback_data": f"close_pos_{pos_id}"},
+            {"text": "✂️ TP1 взят (50%)",  "callback_data": f"tp1_hit_{pos_id}"},
+        ],
+        [{"text": "✏️ Редактировать позицию", "callback_data": f"edit_pos_{pos_id}"}],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+# ============================================================
+# МОНИТОРИНГ ПОЗИЦИЙ (каждые 5 минут)
+# ============================================================
+def position_monitor_loop():
+    print("  [thread] position_monitor_loop запущен (шаг 5 мин)")
+    while True:
+        now  = datetime.now(timezone.utc)
+        wait = (5 - now.minute % 5) * 60 - now.second
+        if wait <= 0:
+            wait = 5 * 60
+        time.sleep(wait)
+
+        positions = get_all_positions()
+        if not positions:
+            continue
+
+        print(f"  [monitor] Проверяю {len(positions)} позиций...")
+
+        for pos in positions:
+            try:
+                ticker        = pos["ticker"]
+                interval      = pos["interval"]
+                chat_id       = pos["chat_id"]
+                pos_id        = pos["pos_id"]
+
+                current_price = get_price(ticker)
+                opens, highs, lows, closes, volumes = get_ohlcv(ticker, interval)
+
+                advice, reason, urgency = analyze_exit(
+                    pos, current_price, closes, highs, lows, volumes
+                )
+
+                last_advice    = pos.get("last_advice", "")
+                last_advice_ts = pos.get("last_advice_ts", 0)
+                now_ts = time.time()
+                elapsed = now_ts - last_advice_ts
+
+                if urgency == "critical":
+                    skip = False
+                elif urgency == "warning":
+                    skip = (advice == last_advice and elapsed < 4 * 60)
+                else:
+                    skip = (advice == last_advice and elapsed < 14 * 60)
+
+                if skip:
+                    continue
+
+                with _positions_lock:
+                    if pos_id in _positions:
+                        if advice == "take_tp1":
+                            _positions[pos_id]["tp1_hit"] = True
+                        _positions[pos_id]["last_advice"]    = advice
+                        _positions[pos_id]["last_advice_ts"] = now_ts
+                        _save_positions()
+
+                msg = format_position_update(pos, current_price, advice, reason, urgency)
+                send(chat_id, msg, position_close_keyboard(pos_id))
+
+            except Exception as e:
+                print(f"  [monitor] Ошибка позиции {pos.get('pos_id', '?')}: {e}")
+
+
+def edit_pos_keyboard(pos_id, pos):
+    lev    = pos.get("leverage", "—")
+    amount = pos.get("margin",   "—")
+    return {"inline_keyboard": [
+        [{"text": f"💵 Цена входа: {fmt_price(pos['entry_price'], pos.get('ticker'))}",
+          "callback_data": f"editfield_{pos_id}_entry"}],
+        [{"text": f"🔴 Stop Loss:  {fmt_price(pos['sl'], pos.get('ticker'))}",
+          "callback_data": f"editfield_{pos_id}_sl"}],
+        [{"text": f"🎯 TP:         {fmt_price(pos['tp1'], pos.get('ticker'))}",
+          "callback_data": f"editfield_{pos_id}_tp1"}],
+        [{"text": f"⚡ Плечо:      x{lev}",
+          "callback_data": f"editfield_{pos_id}_leverage"}],
+        [{"text": f"💰 Сумма маржи: ${amount}",
+          "callback_data": f"editfield_{pos_id}_amount"}],
+        [{"text": "◀️ Назад к позиции", "callback_data": f"back_pos_{pos_id}"}],
+    ]}
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+def tg(method, payload=None):
+    if not BOT_TOKEN:
+        return {"ok": False, "description": "TELEGRAM_BOT_TOKEN is not set"}
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    try:
+        r = _session.post(url, json=payload or {}, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+def send(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    result = tg("sendMessage", payload)
+    if not result.get("ok"):
+        payload2 = {
+            "chat_id": chat_id,
+            "text": text.replace("<b>","").replace("</b>","")
+                        .replace("<i>","").replace("</i>","")
+                        .replace("<pre>","").replace("</pre>",""),
+        }
+        if reply_markup:
+            payload2["reply_markup"] = reply_markup
+        tg("sendMessage", payload2)
+    return result
+
+def answer_callback(callback_id, text=""):
+    tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+
+# ============================================================
+# КЛАВИАТУРЫ
+# ============================================================
+def main_keyboard():
+    return {"inline_keyboard": [[
+        {"text": "🔄 Сигнал",                 "callback_data": "get_signal"},
+        {"text": "💰 Цена",                    "callback_data": "get_price"},
+    ],[
+        {"text": "📊 Сменить актив",           "callback_data": "change_ticker"},
+        {"text": "⏱ Сменить интервал",         "callback_data": "change_interval"},
+    ],[
+        {"text": "🔔 Авто-сигналы: ВКЛ/ВЫКЛ", "callback_data": "toggle_auto"},
+        {"text": "⚙️ Настройки авто",          "callback_data": "auto_settings"},
+    ],[
+        {"text": "📂 Мои позиции",             "callback_data": "my_positions"},
+        {"text": "🧪 Бэктест",                 "callback_data": "run_backtest"},
+    ],[
+        {"text": "📖 Термины",                 "callback_data": "explain"},
+        {"text": "⚖️ Walk-Forward обновить",   "callback_data": "run_wfo"},
+    ],[
+        {"text": "📈 Статистика сигналов",     "callback_data": "signal_stats"},
+    ],[
+        {"text": "💼 Мой баланс / Плечо",      "callback_data": "my_balance"},
+        {"text": "😱 Fear & Greed",            "callback_data": "get_fg"},
+    ]]}
+
+
+def auto_settings_keyboard(chat_id):
+    """Меню настроек авто-сигналов с текущими значениями."""
+    si  = user_auto_send_interval.get(chat_id, DEFAULT_AUTO_SEND_INTERVAL)
+    tf  = user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
+    si_label = AUTO_SEND_INTERVALS[si]["label"]
+    tf_label = INTERVALS[tf]["label"]
+    return {"inline_keyboard": [
+        [{"text": f"⏰ Интервал рассылки: {si_label}  →  изменить",
+          "callback_data": "choose_auto_send_iv"}],
+        [{"text": f"📊 Таймфрейм анализа: {tf_label}  →  изменить",
+          "callback_data": "choose_auto_tf"}],
+        [{"text": "◀️ Назад", "callback_data": "back_main"}],
+    ]}
+
+
+def auto_send_interval_keyboard():
+    """Выбор интервала рассылки."""
+    rows = []
+    keys = list(AUTO_SEND_INTERVALS.keys())
+    for i in range(0, len(keys), 3):
+        row = [{"text": AUTO_SEND_INTERVALS[k]["label"],
+                "callback_data": f"auto_send_iv_{k}"}
+               for k in keys[i:i+3]]
+        rows.append(row)
+    rows.append([{"text": "◀️ Назад", "callback_data": "auto_settings"}])
+    return {"inline_keyboard": rows}
+
+def balance_keyboard(chat_id):
+    bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+    lev = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
+    pct = user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)
+    return {"inline_keyboard": [
+        [{"text": f"💵 Баланс: ${bal:.2f}  →  изменить",
+          "callback_data": "set_balance_menu"}],
+        [{"text": f"⚡ Плечо: x{lev}  →  изменить",
+          "callback_data": "set_leverage_menu"}],
+        [{"text": f"🎲 Размер: {pct}%  →  изменить",
+          "callback_data": "set_size_menu"}],
+        [{"text": "◀️ Назад", "callback_data": "back_main"}],
+    ]}
+
+
+def leverage_keyboard():
+    levels = [1, 2, 3, 5, 10, 15, 20, 25, 50, 75, 100, 125]
+    rows = []
+    for i in range(0, len(levels), 4):
+        row = [{"text": f"x{l}", "callback_data": f"lev_{l}"}
+               for l in levels[i:i+4]]
+        rows.append(row)
+    rows.append([{"text": "◀️ Назад", "callback_data": "my_balance"}])
+    return {"inline_keyboard": rows}
+
+
+def size_pct_keyboard():
+    sizes = [1, 2, 5, 10, 15, 20, 25, 30, 50, 75, 100]
+    rows = []
+    for i in range(0, len(sizes), 4):
+        row = [{"text": f"{s}%", "callback_data": f"size_{s}"}
+               for s in sizes[i:i+4]]
+        rows.append(row)
+    rows.append([{"text": "◀️ Назад", "callback_data": "my_balance"}])
+    return {"inline_keyboard": rows}
+
+def auto_tf_keyboard():
+    """Выбор таймфрейма анализа для авто-сигналов."""
+    rows = []
+    keys = AUTO_ANALYSIS_TFS
+    for i in range(0, len(keys), 3):
+        row = [{"text": INTERVALS[k]["label"],
+                "callback_data": f"auto_tf_{k}"}
+               for k in keys[i:i+3]]
+        rows.append(row)
+    rows.append([{"text": "◀️ Назад", "callback_data": "auto_settings"}])
+    return {"inline_keyboard": rows}
+
+
+def explain_keyboard():
+    return {"inline_keyboard": [[
+        {"text": "📖 Часть 1: Новое в v5",    "callback_data": "explain_1"},
+        {"text": "📊 Часть 2: Индикаторы",    "callback_data": "explain_2"},
+    ],[
+        {"text": "🛡 Часть 3: Риск и советы", "callback_data": "explain_3"},
+        {"text": "◀️ Назад",                  "callback_data": "back_main"},
+    ]]}
+
+def interval_keyboard():
+    return {"inline_keyboard": [[
+        {"text": "🕐 5 мин",  "callback_data": "interval_5m"},
+        {"text": "⚡ 15 мин", "callback_data": "interval_15m"},
+        {"text": "🕑 30 мин", "callback_data": "interval_30m"},
+        {"text": "🕐 1 час",  "callback_data": "interval_1h"},
+    ],[{"text": "◀️ Назад", "callback_data": "back_main"}]]}
+
+def ticker_keyboard():
+    rows = [
+        [{"text": TICKERS[k]["label"], "callback_data": f"ticker_{k}"}
+         for k in list(TICKERS.keys())[i:i+2]]
+        for i in range(0, len(TICKERS), 2)
+    ]
+    rows.append([{"text": "◀️ Назад", "callback_data": "back_main"}])
+    return {"inline_keyboard": rows}
+
+
+# ============================================================
+# ДАННЫЕ (только Binance)
+# ============================================================
+def get_ohlcv(ticker, interval):
+    return _binance_ohlcv(ticker, interval)
+
+def _binance_ohlcv(symbol, interval):
+    if symbol not in TICKERS:
+        raise ValueError(f"Unknown ticker: {symbol}")
+    if interval not in INTERVALS:
+        raise ValueError(f"Unknown interval: {interval}")
+
+    limit = INTERVALS[interval]["limit"]
+    r = _session.get(
+        "https://fapi.binance.com/fapi/v1/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        timeout=20,
+    )
+    r.raise_for_status()
+    raw = r.json()
+    if not isinstance(raw, list):
+        raise ValueError(f"Binance error: {raw}")
+    if len(raw) < 50:
+        raise ValueError(f"Not enough Binance candles: {len(raw)}")
+
+    # Убираем последнюю свечу — она ещё не закрыта.
+    # Так сигнал не использует текущую незакрытую свечу.
+    raw = raw[:-1]
+    opens   = [float(x[1]) for x in raw]
+    highs   = [float(x[2]) for x in raw]
+    lows    = [float(x[3]) for x in raw]
+    closes  = [float(x[4]) for x in raw]
+    volumes = [float(x[5]) for x in raw]
+    return opens, highs, lows, closes, volumes
+
+def get_price(ticker):
+    if ticker not in TICKERS:
+        raise ValueError(f"Unknown ticker: {ticker}")
+    url = "https://fapi.binance.com/fapi/v1/ticker/price"
+    r = _session.get(url, params={"symbol": ticker}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if "price" not in data:
+        raise ValueError(f"Binance price error: {data}")
+    return float(data["price"])
+
+
+# ============================================================
+# COOLDOWN (адаптивный — равен интервалу рассылки пользователя)
+# ============================================================
+def should_send_signal(ticker, interval, new_signal, cooldown_seconds=300, group_key=""):
+    key = f"{group_key}_{ticker}_{interval}"
+    prev = _last_signal_cache.get(key, {})
+    now_ts = time.time()
+    if (prev.get("signal") == new_signal and
+            now_ts - prev.get("ts", 0) < cooldown_seconds):
+        return False
+    _last_signal_cache[key] = {"signal": new_signal, "ts": now_ts}
+    return True
+
+
+# ============================================================
+# ДЕТЕКТОР АНОМАЛИЙ ОБЪЁМА
+# ============================================================
+def detect_volume_anomaly(volumes, sigma_threshold=2.8):
+    if len(volumes) < 30:
+        return False, 1.0
+    recent  = volumes[-100:-1]
+    mean_vol = np.mean(recent)
+    std_vol  = np.std(recent)
+    if std_vol == 0:
+        return False, 1.0
+    z_score = (volumes[-1] - mean_vol) / std_vol
+    return z_score > sigma_threshold, z_score
+
+
+# ============================================================
+# РЫНОЧНЫЙ РЕЖИМ
+# ============================================================
+def calc_adx(highs, lows, closes, period=14):
+    n = len(closes)
+    if n < period * 2 + 1:
+        return None
+    tr_list, dm_plus, dm_minus = [], [], []
+    for i in range(1, n):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i-1]),
+                 abs(lows[i]  - closes[i-1]))
+        tr_list.append(tr)
+        up   = highs[i] - highs[i-1]
+        down = lows[i-1] - lows[i]
+        dm_plus.append(up   if up > down and up > 0   else 0)
+        dm_minus.append(down if down > up and down > 0 else 0)
+
+    def smooth(lst, p):
+        val = sum(lst[:p])
+        result = [val]
+        for x in lst[p:]:
+            val = val - val / p + x
+            result.append(val)
+        return result
+
+    atr_s = smooth(tr_list,  period)
+    dmp_s = smooth(dm_plus,  period)
+    dmm_s = smooth(dm_minus, period)
+
+    dx_list = []
+    for i in range(len(atr_s)):
+        if atr_s[i] == 0:
+            continue
+        di_plus  = 100 * dmp_s[i] / atr_s[i]
+        di_minus = 100 * dmm_s[i] / atr_s[i]
+        denom = di_plus + di_minus
+        if denom == 0:
+            continue
+        dx_list.append(100 * abs(di_plus - di_minus) / denom)
+
+    if len(dx_list) < period:
+        return None
+    return sum(dx_list[-period:]) / period
+
+def detect_market_regime(highs, lows, closes, volumes):
+    adx = calc_adx(highs, lows, closes)
+    period = 20
+    if len(closes) >= period:
+        window = closes[-period:]
+        mid = sum(window) / period
+        std = (sum((x - mid)**2 for x in window) / period) ** 0.5
+        bb_width_pct = (4 * std / mid * 100) if mid > 0 else 0
+    else:
+        bb_width_pct = 0
+    atr     = calc_atr(highs, lows, closes)
+    price   = closes[-1]
+    atr_pct = (atr / price * 100) if (atr and price > 0) else 0
+    if atr_pct > 4.0:
+        regime = "volatile"
+    elif adx is not None and adx > 25:
+        regime = "trend"
+    elif adx is not None and adx < 20:
+        regime = "flat"
+    else:
+        regime = "neutral"
+    return regime, adx, bb_width_pct, atr_pct
+
+def get_adaptive_min_votes(regime):
+    if regime == "trend":      return MIN_VOTES_TREND
+    elif regime == "flat":     return MIN_VOTES_FLAT
+    elif regime == "volatile": return MIN_VOTES_VOLATILE
+    else:                      return MIN_SIGNAL_VOTES
+
+
+# ============================================================
+# СЕЗОННОСТЬ (только крипта)
+# ============================================================
+def get_seasonality_signal(ticker):
+    now     = datetime.now(timezone.utc)
+    weekday = now.weekday()
+    hour    = now.hour
+    month   = now.month
+    day     = now.day
+    quarter_start_months = {1, 4, 7, 10}
+    is_quarter_start = month in quarter_start_months and day <= 14
+    signals = []
+    if ticker == "BTCUSDT":
+        if weekday == 6 and hour >= 17:
+            signals.append((-1, "🗓 Сезонность: BTC исторически слаб в воскресенье вечером UTC"))
+        elif weekday == 0 and hour < 10:
+            signals.append((+1, "🗓 Сезонность: BTC восстанавливается в пн утром"))
+    elif ticker == "ETHUSDT":
+        if weekday == 6 and hour >= 17:
+            signals.append((-1, "🗓 Сезонность: ETH слаб в воскресенье вечером (след. за BTC)"))
+    if not signals:
+        return 0, None
+    total   = sum(s[0] for s in signals)
+    reasons = [s[1] for s in signals]
+    return total, " | ".join(reasons)
+
+
+# ============================================================
+# FEAR & GREED
+# ============================================================
+def get_fear_greed():
+    global _fear_greed_cache
+    now_ts = time.time()
+    if _fear_greed_cache["value"] is not None and (now_ts - _fear_greed_cache["ts"]) < 3600:
+        return _fear_greed_cache["value"], _fear_greed_cache["label"], _fear_greed_cache.get("history", [])
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=8", timeout=10)
+        data    = r.json()["data"]
+        current = data[0]
+        value   = int(current["value"])
+        label   = current["value_classification"]
+        history = []
+        for item in data[1:8]:
+            ts = int(item["timestamp"])
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d.%m")
+            history.append({"date": dt, "value": int(item["value"]), "label": item["value_classification"]})
+        _fear_greed_cache = {"value": value, "label": label, "ts": now_ts, "history": history}
+        return value, label, history
+    except Exception as e:
+        print(f"  [FG] Ошибка: {e}")
+        return None, None, []
+
+def fear_greed_vote(ticker):
+    value, label, _ = get_fear_greed()
+    if value is None:
+        return 0, 0, None
+    if value <= 20:
+        return +1, 1.2, f"😱 Fear&Greed={value} ({label}) — экстрем. страх → покупай"
+    elif value <= 35:
+        return +1, 0.8, f"😨 Fear&Greed={value} ({label}) — страх → вероятный отскок"
+    elif value >= 80:
+        return -1, 1.2, f"🤑 Fear&Greed={value} ({label}) — жадность → риск разворота"
+    elif value >= 65:
+        return -1, 0.8, f"😏 Fear&Greed={value} ({label}) — жадность → осторожно"
+    else:
+        return 0, 0, f"😐 Fear&Greed={value} ({label}) — нейтрально"
+
+def format_fear_greed_msg():
+    value, label, history = get_fear_greed()
+    if value is None:
+        return "❌ Не удалось получить Fear & Greed Index. Попробуй позже."
+
+    bar_filled = max(0, min(20, int(value / 5)))
+    bar = "█" * bar_filled + "░" * (20 - bar_filled)
+
+    if value <= 10:
+        emoji, zone, advice = "😱", "КРАЙНИЙ СТРАХ", "Рынок в панике. Исторически — лучшее время для входа в лонг."
+    elif value <= 25:
+        emoji, zone, advice = "😰", "СТРАХ", "Продавцы доминируют. Ищи уровни поддержки для входа."
+    elif value <= 45:
+        emoji, zone, advice = "😐", "НЕЙТРАЛЬНЫЙ (ближе к страху)", "Рынок неуверен. Торгуй осторожно."
+    elif value <= 55:
+        emoji, zone, advice = "😶", "НЕЙТРАЛЬНЫЙ", "Баланс сил. Следи за объёмом и новостями."
+    elif value <= 65:
+        emoji, zone, advice = "🙂", "НЕЙТРАЛЬНЫЙ (ближе к жадности)", "Покупатели чуть активнее. Осторожно с лонгами."
+    elif value <= 80:
+        emoji, zone, advice = "😏", "ЖАДНОСТЬ", "Рынок перегрет. Уменьшай размер позиций."
+    else:
+        emoji, zone, advice = "🤑", "КРАЙНЯЯ ЖАДНОСТЬ", "Эйфория. Исторически — сигнал к продаже."
+
+    lines = [
+        "😱 <b>Fear & Greed Index — Крипторынок</b>", "",
+        f"{emoji} <b>{value}/100</b> — <b>{zone}</b>",
+        f"[{bar}]",
+        f"<i>Классификация: {label}</i>", "",
+        "💡 <b>Что это значит:</b>",
+        advice, "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "📅 <b>История последних 7 дней:</b>",
+    ]
+    if history:
+        for h in history:
+            v   = h["value"]
+            ico = ("😰" if v <= 25 else ("😐" if v <= 45 else
+                   ("😶" if v <= 55 else ("🙂" if v <= 65 else
+                   ("😏" if v <= 80 else "🤑")))))
+            bar_h = "▓" * int(v/10) + "░" * (10 - int(v/10))
+            lines.append(f"  {h['date']}: {ico} <b>{v}</b> [{bar_h}] {h['label']}")
+    lines += [
+        "", "📌 <b>Правило:</b> Покупай в страхе, продавай в жадности",
+        "⚠️ Только для крипто. Не финансовая рекомендация.",
+    ]
+    return "\n".join(lines)
+
+
+# ============================================================
+# WALK-FORWARD OPTIMIZATION
+# ============================================================
+DEFAULT_WEIGHTS = {
+    "rsi": 1.0, "stoch_rsi": 1.0, "ema": 1.0, "ema200": 1.0,
+    "macd": 1.0, "bollinger": 1.0, "supertrend": 1.2, "obv": 0.9,
+    "ichimoku": 1.1, "sr_level": 0.8, "volume": 0.8, "mtf": 1.3,
+    "fg_index": 0.7, "seasonality": 0.5,
+    "candle": 0.9,   # свечные паттерны — обновляется WFO
+}
+
+def load_weights():
+    global _indicator_weights
+    if _indicator_weights:
+        return _indicator_weights
+    if os.path.exists(WEIGHTS_FILE):
+        try:
+            with open(WEIGHTS_FILE, "r") as f:
+                data = json.load(f)
+                _indicator_weights = data.get("weights", DEFAULT_WEIGHTS.copy())
+                return _indicator_weights
+        except Exception:
+            pass
+    _indicator_weights = DEFAULT_WEIGHTS.copy()
+    return _indicator_weights
+
+def save_weights(weights):
+    global _indicator_weights
+    _indicator_weights = weights
+    try:
+        with open(WEIGHTS_FILE, "w") as f:
+            json.dump({"weights": weights, "updated": datetime.now(timezone.utc).isoformat()}, f, indent=2)
+    except Exception as e:
+        print(f"  [WFO] Ошибка сохранения: {e}")
+
+def _wfo_raw_klines(symbol, interval, limit):
+    if symbol not in TICKERS:
+        raise ValueError(f"Unknown ticker: {symbol}")
+    r = _session.get(
+        "https://fapi.binance.com/fapi/v1/klines",
+        params={"symbol": symbol, "interval": interval, "limit": int(limit)},
+        timeout=20,
+    )
+    r.raise_for_status()
+    raw = r.json()
+    if not isinstance(raw, list):
+        raise ValueError(f"Binance Futures error: {raw}")
+    if len(raw) < 50:
+        raise ValueError(f"Not enough Binance Futures candles: {len(raw)}")
+    return raw[:-1]  # remove unfinished candle
+
+
+def _wfo_pack_klines(raw):
+    return {
+        "open_times": [int(x[0]) for x in raw],
+        "close_times": [int(x[6]) for x in raw],
+        "opens": [float(x[1]) for x in raw],
+        "highs": [float(x[2]) for x in raw],
+        "lows": [float(x[3]) for x in raw],
+        "closes": [float(x[4]) for x in raw],
+        "volumes": [float(x[5]) for x in raw],
+    }
+
+
+def _wfo_aggregate_15m_to_45m_with_times(raw, limit):
+    if len(raw) < 3:
+        raise ValueError("Not enough 15m candles for 45m aggregation")
+    remainder = len(raw) % 3
+    if remainder:
+        raw = raw[remainder:]
+    chunks = [raw[i:i + 3] for i in range(0, len(raw), 3)]
+    chunks = chunks[-int(limit):]
+    rows = []
+    for ch in chunks:
+        rows.append([
+            int(ch[0][0]),
+            float(ch[0][1]),
+            max(float(x[2]) for x in ch),
+            min(float(x[3]) for x in ch),
+            float(ch[-1][4]),
+            sum(float(x[5]) for x in ch),
+            int(ch[-1][6]),
+        ])
+    return {
+        "open_times": [int(x[0]) for x in rows],
+        "close_times": [int(x[6]) for x in rows],
+        "opens": [float(x[1]) for x in rows],
+        "highs": [float(x[2]) for x in rows],
+        "lows": [float(x[3]) for x in rows],
+        "closes": [float(x[4]) for x in rows],
+        "volumes": [float(x[5]) for x in rows],
+    }
+
+
+def get_ohlcv_with_times(ticker, interval, limit=None):
+    """Futures OHLCV with open/close timestamps for leakage-safe WFO."""
+    base_limit = int(limit or INTERVALS.get(interval, {}).get("limit", 500))
+    if interval == "45m":
+        req_limit = min(1500, base_limit * 3 + 3)
+        raw = _wfo_raw_klines(ticker, "15m", req_limit)
+        return _wfo_aggregate_15m_to_45m_with_times(raw, min(base_limit, 499))
+    req_limit = min(1500, base_limit)
+    return _wfo_pack_klines(_wfo_raw_klines(ticker, interval, req_limit))
+
+
+def _wfo_slice_until(data, close_time_ms, min_len=50):
+    idx = 0
+    for ts in data.get("close_times", []):
+        if ts <= close_time_ms:
+            idx += 1
+        else:
+            break
+    if idx < min_len:
+        return None
+    return {
+        "opens": data["opens"][:idx],
+        "highs": data["highs"][:idx],
+        "lows": data["lows"][:idx],
+        "closes": data["closes"][:idx],
+        "volumes": data["volumes"][:idx],
+        "close_times": data["close_times"][:idx],
+    }
+
+
+def _wfo_seasonality_prediction_at(ticker, close_time_ms):
+    dt = datetime.fromtimestamp(int(close_time_ms) / 1000, tz=timezone.utc)
+    weekday = dt.weekday()
+    hour = dt.hour
+    if ticker == "BTCUSDT":
+        if weekday == 6 and hour >= 17:
+            return False, "BTC Sunday evening UTC weakness"
+        if weekday == 0 and hour < 10:
+            return True, "BTC Monday morning recovery"
+    if ticker == "ETHUSDT" and weekday == 6 and hour >= 17:
+        return False, "ETH Sunday evening UTC weakness"
+    return None, None
+
+
+def _wfo_prediction_pack(ticker, i, data, mtf_data):
+    opens = data["opens"][:i]
+    highs = data["highs"][:i]
+    lows = data["lows"][:i]
+    closes = data["closes"][:i]
+    volumes = data["volumes"][:i]
+    close_times = data["close_times"]
+    signal_time = close_times[i - 1]
+    price = closes[-1]
+    preds = {}
+
+    rsi = calc_rsi(closes)
+    if rsi is not None:
+        preds["rsi"] = rsi < 50
+
+    sk, _ = calc_stoch_rsi(closes)
+    if sk is not None:
+        preds["stoch_rsi"] = sk < 50
+
+    e20 = calc_ema(closes, 20)
+    e50 = calc_ema(closes, 50)
+    if e20 and e50:
+        if price > e20 > e50:
+            preds["ema"] = True
+        elif price < e20 < e50:
+            preds["ema"] = False
+
+    e200 = calc_ema(closes, 200)
+    if e200:
+        preds["ema200"] = price > e200
+
+    macd, msig = calc_macd(closes)
+    if macd is not None and msig is not None:
+        preds["macd"] = macd > msig
+
+    bb_l, bb_m, bb_h = calc_bollinger(closes)
+    if bb_l and bb_m and bb_h:
+        preds["bollinger"] = price < bb_m
+
+    st_dir, _ = calc_supertrend(highs, lows, closes)
+    if st_dir is not None:
+        preds["supertrend"] = st_dir == 1
+
+    _, obv_t = calc_obv(closes, volumes)
+    if obv_t is not None:
+        preds["obv"] = obv_t > 0
+
+    if len(closes) >= 52:
+        ich = calc_ichimoku(list(highs), list(lows), list(closes))
+        if ich and ich["tenkan"] and ich["kijun"]:
+            preds["ichimoku"] = ich["tenkan"] > ich["kijun"] and (ich["cloud_top"] is None or price > ich["cloud_top"])
+
+    if len(closes) >= 30:
+        sup, res = calc_support_resistance(list(highs), list(lows), list(closes))
+        dist_sup = (price - sup) / price * 100
+        dist_res = (res - price) / price * 100
+        if dist_sup < 2:
+            preds["sr_level"] = True
+        elif dist_res < 2:
+            preds["sr_level"] = False
+
+    if len(volumes) >= 20 and e20 and e50:
+        avg_v = sum(volumes[-20:-1]) / 19
+        ratio = volumes[-1] / avg_v if avg_v > 0 else 1.0
+        if ratio > 1.5 or ratio < 0.7:
+            preds["volume"] = price > e20
+
+    mtf_score = 0
+    for tf, tf_data in mtf_data.items():
+        sliced = _wfo_slice_until(tf_data, signal_time, min_len=60)
+        if not sliced:
+            continue
+        mc = sliced["closes"]
+        e20_m = calc_ema(mc, 20)
+        e50_m = calc_ema(mc, 50)
+        if e20_m and e50_m:
+            if mc[-1] > e20_m > e50_m:
+                mtf_score += 1
+            elif mc[-1] < e20_m < e50_m:
+                mtf_score -= 1
+    if mtf_score > 0:
+        preds["mtf"] = True
+    elif mtf_score < 0:
+        preds["mtf"] = False
+
+    season_pred, _ = _wfo_seasonality_prediction_at(ticker, signal_time)
+    if season_pred is not None:
+        preds["seasonality"] = season_pred
+
+    if len(closes) >= 5 and len(opens) >= i:
+        try:
+            candle_patterns = detect_candle_patterns(opens, list(highs), list(lows), list(closes))
+            candle_net = sum(direction for (_, direction, _strength) in candle_patterns)
+            if candle_net > 0:
+                preds["candle"] = True
+            elif candle_net < 0:
+                preds["candle"] = False
+        except Exception:
+            pass
+
+    # Historical Fear & Greed is not stored in this bot, so optimizing it would leak current data.
+    return preds
+
+
+def _wfo_stats(points):
+    stats = {k: {"wins": 0, "total": 0} for k in DEFAULT_WEIGHTS}
+    for row in points:
+        actual = row["actual_up"]
+        for ind, pred in row["preds"].items():
+            if ind not in stats:
+                continue
+            stats[ind]["wins"] += 1 if pred == actual else 0
+            stats[ind]["total"] += 1
+    return stats
+
+
+def _wfo_weight_from_stat(ind, stat, min_samples=8):
+    if ind == "fg_index":
+        return DEFAULT_WEIGHTS[ind], "⏸ нет исторических данных"
+    if stat["total"] < min_samples:
+        return DEFAULT_WEIGHTS[ind], "⚠️ мало train"
+    wr = stat["wins"] / stat["total"]
+    weight = round(max(0.3, min(2.0, wr * 2.0)), 2)
+    if wr >= 0.57:
+        status = "✅ train strong"
+    elif wr >= 0.52:
+        status = "🟡 train ok"
+    elif wr >= 0.47:
+        status = "⚠️ train weak"
+    else:
+        status = "❌ train poor"
+    return weight, status
+
+
+def _wfo_eval_ensemble(points, weights, min_edge=0.05):
+    total = wins = skipped = 0
+    edge_sum = 0.0
+    for row in points:
+        bull = 0.0
+        bear = 0.0
+        for ind, pred in row["preds"].items():
+            w = weights.get(ind, DEFAULT_WEIGHTS.get(ind, 1.0))
+            if pred:
+                bull += w
+            else:
+                bear += w
+        denom = bull + bear
+        if denom <= 0:
+            skipped += 1
+            continue
+        edge = abs(bull - bear) / denom
+        if edge < min_edge:
+            skipped += 1
+            continue
+        pred_up = bull > bear
+        wins += 1 if pred_up == row["actual_up"] else 0
+        total += 1
+        edge_sum += edge
+    return {
+        "wins": wins,
+        "total": total,
+        "wr": wins / total * 100 if total else 0.0,
+        "skipped": skipped,
+        "avg_edge": edge_sum / total if total else 0.0,
+    }
+
+
+def _wfo_wr(stat):
+    return stat["wins"] / stat["total"] * 100 if stat.get("total") else 0.0
+
+
+def run_walk_forward_optimization(ticker="BTCUSDT", interval="1h", n_candles=200):
+    """
+    Leakage-aware WFO:
+    - uses futures OHLCV with timestamps;
+    - aligns higher timeframes by close_time <= signal_time;
+    - trains weights only on the first 70% of historical points;
+    - reports OOS/test quality on the last 30%;
+    - skips Fear & Greed optimization unless historical values are stored later.
+    """
+    min_history = 120
+    train_ratio = 0.70
+    limit = min(1500, max(INTERVALS.get(interval, {}).get("limit", 500), n_candles + min_history + 20))
+    try:
+        data = get_ohlcv_with_times(ticker, interval, limit=limit)
+    except Exception as e:
+        return None, f"Ошибка получения timestamp OHLCV: {e}"
+
+    closes = data["closes"]
+    n = len(closes)
+    if n < min_history + 30:
+        return None, f"Недостаточно данных. Есть {n} свечей, нужно минимум {min_history + 30}"
+
+    start_idx = max(min_history, n - n_candles)
+    if start_idx >= n - 2:
+        return None, f"Недостаточно данных для WFO: start={start_idx}, n={n}"
+
+    mtf_data = {}
+    mtf_errors = []
+    for tf in MTF_HIERARCHY.get(interval, []):
+        try:
+            mtf_data[tf] = get_ohlcv_with_times(ticker, tf, limit=1000)
+        except Exception as e:
+            mtf_errors.append(f"{tf}: {e}")
+
+    points = []
+    for i in range(start_idx, n):
+        if i <= 0 or i >= n:
+            continue
+        try:
+            preds = _wfo_prediction_pack(ticker, i, data, mtf_data)
+            actual_up = closes[i] > closes[i - 1]
+            points.append({
+                "i": i,
+                "time": data["close_times"][i - 1],
+                "actual_up": actual_up,
+                "preds": preds,
+            })
+        except Exception:
+            continue
+
+    if len(points) < 30:
+        return None, f"Мало валидных WFO-точек: {len(points)}. Нужно хотя бы 30."
+
+    split = int(len(points) * train_ratio)
+    split = max(10, min(len(points) - 10, split))
+    train_points = points[:split]
+    test_points = points[split:]
+    train_stats = _wfo_stats(train_points)
+    test_stats = _wfo_stats(test_points)
+
+    new_weights = DEFAULT_WEIGHTS.copy()
+    statuses = {}
+    for ind in DEFAULT_WEIGHTS:
+        weight, status = _wfo_weight_from_stat(ind, train_stats[ind])
+        new_weights[ind] = weight
+        statuses[ind] = status
+
+    ensemble_train = _wfo_eval_ensemble(train_points, new_weights)
+    ensemble_test = _wfo_eval_ensemble(test_points, new_weights)
+    degradation = ensemble_train["wr"] - ensemble_test["wr"]
+
+    save_weights(new_weights)
+
+    start_dt = datetime.fromtimestamp(points[0]["time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    split_dt = datetime.fromtimestamp(test_points[0]["time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    end_dt = datetime.fromtimestamp(points[-1]["time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    verdict = "✅ OOS не развалился, но это всё ещё не гарантия"
+    if ensemble_test["total"] < 20:
+        verdict = "⚠️ OOS мало точек: доверие низкое"
+    elif ensemble_test["wr"] < 50 or degradation > 12:
+        verdict = "🚨 Возможное переобучение: OOS слабее train"
+    elif degradation > 7:
+        verdict = "⚠️ Есть деградация на OOS — веса использовать осторожно"
+
+    report_lines = [
+        "⚙️ <b>Walk-Forward Optimization v6.4</b>",
+        f"Тикер: <b>{ticker}</b> | TF: <b>{interval}</b> | Points: <b>{len(points)}</b>",
+        f"Период: {start_dt} → {end_dt} | OOS starts: {split_dt}",
+        f"Train/Test: <b>{len(train_points)}</b>/<b>{len(test_points)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "<b>Indicator       Train      OOS        Weight</b>",
+    ]
+
+    for ind in DEFAULT_WEIGHTS:
+        tr = train_stats[ind]
+        te = test_stats[ind]
+        tr_s = f"{_wfo_wr(tr):5.1f}%/{tr['total']:<3}" if tr["total"] else "   —  /0  "
+        te_s = f"{_wfo_wr(te):5.1f}%/{te['total']:<3}" if te["total"] else "   —  /0  "
+        report_lines.append(f"{ind:<13} {tr_s} {te_s}  {new_weights[ind]:.2f} {statuses[ind]}")
+
+    report_lines += [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Ensemble Train: <b>{ensemble_train['wr']:.1f}%</b> | N={ensemble_train['total']} | edge={ensemble_train['avg_edge']:.2f}",
+        f"Ensemble OOS:   <b>{ensemble_test['wr']:.1f}%</b> | N={ensemble_test['total']} | edge={ensemble_test['avg_edge']:.2f}",
+        f"Degradation: <b>{degradation:+.1f} pp</b>",
+        "",
+        verdict,
+        "✅ Веса обновлены только по TRAIN-части. OOS использовался только как проверка.",
+        "⏸ Fear & Greed не оптимизируется: нет сохранённой исторической серии.",
+    ]
+    if mtf_errors:
+        report_lines.append("ℹ️ MTF частично недоступен: " + " | ".join(mtf_errors[:2]))
+    return new_weights, "\n".join(report_lines)
+
+def wfo_weekly_loop():
+    print("  [thread] wfo_weekly_loop запущен")
+    while True:
+        now = datetime.now(timezone.utc)
+        if now.weekday() == 6 and now.hour == 2 and now.minute < 10:
+            run_walk_forward_optimization("BTCUSDT", "1h", 200)
+            time.sleep(600)
+        time.sleep(30)
+
+
+# ============================================================
+# КРИТЕРИЙ КЕЛЛИ
+# ============================================================
+def kelly_criterion(win_rate, risk_reward_ratio):
+    if risk_reward_ratio <= 0:
+        return 0.0
+    f = (win_rate * risk_reward_ratio - (1 - win_rate)) / risk_reward_ratio
+    return round(max(0.0, min(0.25, f / 2)) * 100, 1)
+
+# ============================================================
+# КАЛЬКУЛЯТОР ПОЗИЦИИ С ПЛЕЧОМ
+# ============================================================
+def calc_position_details(balance, size_pct, leverage, entry, sl, tp1, tp2, direction):
+    margin       = balance * size_pct / 100
+    position_val = margin * leverage
+    qty          = position_val / entry if entry > 0 else 0
+
+    if direction == "long":
+        pnl_tp1 = (tp1 - entry) / entry * position_val
+        pnl_tp2 = (tp2 - entry) / entry * position_val
+        pnl_sl  = (sl  - entry) / entry * position_val
+        liq_price = entry * (1 - 1 / leverage + 0.004)
+    else:
+        pnl_tp1 = (entry - tp1) / entry * position_val
+        pnl_tp2 = (entry - tp2) / entry * position_val
+        pnl_sl  = (entry - sl)  / entry * position_val
+        liq_price = entry * (1 + 1 / leverage - 0.004)
+
+    return {
+        "margin":             round(margin, 4),
+        "position_val":       round(position_val, 4),
+        "qty":                round(qty, 6),
+        "pnl_tp1":            round(pnl_tp1, 4),
+        "pnl_tp2":            round(pnl_tp2, 4),
+        "pnl_sl":             round(pnl_sl, 4),
+        "pnl_tp1_pct_margin": round(pnl_tp1 / margin * 100, 2) if margin > 0 else 0,
+        "pnl_tp2_pct_margin": round(pnl_tp2 / margin * 100, 2) if margin > 0 else 0,
+        "pnl_sl_pct_margin":  round(pnl_sl  / margin * 100, 2) if margin > 0 else 0,
+        "pnl_tp1_pct_bal":    round(pnl_tp1 / balance * 100, 2) if balance > 0 else 0,
+        "pnl_tp2_pct_bal":    round(pnl_tp2 / balance * 100, 2) if balance > 0 else 0,
+        "pnl_sl_pct_bal":     round(pnl_sl  / balance * 100, 2) if balance > 0 else 0,
+        "liq_price":          round(liq_price, 4),
+        "balance_after_tp1":  round(balance + pnl_tp1, 4),
+        "balance_after_tp2":  round(balance + pnl_tp2, 4),
+        "balance_after_sl":   round(balance + pnl_sl,  4),
+    }
+
+
+def recommend_size_pct(kelly_pct, regime, leverage):
+    base = kelly_pct if (kelly_pct and kelly_pct > 0) else 10.0
+
+    regime_mult = {"trend": 1.0, "flat": 0.7, "volatile": 0.5, "neutral": 0.8}.get(regime, 0.8)
+
+    if   leverage >= 50: lev_mult = 0.3
+    elif leverage >= 20: lev_mult = 0.5
+    elif leverage >= 10: lev_mult = 0.7
+    elif leverage >= 5:  lev_mult = 0.85
+    else:                lev_mult = 1.0
+
+    result = base * regime_mult * lev_mult
+
+    if   leverage >= 20: result = min(result, 5.0)
+    elif leverage >= 10: result = min(result, 10.0)
+    else:                result = min(result, 20.0)
+
+    return round(max(1.0, result), 1)
+
+
+def format_position_calc(balance, size_pct, leverage, entry, calc, direction, ticker, regime, kelly_pct):
+    tk        = TICKERS[ticker]["label"]
+    dir_emoji = "🟢 LONG" if direction == "long" else "🔴 SHORT"
+    rec_pct   = recommend_size_pct(kelly_pct, regime, leverage)
+
+    warnings = []
+    if leverage >= 50:
+        warnings.append("🚨 Плечо x50+ — экстремальный риск!")
+    elif leverage >= 20:
+        warnings.append("⚠️ Плечо x20+ — используй маленький % маржи.")
+    if size_pct > rec_pct * 1.5:
+        warnings.append(f"⚠️ Ты ставишь {size_pct}% — рекомендую не более {rec_pct}%")
+    if abs(calc["pnl_sl_pct_bal"]) > 5:
+        warnings.append(f"🔴 Риск убытка {abs(calc['pnl_sl_pct_bal']):.1f}% от баланса — это много!")
+
+    lines = [
+        f"💰 <b>Расчёт позиции — {tk}</b>",
+        f"{dir_emoji}  |  Плечо: <b>x{leverage}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"💵 Твой баланс:     <b>${balance:.2f}</b>",
+        f"🎲 Маржа ({size_pct}%):  <b>${calc['margin']:.2f}</b>",
+        f"📦 Объём позиции:   <b>${calc['position_val']:.2f}</b>",
+        f"🪙 Количество:      <b>{calc['qty']} {ticker.replace('USDT','')}</b>",
+        f"💲 Цена входа:      <b>{fmt_price(entry, ticker)}</b>",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "📊 <b>Сценарии:</b>",
+        "",
+        f"🎯 TP1 → <b>+${calc['pnl_tp1']:.2f}</b>",
+        f"   ({calc['pnl_tp1_pct_margin']:+.1f}% от маржи | {calc['pnl_tp1_pct_bal']:+.1f}% от баланса)",
+        f"   Баланс станет: <b>${calc['balance_after_tp1']:.2f}</b>",
+        "",
+        f"🎯 TP2 → <b>+${calc['pnl_tp2']:.2f}</b>",
+        f"   ({calc['pnl_tp2_pct_margin']:+.1f}% от маржи | {calc['pnl_tp2_pct_bal']:+.1f}% от баланса)",
+        f"   Баланс станет: <b>${calc['balance_after_tp2']:.2f}</b>",
+        "",
+        f"🔴 SL  → <b>${calc['pnl_sl']:.2f}</b>",
+        f"   ({calc['pnl_sl_pct_margin']:+.1f}% от маржи | {calc['pnl_sl_pct_bal']:+.1f}% от баланса)",
+        f"   Баланс станет: <b>${calc['balance_after_sl']:.2f}</b>",
+        "",
+        f"💥 Цена ликвидации: <b>{fmt_price(calc['liq_price'], ticker)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🧠 Рекомендую маржу: <b>{rec_pct}%</b>  (≈${balance * rec_pct / 100:.2f})",
+        f"   Kelly={kelly_pct or 0:.1f}% | Режим: {regime} | Плечо: x{leverage}",
+    ]
+
+    if warnings:
+        lines.append("")
+        lines.extend(warnings)
+
+    lines += ["", "⚠️ Расчёт приблизительный. Учитывай комиссии биржи."]
+    return "\n".join(lines)
+
+# ============================================================
+# КОРРЕЛЯЦИОННЫЙ ФИЛЬТР
+# ============================================================
+def check_correlation_filter(ticker, signals_cache):
+    for pair in CORR_PAIRS:
+        if ticker not in pair:
+            continue
+        other = pair[0] if ticker == pair[1] else pair[1]
+        if other not in signals_cache:
+            continue
+        my_score    = signals_cache.get(ticker, {}).get("score", 0)
+        other_score = signals_cache.get(other,  {}).get("score", 0)
+        if abs(my_score) < abs(other_score):
+            return True, other
+    return False, None
+
+def calc_rolling_correlation(closes1, closes2, period=30):
+    if len(closes1) < period or len(closes2) < period:
+        return None
+    a  = np.array(closes1[-period:])
+    b  = np.array(closes2[-period:])
+    ra = np.diff(a) / a[:-1]
+    rb = np.diff(b) / b[:-1]
+    if np.std(ra) == 0 or np.std(rb) == 0:
+        return None
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
+# ============================================================
+# БАЗОВЫЕ ИНДИКАТОРЫ
+# ============================================================
+def calc_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [max(d, 0) for d in deltas]
+    losses = [abs(min(d, 0)) for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100 - (100 / (1 + avg_gain / avg_loss))
+
+def calc_ema(closes, period):
+    if len(closes) < period:
+        return None
+    k   = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+def calc_macd(closes):
+    if len(closes) < 26:
+        return None, None
+    k12 = 2 / (12 + 1)
+    k26 = 2 / (26 + 1)
+    ema12 = sum(closes[:12]) / 12
+    ema26 = sum(closes[:26]) / 26
+    for price in closes[12:26]:
+        ema12 = price * k12 + ema12 * (1 - k12)
+    macd_vals = []
+    for price in closes[26:]:
+        ema12 = price * k12 + ema12 * (1 - k12)
+        ema26 = price * k26 + ema26 * (1 - k26)
+        macd_vals.append(ema12 - ema26)
+    if not macd_vals:
+        return None, None
+    macd_line = macd_vals[-1]
+    if len(macd_vals) < 9:
+        return macd_line, None
+    k9 = 2 / (9 + 1)
+    sig = sum(macd_vals[:9]) / 9
+    for v in macd_vals[9:]:
+        sig = v * k9 + sig * (1 - k9)
+    return macd_line, sig
+
+def calc_bollinger(closes, period=20):
+    if len(closes) < period:
+        return None, None, None
+    window = closes[-period:]
+    mid    = sum(window) / period
+    std    = (sum((x - mid) ** 2 for x in window) / period) ** 0.5
+    return mid - 2 * std, mid, mid + 2 * std
+
+def calc_support_resistance(highs, lows, closes, lookback=30):
+    return min(lows[-lookback:]), max(highs[-lookback:])
+
+def detect_range_htf(highs, lows, closes, min_touches=2, min_width_pct=0.5):
+    """
+    Определяет боковик на HTF (15m).
+    Возвращает (range_high, range_low) или None если боковика нет.
+    """
+    if len(closes) < 30:
+        return None
+
+    adx = calc_adx(highs, lows, closes)
+    if adx is not None and adx > 22:
+        return None  # тренд — боковика нет
+
+    # Берём последние 40 свечей для поиска боковика
+    lookback = 40
+    h = highs[-lookback:]
+    l = lows[-lookback:]
+    c = closes[-lookback:]
+
+    # Границы боковика через перцентили (устойчивее к выбросам)
+    range_high = np.percentile(h, 90)
+    range_low  = np.percentile(l, 10)
+
+    # Проверка ширины канала
+    width_pct = (range_high - range_low) / range_low * 100
+    if width_pct < min_width_pct:
+        return None  # канал слишком узкий — комиссия съест прибыль
+    if width_pct > 15:
+        return None  # слишком широко — это не боковик, а волатильность
+
+    # Считаем касания верхней и нижней границы
+    touch_zone = width_pct * 0.015  # 1.5% от ширины = зона касания
+
+    touches_high = sum(
+        1 for i in range(len(h))
+        if abs(h[i] - range_high) / range_high * 100 < touch_zone
+    )
+    touches_low = sum(
+        1 for i in range(len(l))
+        if abs(l[i] - range_low) / range_low * 100 < touch_zone
+    )
+
+    if touches_high < min_touches or touches_low < min_touches:
+        return None  # недостаточно касаний — нет сформированного боковика
+
+    return range_high, range_low
+
+def detect_liquidity_grab(highs, lows, closes, volumes, range_high, range_low):
+    """
+    Ищет захват ликвидности (Stop Hunt) на последних 3 свечах HTF.
+
+    Бычий grab:  фитиль пробил range_low, свеча закрылась выше + объём выше среднего
+    Медвежий grab: фитиль пробил range_high, свеча закрылась ниже + объём выше среднего
+
+    Возвращает: ("bull", grab_low) / ("bear", grab_high) / None
+    """
+    if len(closes) < 20:
+        return None
+
+    # Средний объём за последние 20 свечей (исключая последнюю)
+    avg_vol = sum(volumes[-20:-1]) / 19 if len(volumes) >= 20 else None
+
+    # Проверяем последние 3 свечи (grab мог быть чуть раньше)
+    for i in range(-3, 0):
+        h = highs[i];  l = lows[i];  c = closes[i]
+        vol = volumes[i]
+
+        # Объёмное подтверждение — ключевое условие
+        vol_confirmed = (avg_vol is None) or (vol > avg_vol * 1.2)
+
+        # Бычий grab: фитиль ниже range_low, закрытие выше range_low
+        if l < range_low and c > range_low and vol_confirmed:
+            penetration = (range_low - l) / range_low * 100
+            if penetration > 0.1:  # укол не менее 0.1% — не микрошум
+                return "bull", l   # l = точка ложного пробоя = уровень SL
+
+        # Медвежий grab: фитиль выше range_high, закрытие ниже range_high
+        if h > range_high and c < range_high and vol_confirmed:
+            penetration = (h - range_high) / range_high * 100
+            if penetration > 0.1:
+                return "bear", h   # h = точка ложного пробоя = уровень SL
+
+    return None
+
+def detect_msb(highs, lows, closes, grab_type):
+    """
+    Слом структуры (MSB/CHoCH) на LTF (5m) после liquidity grab.
+
+    Для лонга (grab_type="bull"):
+        Ищем: цена перестала делать новые минимумы + закрылась выше
+        предыдущего локального максимума (Higher High)
+
+    Для шорта (grab_type="bear"):
+        Ищем: цена перестала делать новые максимумы + закрылась ниже
+        предыдущего локального минимума (Lower Low)
+
+    Возвращает: (True, entry_price, sl_reference) или (False, None, None)
+    """
+    if len(closes) < 10:
+        return False, None, None
+
+    # Берём последние 10 свечей LTF для поиска слома
+    h = highs[-10:]
+    l = lows[-10:]
+    c = closes[-10:]
+
+    if grab_type == "bull":
+        # Ищем локальный минимум (точку разворота)
+        local_low_idx = l.index(min(l))
+
+        # После минимума должен быть Higher High
+        if local_low_idx >= len(h) - 2:
+            return False, None, None  # минимум слишком свежий, нет подтверждения
+
+        post_low_highs = h[local_low_idx:]
+        pre_low_high   = max(h[:local_low_idx + 1]) if local_low_idx > 0 else h[0]
+
+        # Слом: максимум после разворота выше предыдущего максимума
+        if max(post_low_highs) > pre_low_high:
+            # Вход на текущей цене (после подтверждения закрытия свечи)
+            entry = c[-1]
+            sl    = min(l)   # за самый нижний фитиль grab-зоны
+            return True, entry, sl
+
+    elif grab_type == "bear":
+        local_high_idx = h.index(max(h))
+
+        if local_high_idx >= len(l) - 2:
+            return False, None, None
+
+        post_high_lows = l[local_high_idx:]
+        pre_high_low   = min(l[:local_high_idx + 1]) if local_high_idx > 0 else l[0]
+
+        if min(post_high_lows) < pre_high_low:
+            entry = c[-1]
+            sl    = max(h)
+            return True, entry, sl
+
+    return False, None, None
+
+def calc_volume_signal(volumes):
+    if len(volumes) < 20:
+        return None, None
+    avg_vol  = sum(volumes[-20:-1]) / 19
+    last_vol = volumes[-1]
+    return last_vol, last_vol / avg_vol if avg_vol > 0 else 1.0
+
+def calc_atr(highs, lows, closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i-1]),
+                 abs(lows[i]  - closes[i-1]))
+        trs.append(tr)
+    return sum(trs[-period:]) / period
+
+def calc_stoch_rsi(closes, rsi_period=14, stoch_period=14, smooth_k=3, smooth_d=3):
+    if len(closes) < rsi_period + stoch_period + smooth_k + smooth_d:
+        return None, None
+    rsi_series = [r for r in
+                  [calc_rsi(closes[:i], rsi_period) for i in range(rsi_period + 1, len(closes) + 1)]
+                  if r is not None]
+    if len(rsi_series) < stoch_period:
+        return None, None
+    raw_k = []
+    for i in range(stoch_period, len(rsi_series) + 1):
+        w = rsi_series[i - stoch_period:i]
+        lo, hi = min(w), max(w)
+        raw_k.append((rsi_series[i-1] - lo) / (hi - lo) * 100 if hi != lo else 50.0)
+    if len(raw_k) < smooth_k:
+        return None, None
+    smooth_K = [sum(raw_k[i - smooth_k:i]) / smooth_k for i in range(smooth_k, len(raw_k) + 1)]
+    if len(smooth_K) < smooth_d:
+        return None, None
+    smooth_D = [sum(smooth_K[i - smooth_d:i]) / smooth_d for i in range(smooth_d, len(smooth_K) + 1)]
+    return smooth_K[-1], smooth_D[-1]
+
+def calc_obv(closes, volumes):
+    if len(closes) < 20:
+        return None, None
+    obv = 0.0
+    obv_series = [0.0]
+    for i in range(1, len(closes)):
+        obv += (volumes[i] if closes[i] > closes[i-1]
+                else (-volumes[i] if closes[i] < closes[i-1] else 0))
+        obv_series.append(obv)
+    ema5  = calc_ema(obv_series, 5)
+    ema20 = calc_ema(obv_series, 20)
+    if ema5 is None or ema20 is None:
+        return obv_series[-1], None
+    return obv_series[-1], ema5 - ema20
+
+def calc_supertrend(highs, lows, closes, period=10, multiplier=3.0):
+    n = len(closes)
+    if n < period + 2:
+        return None, None
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+           for i in range(1, n)]
+    atr_series = [None] * period
+    atr_val    = sum(trs[:period]) / period
+    atr_series.append(atr_val)
+    for i in range(period, len(trs)):
+        atr_val = (atr_val * (period - 1) + trs[i]) / period
+        atr_series.append(atr_val)
+    upper_basic = [(highs[i] + lows[i]) / 2 + multiplier * atr_series[i]
+                   if atr_series[i] else None for i in range(n)]
+    lower_basic = [(highs[i] + lows[i]) / 2 - multiplier * atr_series[i]
+                   if atr_series[i] else None for i in range(n)]
+    final_upper = [None] * n; final_lower = [None] * n; direction = [1] * n
+    for i in range(1, n):
+        if upper_basic[i] is None:
+            continue
+        final_upper[i] = (upper_basic[i]
+                          if upper_basic[i] < (final_upper[i-1] or upper_basic[i])
+                          or closes[i-1] > (final_upper[i-1] or upper_basic[i])
+                          else (final_upper[i-1] or upper_basic[i]))
+        final_lower[i] = (lower_basic[i]
+                          if lower_basic[i] > (final_lower[i-1] or lower_basic[i])
+                          or closes[i-1] < (final_lower[i-1] or lower_basic[i])
+                          else (final_lower[i-1] or lower_basic[i]))
+        if direction[i-1] == -1 and closes[i] > final_upper[i]:
+            direction[i] = 1
+        elif direction[i-1] == 1 and closes[i] < final_lower[i]:
+            direction[i] = -1
+        else:
+            direction[i] = direction[i-1]
+    st_line = final_lower[-1] if direction[-1] == 1 else final_upper[-1]
+    return direction[-1], st_line
+
+def calc_ichimoku(highs, lows, closes):
+    n = len(closes)
+    if n < 52:
+        return None
+    def midpoint(h, l, period, idx):
+        wh = h[idx - period + 1: idx + 1]; wl = l[idx - period + 1: idx + 1]
+        return (max(wh) + min(wl)) / 2 if len(wh) >= period else None
+    tenkan   = midpoint(highs, lows, 9,  n - 1)
+    kijun    = midpoint(highs, lows, 26, n - 1)
+    senkou_a = ((tenkan + kijun) / 2) if (tenkan and kijun) else None
+    senkou_b = midpoint(highs, lows, 52, n - 1)
+    cloud_top    = max(senkou_a, senkou_b) if (senkou_a and senkou_b) else None
+    cloud_bottom = min(senkou_a, senkou_b) if (senkou_a and senkou_b) else None
+    chikou_ref   = closes[n - 26] if n >= 26 else None
+    return {"tenkan": tenkan, "kijun": kijun,
+            "cloud_top": cloud_top, "cloud_bottom": cloud_bottom,
+            "chikou_price": closes[-1], "chikou_ref": chikou_ref, "price": closes[-1]}
+
+# ============================================================
+# ДОПОЛНИТЕЛЬНЫЕ ИНДИКАТОРЫ (точность сигналов)
+# ============================================================
+
+def calc_vwap(highs, lows, closes, volumes):
+    """VWAP — Volume Weighted Average Price за сессию (последние 100 свечей)."""
+    n = min(len(closes), 100)
+    if n < 5:
+        return None
+    tp  = [(highs[-n+i] + lows[-n+i] + closes[-n+i]) / 3 for i in range(n)]
+    vol = volumes[-n:]
+    cum_tpv = sum(tp[i] * vol[i] for i in range(n))
+    cum_vol = sum(vol)
+    return cum_tpv / cum_vol if cum_vol > 0 else None
+
+
+def detect_candle_patterns(opens, highs, lows, closes):
+    """
+    Распознавание свечных паттернов.
+    Возвращает список (название, направление, сила):
+      направление: +1 бычий, -1 медвежий, 0 нейтральный
+      сила: 1.0 базовая, 1.5 сильный, 2.0 очень сильный
+    """
+    if len(closes) < 5:
+        return []
+
+    patterns = []
+    o,  h,  l,  c  = opens[-1],  highs[-1],  lows[-1],  closes[-1]
+    po, ph, pl, pc = opens[-2],  highs[-2],  lows[-2],  closes[-2]
+    o3, h3, l3, c3 = opens[-3],  highs[-3],  lows[-3],  closes[-3]
+    o4, h4, l4, c4 = opens[-4],  highs[-4],  lows[-4],  closes[-4]
+    o5, h5, l5, c5 = opens[-5],  highs[-5],  lows[-5],  closes[-5]
+
+    body         = abs(c - o)
+    prev_body    = abs(pc - po)
+    upper_wick   = h - max(o, c)
+    lower_wick   = min(o, c) - l
+    full_range   = h - l if h != l else 1e-9
+    prev_range   = ph - pl if ph != pl else 1e-9
+
+    # ── Контекст: локальный тренд (последние 5 свечей) ──
+    _trend_up   = closes[-5] < closes[-3] < closes[-1]
+    _trend_down = closes[-5] > closes[-3] > closes[-1]
+
+    # ── 1-свечные паттерны ──────────────────────────────
+
+    # Doji — нерешительность (сила зависит от предшествующего движения)
+    if body / full_range < 0.08:
+        _doji_str = 1.5 if (_trend_up or _trend_down) else 1.0
+        patterns.append(("doji", 0, _doji_str))
+
+    # Hammer — бычий разворот (требует нисходящего контекста)
+    if (lower_wick > body * 2.0 and
+            upper_wick < body * 0.5 and
+            _trend_down):
+        _str = 1.5 if c > o else 1.0   # бычье тело сильнее
+        patterns.append(("hammer", +1, _str))
+
+    # Inverted Hammer — бычий после падения (слабее классического)
+    if (upper_wick > body * 2.0 and
+            lower_wick < body * 0.5 and
+            _trend_down and c > o):
+        patterns.append(("inverted_hammer", +1, 1.0))
+
+    # Shooting Star — медвежий разворот (требует восходящего контекста)
+    if (upper_wick > body * 2.0 and
+            lower_wick < body * 0.5 and
+            _trend_up):
+        _str = 1.5 if c < o else 1.0
+        patterns.append(("shooting_star", -1, _str))
+
+    # Hanging Man — медвежий после роста (внешне как молот)
+    if (lower_wick > body * 2.0 and
+            upper_wick < body * 0.5 and
+            _trend_up and c < o):
+        patterns.append(("hanging_man", -1, 1.0))
+
+    # Pin Bar — экстремальный отказ от уровня (длинная тень > 3x тела)
+    if lower_wick > body * 3.0 and upper_wick < body * 0.3:
+        patterns.append(("pin_bar_bull", +1, 1.5))
+    if upper_wick > body * 3.0 and lower_wick < body * 0.3:
+        patterns.append(("pin_bar_bear", -1, 1.5))
+
+    # ── 2-свечные паттерны ──────────────────────────────
+
+    # Bullish Engulfing — поглощение (тело полностью покрывает предыдущее)
+    if (c > o and pc < po and o <= pc and c >= po):
+        _size_mult = min(2.0, body / prev_body) if prev_body > 0 else 1.0
+        _str = 1.5 if _size_mult > 1.5 else 1.0
+        patterns.append(("bullish_engulfing", +1, _str))
+
+    # Bearish Engulfing
+    if (c < o and pc > po and o >= pc and c <= po):
+        _size_mult = min(2.0, body / prev_body) if prev_body > 0 else 1.0
+        _str = 1.5 if _size_mult > 1.5 else 1.0
+        patterns.append(("bearish_engulfing", -1, _str))
+
+    # Tweezer Bottom — два одинаковых минимума (разворот вверх)
+    if (abs(l - pl) / full_range < 0.05 and
+            c > o and pc < po and _trend_down):
+        patterns.append(("tweezer_bottom", +1, 1.5))
+
+    # Tweezer Top — два одинаковых максимума (разворот вниз)
+    if (abs(h - ph) / full_range < 0.05 and
+            c < o and pc > po and _trend_up):
+        patterns.append(("tweezer_top", -1, 1.5))
+
+    # Bullish Harami — маленькая бычья внутри большой медвежьей
+    if (pc < po and c > o and
+            o > min(po, pc) and c < max(po, pc) and
+            body < prev_body * 0.5):
+        patterns.append(("bullish_harami", +1, 1.0))
+
+    # Bearish Harami
+    if (pc > po and c < o and
+            o < max(po, pc) and c > min(po, pc) and
+            body < prev_body * 0.5):
+        patterns.append(("bearish_harami", -1, 1.0))
+
+    # Inside Bar — сжатие волатильности (нейтральный, ждём пробой)
+    if h < ph and l > pl:
+        patterns.append(("inside_bar", 0, 1.0))
+
+    # ── 3-свечные паттерны ──────────────────────────────
+
+    # Morning Star — 3-свечной бычий разворот
+    if (c3 < o3 and
+            abs(pc - po) < abs(c3 - o3) * 0.35 and
+            c > o and
+            c > (o3 + c3) / 2):
+        patterns.append(("morning_star", +1, 2.0))
+
+    # Evening Star — 3-свечной медвежий разворот
+    if (c3 > o3 and
+            abs(pc - po) < abs(c3 - o3) * 0.35 and
+            c < o and
+            c < (o3 + c3) / 2):
+        patterns.append(("evening_star", -1, 2.0))
+
+    # Three White Soldiers — три последовательные бычьи свечи
+    if (c > o and pc > po and c3 > o3 and
+            c > pc > c3 and
+            o > po and po > o3 and
+            abs(upper_wick) < body * 0.3):
+        patterns.append(("three_white_soldiers", +1, 2.0))
+
+    # Three Black Crows — три последовательные медвежьи
+    if (c < o and pc < po and c3 < o3 and
+            c < pc < c3 and
+            o < po and po < o3 and
+            abs(lower_wick) < body * 0.3):
+        patterns.append(("three_black_crows", -1, 2.0))
+
+    # Three Inside Down — Harami + подтверждение (медвежий)
+    if (c4 > o4 and
+            o3 < c4 and c3 > o4 and
+            c3 < o3 and
+            c < c3):
+        patterns.append(("three_inside_down", -1, 2.0))
+
+    return patterns
+
+
+def detect_rsi_divergence(closes, highs, lows, lookback=30):
+    """
+    Дивергенция RSI.
+    Бычья: цена делает более низкий минимум, RSI — более высокий (потенциальный разворот вверх).
+    Медвежья: цена делает более высокий максимум, RSI — более низкий.
+    """
+    if len(closes) < lookback + 15:
+        return 0, None
+
+    half = lookback // 2
+
+    # RSI-серия для последних lookback свечей
+    rsi_vals = []
+    base = len(closes) - lookback
+    for i in range(base, len(closes)):
+        r = calc_rsi(closes[:i+1])
+        rsi_vals.append(r if r is not None else 50.0)
+
+    if len(rsi_vals) < lookback:
+        return 0, None
+
+    rsi_first  = rsi_vals[:half]
+    rsi_second = rsi_vals[half:]
+    price_highs_first  = highs[-(lookback):-(half)]
+    price_highs_second = highs[-(half):]
+    price_lows_first   = lows[-(lookback):-(half)]
+    price_lows_second  = lows[-(half):]
+
+    if not price_highs_first or not price_highs_second:
+        return 0, None
+
+    # Медвежья дивергенция
+    if (max(price_highs_second) > max(price_highs_first) and
+            max(rsi_second) < max(rsi_first) - 3):
+        return -1, "🔻 Медвежья дивергенция RSI (цена ↑↑, RSI ↓)"
+
+    # Бычья дивергенция
+    if (min(price_lows_second) < min(price_lows_first) and
+            min(rsi_second) > min(rsi_first) + 3):
+        return +1, "🔺 Бычья дивергенция RSI (цена ↓↓, RSI ↑)"
+
+    return 0, None
+
+
+def calc_ema_slope(closes, period=20, bars=3):
+    """
+    Наклон EMA — насколько сильно EMA растёт или падает.
+    Возвращает: +1 растёт, -1 падает, 0 боковик.
+    """
+    if len(closes) < period + bars:
+        return 0
+    ema_now  = calc_ema(closes, period)
+    ema_prev = calc_ema(closes[:-bars], period)
+    if ema_now is None or ema_prev is None or ema_prev == 0:
+        return 0
+    change_pct = (ema_now - ema_prev) / ema_prev * 100
+    if change_pct > 0.05:   return +1
+    if change_pct < -0.05:  return -1
+    return 0
+
+# ============================================================
+# РИСК-МЕНЕДЖМЕНТ
+# ============================================================
+def calc_risk_levels(price, atr, signal_direction, support=None, resistance=None):
+    if atr is None:
+        return None
+    if signal_direction == "long":
+        sl  = price - ATR_SL_MULT * atr
+        tp1 = price + ATR_TP_MULT * atr
+        tp2 = resistance if (resistance and resistance > tp1) else price + 4.0 * atr
+    else:
+        sl  = price + ATR_SL_MULT * atr
+        tp1 = price - ATR_TP_MULT * atr
+        tp2 = support if (support and support < tp1) else price - 4.0 * atr
+    risk   = abs(price - sl)
+    reward = abs(tp1 - price)
+    rr     = reward / risk if risk > 0 else 0.0
+    return {"sl": sl, "tp1": tp1, "tp2": tp2, "risk_pct": risk / price * 100, "rr_ratio": rr}
+
+
+# ============================================================
+# ПАТТЕРН-АНАЛИЗ
+# ============================================================
+def analyze_patterns(closes):
+    returns   = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
+    base_rate = sum(r > 0 for r in returns) / len(returns)
+
+    def classify(w):
+        if all(r < 0 for r in w): return "bear"
+        if all(r > 0 for r in w): return "bull"
+        return None
+
+    patterns = {"bear": [], "bull": []}
+    for i in range(WINDOW, len(returns) - 1):
+        ptype = classify(returns[i - WINDOW:i])
+        if ptype:
+            patterns[ptype].append(returns[i] > 0)
+
+    results = {}
+    for ptype, outcomes in patterns.items():
+        n = len(outcomes)
+        if n < 5:
+            results[ptype] = None
+            continue
+        p_up = sum(outcomes) / n
+        try:    p_val = stats.binomtest(sum(outcomes), n, base_rate).pvalue
+        except:
+            try:    p_val = stats.binom_test(sum(outcomes), n, base_rate)
+            except: p_val = 1.0
+        results[ptype] = {"n": n, "p_up": p_up, "edge": p_up - base_rate, "p_val": p_val}
+
+    last_pattern = classify(returns[-WINDOW:])
+    signal, prob = "WAIT ⏸", 0.0
+
+    if last_pattern and results.get(last_pattern):
+        d = results[last_pattern]
+        if d["p_val"] < 0.05:
+            if d["p_up"] >= THRESHOLD:
+                signal = "🟢 LONG (разворот)" if last_pattern == "bear" else "🟢 LONG (продолжение)"
+                prob   = d["p_up"]
+            elif (1 - d["p_up"]) >= THRESHOLD:
+                signal = "🔴 SHORT"
+                prob   = 1 - d["p_up"]
+
+    return signal, prob, last_pattern, base_rate, results
+
+
+# ============================================================
+# МТФ АНАЛИЗ
+# ============================================================
+def mtf_bias(ticker, base_interval):
+    higher_tfs = MTF_HIERARCHY.get(base_interval, [])
+    if not higher_tfs:
+        return 0, []
+    details     = []
+    total_score = 0
+    for tf in higher_tfs:
+        try:
+            opens, highs, lows, closes, volumes = get_ohlcv(ticker, tf)
+            price  = closes[-1]
+            ema20  = calc_ema(closes, 20)
+            ema50  = calc_ema(closes, 50)
+            ema200 = calc_ema(closes, 200)
+            st_dir, _ = calc_supertrend(highs, lows, closes)
+            score = 0
+            if ema20 and ema50:
+                if price > ema20 > ema50: score += 1
+                elif price < ema20 < ema50: score -= 1
+            if ema200:
+                score += 1 if price > ema200 else -1
+            if st_dir == 1: score += 1
+            elif st_dir == -1: score -= 1
+            total_score += score
+            label = "🟢" if score > 0 else ("🔴" if score < 0 else "⚪")
+            details.append(f"{label} {INTERVALS[tf]['label']}: score={score:+d}")
+        except Exception:
+            details.append(f"❓ {INTERVALS[tf]['label']}: нет данных")
+    return total_score, details
+
+
+# ============================================================
+# ПОЛНЫЙ АНАЛИЗ
+# ============================================================
+def full_analyze(ticker, interval):
+    opens, highs, lows, closes, volumes = get_ohlcv(ticker, interval)
+    price   = closes[-1]
+    weights = load_weights()
+
+    is_anomaly, vol_zscore = detect_volume_anomaly(volumes)
+    regime, adx, bb_width, atr_pct_val = detect_market_regime(highs, lows, closes, volumes)
+    min_votes = get_adaptive_min_votes(regime)
+    season_score, season_reason = get_seasonality_signal(ticker)
+    fg_score, fg_weight, fg_reason = fear_greed_vote(ticker)
+    signal, prob, last_pattern, base_rate, pat_results = analyze_patterns(closes)
+
+    rsi                  = calc_rsi(closes)
+    ema20                = calc_ema(closes, 20)
+    ema50                = calc_ema(closes, 50)
+    ema200               = calc_ema(closes, 200)
+    macd, macd_sig       = calc_macd(closes)
+    bb_low, bb_mid, bb_high = calc_bollinger(closes)
+    support, resistance  = calc_support_resistance(highs, lows, closes)
+    last_vol, vol_ratio  = calc_volume_signal(volumes)
+    atr                  = calc_atr(highs, lows, closes)
+    stoch_k, stoch_d     = calc_stoch_rsi(closes)
+    _, obv_trend         = calc_obv(closes, volumes)
+    st_dir, st_line      = calc_supertrend(highs, lows, closes)
+    ichimoku             = calc_ichimoku(highs, lows, closes)
+    mtf_score, mtf_details = mtf_bias(ticker, interval)
+
+    # ── Новые индикаторы ──────────────────────────────────
+    vwap             = calc_vwap(highs, lows, closes, volumes)
+    candle_patterns  = detect_candle_patterns(opens, highs, lows, closes)
+    div_score, div_reason = detect_rsi_divergence(closes, highs, lows)
+    _slope_bars = {"1m": 5, "3m": 5, "5m": 4, "15m": 3, "30m": 3, "1h": 3}
+    _n_bars = _slope_bars.get(interval, 3)
+    ema20_slope = calc_ema_slope(closes, 20, _n_bars)
+    # ─────────────────────────────────────────────────────────────
+
+    bull_votes = []
+    bear_votes = []
+    neutral = []
+
+    def add_bull(reason, ind_key):
+        bull_votes.append((reason, weights.get(ind_key, 1.0)))
+
+    def add_bear(reason, ind_key):
+        bear_votes.append((reason, weights.get(ind_key, 1.0)))
+
+    rsi_w = weights.get("rsi", 1.0) * (0.5 if regime == "trend" else (1.5 if regime == "flat" else 1.0))
+    # ── Stop Hunt / Liquidity Grab (HTF=15m, LTF=5m) ─────────
+    _liq_signal = None
+    _liq_rr     = None
+
+    try:
+        # Шаг 1: Ищем боковик на 15m (HTF)
+        if interval != "15m":
+            _, htf_h, htf_l, htf_c, htf_v = get_ohlcv(ticker, "15m")
+        else:
+            htf_h, htf_l, htf_c, htf_v = highs, lows, closes, volumes
+
+        range_result = detect_range_htf(htf_h, htf_l, htf_c)
+
+        if range_result is not None:
+            range_high, range_low = range_result
+            range_width_pct = (range_high - range_low) / range_low * 100
+
+            # Шаг 2: Ищем liquidity grab на 15m
+            # opens нужны для grab — берём из существующего запроса
+            grab_result = detect_liquidity_grab(
+                htf_h, htf_l, htf_c, htf_v, range_high, range_low
+            )
+
+            if grab_result is not None:
+                grab_type, grab_extreme = grab_result
+
+                # Шаг 3: Подтверждение MSB на 5m (LTF)
+                if interval != "5m":
+                    _, ltf_h, ltf_l, ltf_c, _ = get_ohlcv(ticker, "5m")
+                else:
+                    ltf_h, ltf_l, ltf_c = highs, lows, closes
+
+                msb_confirmed, entry_price, sl_grab = detect_msb(
+                    ltf_h, ltf_l, ltf_c, grab_type
+                )
+
+                if msb_confirmed and entry_price and sl_grab:
+                    risk = abs(entry_price - sl_grab)
+
+                    if grab_type == "bull":
+                        tp_target = range_high   # противоположная граница
+                        reward    = abs(tp_target - entry_price)
+                    else:
+                        tp_target = range_low
+                        reward    = abs(entry_price - tp_target)
+
+                    rr = reward / risk if risk > 0 else 0
+
+                    # Минимальный RR = 2.5 (жёсткий фильтр)
+                    if rr >= 2.5:
+                        _liq_rr = round(rr, 2)
+                        if grab_type == "bull":
+                            _liq_signal = "bull"
+                            add_bull(
+                                f"🎯 Liquidity Grab LONG: SSL захвачена, MSB подтверждён "
+                                f"(RR {rr:.1f}x, канал {range_width_pct:.1f}%)",
+                                "supertrend"   # используем вес supertrend — сильный сигнал
+                            )
+                        else:
+                            _liq_signal = "bear"
+                            add_bear(
+                                f"🎯 Liquidity Grab SHORT: BSL захвачена, MSB подтверждён "
+                                f"(RR {rr:.1f}x, канал {range_width_pct:.1f}%)",
+                                "supertrend"
+                            )
+                    else:
+                        neutral.append(
+                            f"⚠️ Grab найден ({grab_type}), но RR={rr:.1f}x < 2.5 — пропуск"
+                        )
+
+    except Exception as e:
+        neutral.append(f"[LiqGrab] ошибка: {e}")
+    # ─────────────────────────────────────────────────────────
+
+    if rsi is not None:
+        if rsi < 30:   bull_votes.append((f"RSI={rsi:.0f} — перепроданность (<30)", rsi_w))
+        elif rsi > 70: bear_votes.append((f"RSI={rsi:.0f} — перекупленность (>70)", rsi_w))
+        elif rsi > 55: bull_votes.append((f"RSI={rsi:.0f} — выше нейтрали", rsi_w))
+        elif rsi < 45: bear_votes.append((f"RSI={rsi:.0f} — ниже нейтрали", rsi_w))
+        else:          neutral.append(f"RSI={rsi:.0f} — нейтральная зона")
+
+    if stoch_k is not None and stoch_d is not None:
+        if stoch_k < 20 and stoch_k > stoch_d:   add_bull(f"Stoch RSI K={stoch_k:.1f} пересёк D ↑", "stoch_rsi")
+        elif stoch_k > 80 and stoch_k < stoch_d: add_bear(f"Stoch RSI K={stoch_k:.1f} пересёк D ↓", "stoch_rsi")
+        elif stoch_k < 20:  add_bull(f"Stoch RSI K={stoch_k:.1f} — перепроданность", "stoch_rsi")
+        elif stoch_k > 80:  add_bear(f"Stoch RSI K={stoch_k:.1f} — перекупленность", "stoch_rsi")
+        else:               neutral.append(f"Stoch RSI K={stoch_k:.1f} D={stoch_d:.1f}")
+
+    if ema20 and ema50:
+        if price > ema20 > ema50:   add_bull("Цена > EMA20 > EMA50 — восх. тренд", "ema")
+        elif price < ema20 < ema50: add_bear("Цена < EMA20 < EMA50 — нисх. тренд", "ema")
+        elif price > ema20:         add_bull("Цена > EMA20, возможный разворот вверх", "ema")
+        else:                       neutral.append("EMA20/50 — смешанный тренд")
+
+    if ema200:
+        pct_above = (price - ema200) / ema200 * 100
+        if price > ema200 and pct_above < 15:
+            add_bull(f"Цена выше EMA200 на +{pct_above:.1f}%", "ema200")
+        elif price > ema200:
+            neutral.append(f"Цена на {pct_above:.1f}% выше EMA200 — слишком далеко")
+        else:
+            add_bear(f"Цена < EMA200 на -{abs(pct_above):.1f}%", "ema200")
+
+    if macd is not None and macd_sig is not None:
+        if macd > macd_sig and macd > 0:   add_bull("MACD выше сигнальной и нуля", "macd")
+        elif macd > macd_sig and macd < 0: add_bull("MACD пересёк сигнальную вверх", "macd")
+        elif macd < macd_sig and macd < 0: add_bear("MACD ниже сигнальной и нуля", "macd")
+        elif macd < macd_sig and macd > 0: add_bear("MACD пересёк сигнальную вниз", "macd")
+
+    if bb_low and bb_high:
+        if price <= bb_low:    add_bull(f"Цена у нижней BB ({bb_low:,.4f})", "bollinger")
+        elif price >= bb_high: add_bear(f"Цена у верхней BB ({bb_high:,.4f})", "bollinger")
+        else:                  neutral.append("Цена внутри Bollinger Bands")
+
+    if st_dir is not None:
+        if st_dir == 1: add_bull(f"Supertrend бычий (>${st_line:,.4f})", "supertrend")
+        else:           add_bear(f"Supertrend медвежий (<${st_line:,.4f})", "supertrend")
+
+    if obv_trend is not None:
+        if obv_trend > 0: add_bull("OBV растёт — накопление", "obv")
+        else:             add_bear("OBV падает — распределение", "obv")
+
+    if ichimoku:
+        ich = ichimoku
+        ich_bull = ich_bear = 0
+        if ich["tenkan"] and ich["kijun"]:
+            if ich["tenkan"] > ich["kijun"]: ich_bull += 1
+            else: ich_bear += 1
+        if ich["cloud_top"] and ich["cloud_bottom"]:
+            if price > ich["cloud_top"]: ich_bull += 1
+            elif price < ich["cloud_bottom"]: ich_bear += 1
+            else: neutral.append("Ichimoku: цена внутри облака")
+        if ich["chikou_ref"]:
+            if ich["chikou_price"] > ich["chikou_ref"]: ich_bull += 1
+            else: ich_bear += 1
+        net = ich_bull - ich_bear
+        if net >= 2:    add_bull(f"Ichimoku: {ich_bull}/3 бычьих (net={net:+d})", "ichimoku")
+        elif net <= -2: add_bear(f"Ichimoku: {ich_bear}/3 медвежьих (net={net:+d})", "ichimoku")
+        else:           neutral.append(f"Ichimoku: смешанный ({ich_bull}↑ {ich_bear}↓)")
+
+    dist_sup = (price - support) / price * 100
+    dist_res = (resistance - price) / price * 100
+    if dist_sup < 2:   add_bull(f"Цена у поддержки ${support:,.4f}", "sr_level")
+    elif dist_res < 2: add_bear(f"Цена у сопротивления ${resistance:,.4f}", "sr_level")
+    else:              neutral.append(f"Поддержка ${support:,.4f} | Сопр. ${resistance:,.4f}")
+
+    # Volume — обязательный множитель, не просто голос
+    _volume_confirmed = False
+    if vol_ratio is not None:
+        if vol_ratio > 1.3:
+            _volume_confirmed = True
+            ind_score = sum(w for _, w in bull_votes) - sum(w for _, w in bear_votes)
+            if ind_score > 1.0:
+                add_bull(f"Объём {vol_ratio:.1f}x подтверждает рост", "volume")
+            elif ind_score < -1.0:
+                add_bear(f"Объём {vol_ratio:.1f}x подтверждает падение", "volume")
+            else:
+                neutral.append(f"Объём {vol_ratio:.1f}x — высокий, но без тренда")
+        elif vol_ratio < 0.6:
+            # Слабый объём = штраф к весам (не блокировка, но ослабление)
+            bull_votes[:] = [(r, w * 0.7) for r, w in bull_votes]
+            bear_votes[:] = [(r, w * 0.7) for r, w in bear_votes]
+            neutral.append(f"⚠️ Объём {vol_ratio:.1f}x — слабый, веса снижены на 30%")
+        else:
+            neutral.append(f"Объём {vol_ratio:.1f}x — норма")
+
+    if mtf_score > 0:
+        add_bull(f"MTF: старшие TF бычьи (score={mtf_score:+d})", "mtf")
+    elif mtf_score < 0:
+        add_bear(f"MTF: старшие TF медвежьи (score={mtf_score:+d})", "mtf")
+    else:
+        neutral.append("MTF: нейтрально")
+
+    # ── VWAP ──────────────────────────────────────────────
+    if vwap is not None:
+        if price > vwap * 1.002:
+            add_bull(f"Цена выше VWAP ({vwap:,.4f}) — покупатели контролируют", "ema")
+        elif price < vwap * 0.998:
+            add_bear(f"Цена ниже VWAP ({vwap:,.4f}) — продавцы контролируют", "ema")
+        else:
+            neutral.append(f"Цена у VWAP ({vwap:,.4f}) — нейтральная зона")
+
+
+    _candle_names_ru = {
+        "doji":                 "➖ Дожи — нерешительность рынка",
+        "hammer":               "🔨 Молот — бычий разворот",
+        "inverted_hammer":      "🔨 Перевёрнутый молот — бычий",
+        "shooting_star":        "⭐ Падающая звезда — медвежий разворот",
+        "hanging_man":          "🪝 Повешенный — медвежий разворот",
+        "pin_bar_bull":         "📌 Pin Bar — бычий отказ от уровня",
+        "pin_bar_bear":         "📌 Pin Bar — медвежий отказ от уровня",
+        "bullish_engulfing":    "🟢 Бычье поглощение",
+        "bearish_engulfing":    "🔴 Медвежье поглощение",
+        "tweezer_bottom":       "🔻 Пинцет снизу — разворот вверх",
+        "tweezer_top":          "🔺 Пинцет сверху — разворот вниз",
+        "bullish_harami":       "🫂 Бычья харами",
+        "bearish_harami":       "🫂 Медвежья харами",
+        "inside_bar":           "📦 Inside Bar — сжатие (ждём пробой)",
+        "morning_star":         "🌅 Утренняя звезда — бычий разворот",
+        "evening_star":         "🌆 Вечерняя звезда — медвежий разворот",
+        "three_white_soldiers": "💪 Три белых солдата — сильный рост",
+        "three_black_crows":    "🐦 Три чёрных вороны — сильное падение",
+        "three_inside_up":      "✅ Three Inside Up — разворот вверх",
+        "three_inside_down":    "❌ Three Inside Down — разворот вниз",
+    }
+
+    # Ключ веса для паттернов — отдельный "candle" индикатор
+    # В WFO отслеживается самостоятельно, не смешивается с supertrend
+    _candle_base_weight = weights.get("candle", 0.9)
+
+    # Блок накопления: несколько паттернов в одном направлении = усиление
+    _candle_bull_score = 0.0
+    _candle_bear_score = 0.0
+    _candle_bull_labels = []
+    _candle_bear_labels = []
+    _candle_neutral_labels = []
+
+    for (name, direction, strength) in candle_patterns:
+        label = _candle_names_ru.get(name, name)
+        w = _candle_base_weight * strength
+        if direction == +1:
+            _candle_bull_score += w
+            _candle_bull_labels.append(label)
+        elif direction == -1:
+            _candle_bear_score += w
+            _candle_bear_labels.append(label)
+        else:
+            _candle_neutral_labels.append(label)
+
+    # Нейтральные — просто в neutral, не голосуют
+    for lbl in _candle_neutral_labels:
+        neutral.append(lbl)
+
+    # Голосуем суммарным весом (не по одному)
+    # Это предотвращает "ballot stuffing" от нескольких слабых паттернов
+    if _candle_bull_score > 0:
+        combined_label = " + ".join(_candle_bull_labels)
+        bull_votes.append((f"Свечи: {combined_label}", _candle_bull_score))
+    if _candle_bear_score > 0:
+        combined_label = " + ".join(_candle_bear_labels)
+        bear_votes.append((f"Свечи: {combined_label}", _candle_bear_score))
+
+    # ── RSI дивергенция ───────────────────────────────────
+    if div_score == +1 and div_reason:
+        add_bull(div_reason, "rsi")
+    elif div_score == -1 and div_reason:
+        add_bear(div_reason, "rsi")
+
+    # ── Наклон EMA20 ──────────────────────────────────────
+    if ema20_slope == +1:
+        add_bull("EMA20 растёт — восходящий импульс", "ema")
+    elif ema20_slope == -1:
+        add_bear("EMA20 падает — нисходящий импульс", "ema")
+
+    if fg_score != 0 and fg_reason:
+        if fg_score > 0: bull_votes.append((fg_reason, weights.get("fg_index", 0.7) * fg_weight))
+        else:            bear_votes.append((fg_reason, weights.get("fg_index", 0.7) * fg_weight))
+    elif fg_reason:
+        neutral.append(fg_reason)
+
+    if season_score > 0 and season_reason:
+        bull_votes.append((season_reason, weights.get("seasonality", 0.5)))
+    elif season_score < 0 and season_reason:
+        bear_votes.append((season_reason, weights.get("seasonality", 0.5)))
+
+    bull_weight_sum = sum(w for _, w in bull_votes)
+    bear_weight_sum = sum(w for _, w in bear_votes)
+    total_weight    = bull_weight_sum + bear_weight_sum
+    bull_args = [r for r, _ in bull_votes]
+    bear_args = [r for r, _ in bear_votes]
+
+    if is_anomaly:
+        signal    = "🚨 АНОМАЛИЯ — СИГНАЛЫ ЗАМОРОЖЕНЫ"
+        prob      = 0.0
+        anomaly_reason = f"⚠️ Объём = {vol_zscore:.1f}σ — манипуляция или новость!"
+        risk_levels = None; direction = None; kelly_pct = None
+    else:
+        anomaly_reason = None
+
+        _volume_gate_active = (not _volume_confirmed and
+                               regime in ("trend", "volatile") and
+                               vol_ratio is not None and vol_ratio < 0.8)
+
+        if bull_weight_sum >= min_votes and bull_weight_sum > bear_weight_sum:
+            strength = bull_weight_sum / total_weight if total_weight else 0
+            if _volume_gate_active:
+                signal = "🟡 Вероятный LONG"
+                prob   = round(0.50 + strength * 0.10, 2)
+                neutral.append(f"⚠️ Объём {vol_ratio:.1f}x — сигнал понижен до вероятного")
+            else:
+                signal = "🟢 LONG (индикаторы)"
+                prob   = round(0.50 + strength * 0.25, 2)
+        elif bear_weight_sum >= min_votes and bear_weight_sum > bull_weight_sum:
+            strength = bear_weight_sum / total_weight if total_weight else 0
+            if _volume_gate_active:
+                signal = "🟡 Вероятный SHORT"
+                prob   = round(0.50 + strength * 0.10, 2)
+                neutral.append(f"⚠️ Объём {vol_ratio:.1f}x — сигнал понижен до вероятного")
+            else:
+                signal = "🔴 SHORT (индикаторы)"
+                prob   = round(0.50 + strength * 0.25, 2)
+        elif signal == "WAIT ⏸" and total_weight > 0:
+            score_diff = bull_weight_sum - bear_weight_sum
+            strength   = abs(score_diff) / total_weight
+            if score_diff >= 3 and strength >= 0.60:
+                signal = "🟡 Вероятный LONG"; prob = round(0.50 + strength * 0.15, 2)
+            elif score_diff <= -3 and strength >= 0.60:
+                signal = "🟡 Вероятный SHORT"; prob = round(0.50 + strength * 0.15, 2)
+
+        direction   = "long" if "LONG" in signal else ("short" if "SHORT" in signal else None)
+        if direction and _liq_signal and _liq_rr and _liq_rr >= 2.5:
+            # Для Liquidity Grab — используем границы боковика как TP, не ATR
+            try:
+                if _liq_signal == "bull":
+                    _grab_sl  = sl_grab
+                    _grab_tp1 = range_high
+                    _grab_tp2 = range_high * 1.005  # чуть выше BSL
+                else:
+                    _grab_sl  = sl_grab
+                    _grab_tp1 = range_low
+                    _grab_tp2 = range_low * 0.995
+                _grab_risk   = abs(price - _grab_sl)
+                _grab_reward = abs(_grab_tp1 - price)
+                _grab_rr     = _grab_reward / _grab_risk if _grab_risk > 0 else 0
+                risk_levels = {
+                    "sl":       _grab_sl,
+                    "tp1":      _grab_tp1,
+                    "tp2":      _grab_tp2,
+                    "risk_pct": _grab_risk / price * 100,
+                    "rr_ratio": _grab_rr,
+                }
+            except Exception:
+                risk_levels = calc_risk_levels(price, atr, direction, support, resistance)
+        else:
+            risk_levels = calc_risk_levels(price, atr, direction, support, resistance) if direction else None
+
+        kelly_pct = None
+        if risk_levels and risk_levels["rr_ratio"] > 0:
+            hist_wr = pat_results.get(last_pattern, {})
+            wr = (hist_wr.get("p_up", 0.52) if (hist_wr and direction == "long")
+                  else (1 - hist_wr.get("p_up", 0.52) if hist_wr else 0.52))
+            kelly_pct = kelly_criterion(wr, risk_levels["rr_ratio"])
+
+    pat_reason = ""
+    if last_pattern and pat_results.get(last_pattern):
+        d = pat_results[last_pattern]
+        if d["p_val"] < 0.05 and (d["p_up"] >= THRESHOLD or (1 - d["p_up"]) >= THRESHOLD):
+            pat_reason = (f"{WINDOW} свечи → {'рост' if d['p_up'] >= THRESHOLD else 'падение'} "
+                          f"{max(d['p_up'], 1-d['p_up'])*100:.1f}% (p={d['p_val']:.3f})")
+
+    return {
+        "signal": signal, "prob": prob, "pattern": last_pattern,
+        "base_rate": base_rate, "pat_results": pat_results,
+        "bull_args": bull_args, "bear_args": bear_args, "neutral": neutral,
+        "bull_weight_sum": bull_weight_sum, "bear_weight_sum": bear_weight_sum,
+        "pat_reason": pat_reason,
+        "rsi": rsi, "stoch_k": stoch_k, "stoch_d": stoch_d,
+        "ema20": ema20, "ema50": ema50, "ema200": ema200,
+        "macd": macd, "macd_sig": macd_sig,
+        "st_dir": st_dir, "st_line": st_line,
+        "obv_trend": obv_trend, "ichimoku": ichimoku,
+        "support": support, "resistance": resistance,
+        "vol_ratio": vol_ratio, "atr": atr,
+        "mtf_score": mtf_score, "mtf_details": mtf_details,
+        "risk_levels": risk_levels, "price": price,
+        "regime": regime, "adx": adx, "bb_width": bb_width,
+        "min_votes": min_votes,
+        "is_anomaly": is_anomaly, "vol_zscore": vol_zscore,
+        "anomaly_reason": anomaly_reason,
+        "season_score": season_score, "season_reason": season_reason,
+        "fg_reason": fg_reason,
+        "kelly_pct": kelly_pct,
+        "direction": direction,
+    }
+
+
+# ============================================================
+# БЭКТЕСТ
+# ============================================================
+def _bt_count_streak(trades, want_win=True):
+    best = cur = 0
+    for t in trades:
+        is_win = t.get("net_pnl", 0) > 0
+        if is_win == want_win:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    return best
+
+
+def _bt_percentile(values, pct):
+    if not values:
+        return 0.0
+    arr = sorted(values)
+    idx = int(round((len(arr) - 1) * pct / 100.0))
+    idx = max(0, min(len(arr) - 1, idx))
+    return arr[idx]
+
+
+def _bt_side_stats(trades, side):
+    rows = [t for t in trades if t.get("dir") == side]
+    if not rows:
+        return {"n": 0, "wr": 0.0, "avg_r": 0.0, "net_pct": 0.0}
+    wins = [t for t in rows if t.get("net_pnl", 0) > 0]
+    return {
+        "n": len(rows),
+        "wr": len(wins) / len(rows) * 100,
+        "avg_r": sum(t.get("r_multiple", 0) for t in rows) / len(rows),
+        "net_pct": sum(t.get("ret", 0) for t in rows) * 100,
+    }
+
+
+def _bt_score_signal(c_hist, h_hist, l_hist, v_hist):
+    """Small backtest signal engine using only already closed candles."""
+    rsi = calc_rsi(c_hist)
+    ema20 = calc_ema(c_hist, 20)
+    ema50 = calc_ema(c_hist, 50)
+    macd, msig = calc_macd(c_hist)
+    st_dir, _ = calc_supertrend(h_hist, l_hist, c_hist)
+    stk, _ = calc_stoch_rsi(c_hist)
+    _, ob_t = calc_obv(c_hist, v_hist)
+    atr = calc_atr(h_hist, l_hist, c_hist)
+
+    if atr is None or atr <= 0:
+        return None, None, None, "no_atr"
+
+    score = 0
+    price = c_hist[-1]
+    if rsi is not None:
+        score += 1 if rsi < 50 else -1
+    if ema20 and ema50:
+        score += 1 if price > ema20 > ema50 else (-1 if price < ema20 < ema50 else 0)
+    if macd is not None and msig is not None:
+        score += 1 if macd > msig else -1
+    if st_dir is not None:
+        score += 1 if st_dir == 1 else -1
+    if stk is not None:
+        score += 1 if stk < 50 else -1
+    if ob_t is not None:
+        score += 1 if ob_t > 0 else -1
+
+    vol_ratio = 1.0
+    if len(v_hist) >= 20:
+        avg_v = sum(v_hist[-20:-1]) / 19
+        vol_ratio = v_hist[-1] / avg_v if avg_v > 0 else 1.0
+        if vol_ratio < 0.5:
+            score = int(score * 0.7)
+
+    regime_bt, _, _, _ = detect_market_regime(
+        list(h_hist[-80:]), list(l_hist[-80:]), list(c_hist[-80:]), list(v_hist[-80:])
+    )
+    min_votes_bt = get_adaptive_min_votes(regime_bt)
+    threshold = max(4, min_votes_bt - 1)
+    direction = "long" if score >= threshold else ("short" if score <= -threshold else None)
+    return direction, score, atr, regime_bt
+
+
+def run_backtest(ticker, interval, lookback_candles=200):
+    """
+    Futures-aware event backtest.
+
+    What is modeled:
+    - signal uses only already closed candles;
+    - entry happens on the next candle open;
+    - stop/target are checked with future high/low;
+    - if SL and TP are inside the same candle, SL wins (conservative OHLC rule);
+    - taker fees, entry/exit slippage, position sizing by risk, not all-in;
+    - R-multiple, drawdown, exposure, streaks, fees and trade log.
+
+    What is not modeled:
+    - historical funding payments;
+    - order queue/partial fills;
+    - real tick sequence inside a candle.
+    """
+    try:
+        opens, highs, lows, closes, volumes = get_ohlcv(ticker, interval)
+    except Exception as e:
+        return None, f"Ошибка получения данных: {e}"
+
+    min_history = 120
+    n = len(closes)
+    required = min_history + min(lookback_candles, max(1, n - min_history)) + BACKTEST_MAX_HOLD_BARS + 1
+    if n < min_history + BACKTEST_MAX_HOLD_BARS + 2:
+        return None, f"Мало данных: есть {n}, нужно минимум {min_history + BACKTEST_MAX_HOLD_BARS + 2}"
+
+    start_idx = max(min_history, n - lookback_candles - BACKTEST_MAX_HOLD_BARS)
+    end_idx = n - BACKTEST_MAX_HOLD_BARS - 1
+    tested_bars = max(1, end_idx - start_idx + 1)
+
+    trades = []
+    equity_curve = [BACKTEST_INITIAL_EQUITY]
+    drawdown_curve = [0.0]
+    equity = float(BACKTEST_INITIAL_EQUITY)
+    errors = 0
+    skipped = {"volume_anomaly": 0, "no_signal": 0, "no_atr": 0, "bad_risk": 0}
+    ambiguous_bars = 0
+    capped_positions = 0
+    liquidation_touches = 0
+    exposure_bars = 0
+    i = start_idx
+
+    while i <= end_idx:
+        c_hist = closes[:i]
+        h_hist = highs[:i]
+        l_hist = lows[:i]
+        v_hist = volumes[:i]
+
+        try:
+            is_anom, _ = detect_volume_anomaly(list(v_hist))
+            if is_anom:
+                skipped["volume_anomaly"] += 1
+                i += 1
+                continue
+
+            direction, score, atr, regime_bt = _bt_score_signal(c_hist, h_hist, l_hist, v_hist)
+            if atr is None:
+                skipped["no_atr"] += 1
+                i += 1
+                continue
+            if direction is None:
+                skipped["no_signal"] += 1
+                i += 1
+                continue
+
+            # Signal is known after candle i-1 closes. Next possible fill is candle i open.
+            entry_bar = i
+            raw_entry = opens[entry_bar]
+            entry = raw_entry * (1 + BACKTEST_SLIPPAGE_RATE) if direction == "long" else raw_entry * (1 - BACKTEST_SLIPPAGE_RATE)
+
+            if direction == "long":
+                sl = entry - ATR_SL_MULT * atr
+                tp = entry + ATR_TP_MULT * atr
+                risk_per_unit = entry - sl
+            else:
+                sl = entry + ATR_SL_MULT * atr
+                tp = entry - ATR_TP_MULT * atr
+                risk_per_unit = sl - entry
+
+            if risk_per_unit <= 0 or entry <= 0:
+                skipped["bad_risk"] += 1
+                i += 1
+                continue
+
+            equity_before = equity
+            target_risk_cash = equity_before * BACKTEST_RISK_PER_TRADE
+            uncapped_position_value = target_risk_cash / (risk_per_unit / entry)
+            max_position_value = equity_before * BACKTEST_MAX_NOTIONAL_EQUITY_MULT
+            position_value = min(uncapped_position_value, max_position_value)
+            if position_value < uncapped_position_value:
+                capped_positions += 1
+            qty = position_value / entry
+            actual_risk_cash = risk_per_unit * qty
+            if actual_risk_cash <= 0:
+                skipped["bad_risk"] += 1
+                i += 1
+                continue
+
+            effective_leverage = position_value / equity_before if equity_before > 0 else 0
+            liq_price = None
+            if effective_leverage > 1:
+                if direction == "long":
+                    liq_price = entry * (1 - 1 / effective_leverage + BACKTEST_APPROX_MAINT_MARGIN_RATE)
+                else:
+                    liq_price = entry * (1 + 1 / effective_leverage - BACKTEST_APPROX_MAINT_MARGIN_RATE)
+
+            max_exit_bar = min(entry_bar + BACKTEST_MAX_HOLD_BARS, n - 1)
+            raw_exit = closes[max_exit_bar]
+            exit_price = raw_exit * (1 - BACKTEST_SLIPPAGE_RATE) if direction == "long" else raw_exit * (1 + BACKTEST_SLIPPAGE_RATE)
+            exit_bar = max_exit_bar
+            exit_reason = "time_exit"
+            ambiguous = False
+            liquidation_touch = False
+
+            for j in range(entry_bar, max_exit_bar + 1):
+                hi = highs[j]
+                lo = lows[j]
+                if direction == "long":
+                    if liq_price and lo <= liq_price:
+                        liquidation_touch = True
+                    sl_hit = lo <= sl
+                    tp_hit = hi >= tp
+                    if sl_hit and tp_hit:
+                        ambiguous = True
+                    if sl_hit:
+                        raw_exit = sl
+                        exit_price = sl * (1 - BACKTEST_SLIPPAGE_RATE)
+                        exit_bar = j
+                        exit_reason = "sl"
+                        break
+                    if tp_hit:
+                        raw_exit = tp
+                        exit_price = tp * (1 - BACKTEST_SLIPPAGE_RATE)
+                        exit_bar = j
+                        exit_reason = "tp"
+                        break
+                else:
+                    if liq_price and hi >= liq_price:
+                        liquidation_touch = True
+                    sl_hit = hi >= sl
+                    tp_hit = lo <= tp
+                    if sl_hit and tp_hit:
+                        ambiguous = True
+                    if sl_hit:
+                        raw_exit = sl
+                        exit_price = sl * (1 + BACKTEST_SLIPPAGE_RATE)
+                        exit_bar = j
+                        exit_reason = "sl"
+                        break
+                    if tp_hit:
+                        raw_exit = tp
+                        exit_price = tp * (1 + BACKTEST_SLIPPAGE_RATE)
+                        exit_bar = j
+                        exit_reason = "tp"
+                        break
+
+            if ambiguous:
+                ambiguous_bars += 1
+            if liquidation_touch:
+                liquidation_touches += 1
+
+            if direction == "long":
+                gross_pnl = (exit_price - entry) * qty
+                position_ret_gross = (exit_price - entry) / entry
+                mfe = (max(highs[entry_bar:exit_bar + 1]) - entry) / risk_per_unit
+                mae = (entry - min(lows[entry_bar:exit_bar + 1])) / risk_per_unit
+            else:
+                gross_pnl = (entry - exit_price) * qty
+                position_ret_gross = (entry - exit_price) / entry
+                mfe = (entry - min(lows[entry_bar:exit_bar + 1])) / risk_per_unit
+                mae = (max(highs[entry_bar:exit_bar + 1]) - entry) / risk_per_unit
+
+            fees = (entry * qty + exit_price * qty) * BACKTEST_FEE_RATE
+            slippage_cash = (abs(entry - raw_entry) + abs(exit_price - raw_exit)) * qty
+            net_pnl = gross_pnl - fees
+            equity = max(0.0001, equity_before + net_pnl)
+            equity_curve.append(equity)
+            peak = max(equity_curve)
+            drawdown_curve.append((peak - equity) / peak if peak > 0 else 0.0)
+            exposure_bars += exit_bar - entry_bar + 1
+
+            trade_ret_equity = net_pnl / equity_before if equity_before > 0 else 0
+            r_multiple = net_pnl / actual_risk_cash if actual_risk_cash > 0 else 0
+            trades.append({
+                "idx": len(trades) + 1,
+                "dir": direction,
+                "entry_bar": entry_bar,
+                "exit_bar": exit_bar,
+                "entry": entry,
+                "exit": exit_price,
+                "raw_entry": raw_entry,
+                "raw_exit": raw_exit,
+                "sl": sl,
+                "tp": tp,
+                "qty": qty,
+                "position_value": position_value,
+                "effective_leverage": effective_leverage,
+                "liq_price": liq_price,
+                "target_risk_cash": target_risk_cash,
+                "actual_risk_cash": actual_risk_cash,
+                "net_pnl": net_pnl,
+                "gross_pnl": gross_pnl,
+                "ret": trade_ret_equity,
+                "position_ret_gross": position_ret_gross,
+                "r_multiple": r_multiple,
+                "fee": fees,
+                "slippage_cash": slippage_cash,
+                "reason": exit_reason,
+                "bars_held": exit_bar - entry_bar + 1,
+                "score": score,
+                "regime": regime_bt,
+                "mfe_r": mfe,
+                "mae_r": mae,
+                "ambiguous": ambiguous,
+                "liquidation_touch": liquidation_touch,
+                "equity_before": equity_before,
+                "equity_after": equity,
+            })
+
+            # No overlapping positions in this test.
+            i = max(i + 1, exit_bar + 1)
+
+        except Exception as e:
+            errors += 1
+            i += 1
+            continue
+
+    if not trades:
+        return None, f"Сигналов не найдено за {lookback_candles} свечей. Пропуски: {skipped}"
+
+    wins = [t for t in trades if t["net_pnl"] > 0]
+    losses = [t for t in trades if t["net_pnl"] <= 0]
+    win_rate = len(wins) / len(trades)
+    returns = [t["ret"] for t in trades]
+    r_values = [t["r_multiple"] for t in trades]
+    avg_win = sum(t["ret"] for t in wins) / len(wins) if wins else 0.0
+    avg_loss = abs(sum(t["ret"] for t in losses) / len(losses)) if losses else 0.0
+    avg_win_r = sum(t["r_multiple"] for t in wins) / len(wins) if wins else 0.0
+    avg_loss_r = abs(sum(t["r_multiple"] for t in losses) / len(losses)) if losses else 0.0
+    gross_profit = sum(t["net_pnl"] for t in wins)
+    gross_loss = abs(sum(t["net_pnl"] for t in losses))
+    pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    peak = equity_curve[0]
+    max_dd = 0.0
+    for e in equity_curve:
+        peak = max(peak, e)
+        dd = (peak - e) / peak if peak > 0 else 0
+        max_dd = max(max_dd, dd)
+
+    avg_ret = sum(returns) / len(returns)
+    std_ret = float(np.std(returns)) if len(returns) > 1 else 0.0
+    downside = [r for r in returns if r < 0]
+    downside_std = float(np.std(downside)) if len(downside) > 1 else 0.0
+    sharpe = (avg_ret / std_ret * math.sqrt(len(returns))) if std_ret > 0 else 0.0
+    sortino = (avg_ret / downside_std * math.sqrt(len(returns))) if downside_std > 0 else 0.0
+
+    exit_reasons = {}
+    regime_stats = {}
+    for t in trades:
+        exit_reasons[t["reason"]] = exit_reasons.get(t["reason"], 0) + 1
+        rg = t.get("regime") or "unknown"
+        regime_stats.setdefault(rg, {"n": 0, "wins": 0, "net_pnl": 0.0, "avg_r_sum": 0.0})
+        regime_stats[rg]["n"] += 1
+        regime_stats[rg]["wins"] += 1 if t["net_pnl"] > 0 else 0
+        regime_stats[rg]["net_pnl"] += t["net_pnl"]
+        regime_stats[rg]["avg_r_sum"] += t["r_multiple"]
+    for rg, st in regime_stats.items():
+        st["wr"] = st["wins"] / st["n"] * 100 if st["n"] else 0.0
+        st["avg_r"] = st["avg_r_sum"] / st["n"] if st["n"] else 0.0
+        st.pop("avg_r_sum", None)
+
+    payoff_ratio = (avg_win / avg_loss) if avg_loss > 0 else 0.0
+    expectancy_pct = (win_rate * avg_win - (1 - win_rate) * avg_loss) * 100
+    expectancy_r = sum(r_values) / len(r_values)
+    recovery_factor = ((equity_curve[-1] - BACKTEST_INITIAL_EQUITY) / BACKTEST_INITIAL_EQUITY) / max_dd if max_dd > 0 else 0.0
+    exposure_pct = min(100.0, exposure_bars / tested_bars * 100)
+
+    trade_log_tail = []
+    for t in trades[-BACKTEST_TRADE_LOG_LIMIT:]:
+        trade_log_tail.append({
+            "idx": t["idx"],
+            "dir": t["dir"],
+            "r": t["r_multiple"],
+            "ret_pct": t["ret"] * 100,
+            "reason": t["reason"],
+            "bars": t["bars_held"],
+            "entry": t["entry"],
+            "exit": t["exit"],
+        })
+
+    return {
+        "n_trades": len(trades),
+        "n_wins": len(wins),
+        "n_losses": len(losses),
+        "win_rate": win_rate,
+        "avg_win": avg_win * 100,
+        "avg_loss": avg_loss * 100,
+        "avg_win_r": avg_win_r,
+        "avg_loss_r": avg_loss_r,
+        "payoff_ratio": payoff_ratio,
+        "profit_factor": pf,
+        "max_drawdown": max_dd * 100,
+        "total_return": (equity_curve[-1] / BACKTEST_INITIAL_EQUITY - 1.0) * 100,
+        "final_equity": equity_curve[-1],
+        "initial_equity": BACKTEST_INITIAL_EQUITY,
+        "lookback": lookback_candles,
+        "tested_bars": tested_bars,
+        "interval_label": INTERVALS[interval]["label"],
+        "kelly_pct": kelly_criterion(win_rate, payoff_ratio) if payoff_ratio > 0 else 0.0,
+        "long": _bt_side_stats(trades, "long"),
+        "short": _bt_side_stats(trades, "short"),
+        "best_trade": max(returns) * 100,
+        "worst_trade": min(returns) * 100,
+        "best_r": max(r_values),
+        "worst_r": min(r_values),
+        "avg_ret": avg_ret * 100,
+        "expectancy": expectancy_pct,
+        "expectancy_r": expectancy_r,
+        "median_r": _bt_percentile(r_values, 50),
+        "p10_r": _bt_percentile(r_values, 10),
+        "p90_r": _bt_percentile(r_values, 90),
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "recovery_factor": recovery_factor,
+        "exit_reasons": exit_reasons,
+        "regime_stats": regime_stats,
+        "fees_paid": sum(t["fee"] for t in trades),
+        "fees_pct_initial": sum(t["fee"] for t in trades) / BACKTEST_INITIAL_EQUITY * 100,
+        "slippage_cash": sum(t["slippage_cash"] for t in trades),
+        "slippage_pct_initial": sum(t["slippage_cash"] for t in trades) / BACKTEST_INITIAL_EQUITY * 100,
+        "risk_per_trade": BACKTEST_RISK_PER_TRADE * 100,
+        "fee_rate": BACKTEST_FEE_RATE * 100,
+        "slippage_rate": BACKTEST_SLIPPAGE_RATE * 100,
+        "max_hold_bars": BACKTEST_MAX_HOLD_BARS,
+        "max_notional_equity_mult": BACKTEST_MAX_NOTIONAL_EQUITY_MULT,
+        "avg_bars_held": sum(t["bars_held"] for t in trades) / len(trades),
+        "exposure_pct": exposure_pct,
+        "max_consecutive_wins": _bt_count_streak(trades, True),
+        "max_consecutive_losses": _bt_count_streak(trades, False),
+        "ambiguous_bars": ambiguous_bars,
+        "capped_positions": capped_positions,
+        "liquidation_touches": liquidation_touches,
+        "skipped": skipped,
+        "errors": errors,
+        "trade_log_tail": trade_log_tail,
+        "equity_curve": equity_curve,
+        "trades": trades,
+        "model_notes": [
+            "Entry = next candle open after signal close.",
+            "SL/TP same candle => SL first, conservative OHLC assumption.",
+            "Funding, queue position and partial fills are not modeled.",
+        ],
+    }, None
+
+
+def format_backtest(stats, ticker, interval):
+    tk = TICKERS[ticker]["label"]
+    s = stats
+    pf = "∞" if s["profit_factor"] == float("inf") else f"{s['profit_factor']:.2f}"
+    reasons = s.get("exit_reasons", {})
+    reason_text = ", ".join(f"{k}:{v}" for k, v in reasons.items()) if reasons else "—"
+    skipped = s.get("skipped", {})
+    skip_text = ", ".join(f"{k}:{v}" for k, v in skipped.items() if v) or "—"
+    long_s = s.get("long", {})
+    short_s = s.get("short", {})
+    regimes = s.get("regime_stats", {})
+    regime_text = "—"
+    if regimes:
+        parts = []
+        for rg, st in sorted(regimes.items(), key=lambda kv: kv[1].get("n", 0), reverse=True)[:3]:
+            parts.append(f"{rg}: N{st.get('n',0)} WR{st.get('wr',0):.0f}% R{st.get('avg_r',0):+.2f}")
+        regime_text = " | ".join(parts)
+
+    tail = s.get("trade_log_tail", [])
+    tail_lines = []
+    for t in tail[-5:]:
+        side = "L" if t.get("dir") == "long" else "S"
+        tail_lines.append(
+            f"#{t.get('idx')} {side} {t.get('r',0):+.2f}R {t.get('ret_pct',0):+.2f}% {t.get('reason')} {t.get('bars')}b"
+        )
+
+    verdict = "✅ статистически неплохо, но нужен OOS/WFO"
+    if s.get("n_trades", 0) < 30:
+        verdict = "⚠️ мало сделок: выводы слабые"
+    elif s.get("expectancy_r", 0) <= 0 or s.get("profit_factor", 0) < 1.1:
+        verdict = "❌ матожидание слабое/отрицательное"
+    elif s.get("max_drawdown", 0) > 20:
+        verdict = "⚠️ высокая просадка: риск важнее доходности"
+
+    lines = [
+        f"🧪 <b>БЭКТЕСТ v6.3 — {tk}</b>",
+        f"⏱ {s['interval_label']} | Lookback: <b>{s['lookback']}</b> свечей | Tested bars: {s.get('tested_bars', 0)}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Сделок: <b>{s['n_trades']}</b> | Winrate: <b>{s['win_rate']*100:.1f}%</b>",
+        f"Long: N{long_s.get('n',0)} WR{long_s.get('wr',0):.1f}% R{long_s.get('avg_r',0):+.2f} | Short: N{short_s.get('n',0)} WR{short_s.get('wr',0):.1f}% R{short_s.get('avg_r',0):+.2f}",
+        f"Exposure: <b>{s.get('exposure_pct', 0):.1f}%</b> | Avg hold: {s.get('avg_bars_held', 0):.1f} свечей",
+        "",
+        f"Equity: <b>{s['initial_equity']:.2f} → {s['final_equity']:.2f}</b> ({s['total_return']:+.2f}%)",
+        f"Max DD: <b>{s['max_drawdown']:.2f}%</b> | Recovery: {s.get('recovery_factor', 0):.2f}",
+        f"Profit Factor: <b>{pf}</b> | Payoff: {s.get('payoff_ratio', 0):.2f}",
+        f"Expectancy: <b>{s.get('expectancy_r', 0):+.3f}R</b> / {s.get('expectancy', 0):+.3f}% на сделку",
+        f"R median/p10/p90: {s.get('median_r',0):+.2f} / {s.get('p10_r',0):+.2f} / {s.get('p90_r',0):+.2f}",
+        f"Best/Worst: {s['best_r']:+.2f}R / {s['worst_r']:+.2f}R",
+        f"Max streak W/L: {s.get('max_consecutive_wins',0)} / {s.get('max_consecutive_losses',0)}",
+        "",
+        f"Sharpe*: <b>{s.get('sharpe', 0):.2f}</b> | Sortino*: <b>{s.get('sortino', 0):.2f}</b> | Kelly*: <b>{s['kelly_pct']:.1f}%</b>",
+        "",
+        "⚙️ <b>Реалистичность:</b>",
+        f"Risk/trade target: {s.get('risk_per_trade', 0):.1f}% equity | Max notional: {s.get('max_notional_equity_mult', 0):.1f}x equity",
+        f"Fee: {s.get('fee_rate', 0):.3f}% × 2 | Slippage: {s.get('slippage_rate', 0):.3f}% на вход/выход",
+        f"Fees paid: {s.get('fees_pct_initial', 0):.2f}% initial equity | Slippage cost: {s.get('slippage_pct_initial', 0):.2f}%",
+        f"Выходы: {reason_text}",
+        f"Режимы: {regime_text}",
+        f"Ambiguous SL/TP candles: {s.get('ambiguous_bars', 0)} | Position caps: {s.get('capped_positions', 0)} | Liq touches*: {s.get('liquidation_touches', 0)}",
+        f"Skipped: {skip_text}",
+    ]
+    if tail_lines:
+        lines += ["", "📋 <b>Последние сделки:</b>"] + tail_lines
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Вердикт: <b>{verdict}</b>",
+        "⚠️ Funding, очередь заявок, partial fills и порядок движения внутри свечи не моделируются.",
+        "*Sharpe/Sortino/Kelly приблизительные: считаются по сделкам, не по дневной доходности.",
+    ]
+    if s.get("errors"):
+        lines.append(f"Ошибок в цикле: {s['errors']}")
+    return "\n".join(lines)
+
+def format_msg(data, ticker, interval):
+    d   = data
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    tf  = INTERVALS[interval]["label"]
+    tk  = TICKERS[ticker]["label"]
+    p   = d["price"]
+
+    regime_icons = {"trend": "📈 ТРЕНД", "flat": "↔️ БОКОВИК",
+                    "volatile": "⚡ ВОЛАТИЛЬНОСТЬ", "neutral": "⚪ НЕЙТРАЛЬНО"}
+    regime_label = regime_icons.get(d.get("regime", "neutral"), "⚪")
+    adx_str = f"  ADX={d['adx']:.1f}" if d.get("adx") else ""
+
+    lines = [
+        f"📊 <b>QUANT SIGNAL v5 — {tk}</b>",
+        f"🕐 {now}  |  ⏱ <b>{tf}</b>",
+        f"💰 Цена: <b>{fmt_price(p, ticker)}</b>",
+        f"🎯 Режим: <b>{regime_label}</b>{adx_str}  |  Порог: {d.get('min_votes', MIN_SIGNAL_VOTES)} голосов",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⭐ Сигнал: <b>{d['signal']}</b>",
+    ]
+
+    if d.get("anomaly_reason"):
+        lines.append(f"\n{d['anomaly_reason']}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("⚠️ Статистика, не гарантия. Paper Trading only!")
+        return "\n".join(lines)
+
+    if d["prob"] > 0:
+        lines.append(f"📈 Вероятность: <b>{d['prob']*100:.1f}%</b>")
+
+    bws  = d.get("bull_weight_sum", 0)
+    brws = d.get("bear_weight_sum", 0)
+    lines.append(f"⚖️ Счёт: 🟢{bws:.1f} vs 🔴{brws:.1f}")
+
+    if d.get("kelly_pct") and d["kelly_pct"] > 0:
+        lines.append(f"{'✅' if d['kelly_pct']>=1 else '⚠️'} Критерий Келли: <b>{d['kelly_pct']:.1f}%</b>")
+
+    rl = d.get("risk_levels")
+    if rl:
+        direction_label = "LONG" if "LONG" in d["signal"] else "SHORT"
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"🛡 <b>Риск-менеджмент ({direction_label})</b>",
+            f"  🔴 Stop Loss:     <b>{fmt_price(rl['sl'], ticker)}</b>  (-{rl['risk_pct']:.1f}%)",
+            f"  🎯 Take Profit 1: <b>{fmt_price(rl['tp1'], ticker)}</b>",
+            f"  🎯 Take Profit 2: <b>{fmt_price(rl['tp2'], ticker)}</b>",
+            f"  ⚖️ Risk/Reward:   <b>{rl['rr_ratio']:.1f}x</b>",
+        ]
+
+    if d["mtf_details"]:
+        lines += ["", "━━━━━━━━━━━━━━━━━━━━", "📡 <b>MTF анализ:</b>"]
+        for det in d["mtf_details"]:
+            lines.append(f"  {det}")
+
+    if d["bull_args"]:
+        lines += ["", f"🟢 <b>Факторы роста ({len(d['bull_args'])}):</b>"]
+        for a in d["bull_args"]: lines.append(f"  • {a}")
+
+    if d["bear_args"]:
+        lines += ["", f"🔴 <b>Факторы падения ({len(d['bear_args'])}):</b>"]
+        for a in d["bear_args"]: lines.append(f"  • {a}")
+
+    if d["neutral"]:
+        lines += ["", "⚪ <b>Нейтральные:</b>"]
+        for a in d["neutral"]: lines.append(f"  • {a}")
+
+    lines += ["", "━━━━━━━━━━━━━━━━━━━━",
+              "⚠️ Статистика, не гарантия. Paper Trading only!"]
+    return "\n".join(lines)
+
+
+# ============================================================
+# ФОРМАТИРОВАНИЕ СПИСКА ПОЗИЦИЙ
+# ============================================================
+def format_positions_list(positions):
+    if not positions:
+        return ("📂 <b>Открытых позиций нет</b>\n\n"
+                "Получи сигнал и открой позицию кнопкой <b>📂 Открыть позицию</b>")
+    now   = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines = [f"📂 <b>Мои открытые позиции</b>  ({now})", ""]
+    for pos in positions:
+        try:
+            p = get_price(pos["ticker"])
+        except Exception:
+            p = None
+        direction_emoji = "🟢" if pos["direction"] == "long" else "🔴"
+        entry = pos["entry_price"]
+        tk    = TICKERS[pos["ticker"]]["label"]
+        pnl_str = ""
+        if p:
+            pnl = ((p - entry) / entry * 100 if pos["direction"] == "long"
+                   else (entry - p) / entry * 100)
+            pnl_str = f"  PnL: <b>{pnl:+.2f}%</b>"
+        tp1_mark = "✅" if pos.get("tp1_hit") else "⏳"
+        lines += [
+            f"{direction_emoji} <b>{tk}</b>  {pos['direction'].upper()}",
+            (f"  Вход: {fmt_price(entry, pos['ticker'])}  |  Сейчас: {fmt_price(p, pos['ticker'])}" if p
+             else f"  Вход: {fmt_price(entry, pos['ticker'])}"),
+            f"  SL: {fmt_price(pos['sl'], pos['ticker'])}  TP: {fmt_price(pos['tp1'], pos['ticker'])} {tp1_mark}",
+            f"  TF: {INTERVALS[pos['interval']]['label']}{pnl_str}",
+            f"  <i>ID: {pos['pos_id']}</i>",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+# ============================================================
+# АВТО-ДАЙДЖЕСТ
+# ============================================================
+def format_auto_digest(results, interval_label, analysis_tf_label):
+    now   = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines = [
+        f"⚡ <b>Авто-сигнал | {now}</b>",
+        f"📊 Анализ: <b>{analysis_tf_label}</b>  |  Рассылка: <b>{interval_label}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    has_signal = False
+    for ticker, result in results:
+        if isinstance(result, str):
+            lines.append(f"❓ {TICKERS[ticker]['label']} — ошибка")
+            continue
+        d = result; tk = TICKERS[ticker]["label"]; p = d["price"]; s = d["signal"]
+        pr = f" ({d['prob']*100:.0f}%)" if d["prob"] > 0 else ""
+        regime_short = {"trend": "📈", "flat": "↔️", "volatile": "⚡", "neutral": "⚪"}.get(d.get("regime","?"), "⚪")
+        rl_str = ""
+        if d.get("risk_levels"):
+            rl = d["risk_levels"]
+            rl_str = f"  SL{fmt_price(rl['sl'], ticker)} TP{fmt_price(rl['tp1'], ticker)} RR{rl['rr_ratio']:.1f}x"
+        if "LONG" in s:
+            has_signal = True
+            lines.append(f"🟢 <b>{tk}</b> {regime_short} {fmt_price(p, ticker)} → <b>{s}</b>{pr}{rl_str}")
+        elif "SHORT" in s:
+            has_signal = True
+            lines.append(f"🔴 <b>{tk}</b> {regime_short} {fmt_price(p, ticker)} → <b>{s}</b>{pr}{rl_str}")
+        elif "Вероятный" in s:
+            has_signal = True
+            lines.append(f"🟡 <b>{tk}</b> {regime_short} {fmt_price(p, ticker)} → {s}{pr}")
+        else:
+            lines.append(f"⏸ {tk} {regime_short} {fmt_price(p, ticker)} → WAIT")
+    if not has_signal:
+        lines += ["", "📭 Активных сигналов нет"]
+    lines += ["", "⚠️ Не финансовая рекомендация"]
+    return "\n".join(lines)
+
+
+
+
+# ============================================================
+# v5.6 — ЖУРНАЛ СИГНАЛОВ, САМООЦЕНКА И УСИЛЕННЫЕ ФИЛЬТРЫ
+# ============================================================
+_signal_journal_cache = None
+_signal_journal_lock = threading.Lock()
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _load_signal_journal():
+    global _signal_journal_cache
+    if _signal_journal_cache is not None:
+        return _signal_journal_cache
+    if not os.path.exists(SIGNAL_JOURNAL_FILE):
+        _signal_journal_cache = []
+        return _signal_journal_cache
+    try:
+        with open(SIGNAL_JOURNAL_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("signals", [])
+        _signal_journal_cache = data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"  [journal] Ошибка загрузки: {e}")
+        _signal_journal_cache = []
+    return _signal_journal_cache
+
+
+def _save_signal_journal():
+    global _signal_journal_cache
+    if _signal_journal_cache is None:
+        return
+    try:
+        data = _signal_journal_cache[-SIGNAL_JOURNAL_MAX_RECORDS:]
+        _signal_journal_cache = data
+        tmp = SIGNAL_JOURNAL_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, SIGNAL_JOURNAL_FILE)
+    except Exception as e:
+        print(f"  [journal] Ошибка сохранения: {e}")
+
+
+def _signal_direction_from_text(signal):
+    if not signal:
+        return None
+    if "LONG" in signal:
+        return "long"
+    if "SHORT" in signal:
+        return "short"
+    return None
+
+
+def _signal_unique_key(ticker, interval, direction, price):
+    # Защита от дублей: один близкий сигнал по тикеру/TF/направлению/цене.
+    bucket = round(float(price), 6) if price else 0
+    minute_slot = int(time.time() // 300)  # 5-минутное окно
+    return f"{ticker}:{interval}:{direction}:{bucket}:{minute_slot}"
+
+
+def record_signal_journal(ticker, interval, data, source="analysis"):
+    """Записывает только actionable LONG/SHORT. WAIT не засоряет журнал."""
+    direction = data.get("direction") or _signal_direction_from_text(data.get("signal"))
+    if direction not in ("long", "short"):
+        return False
+    price = _safe_float(data.get("price"))
+    atr = _safe_float(data.get("atr"))
+    if not price or price <= 0:
+        return False
+
+    unique_key = _signal_unique_key(ticker, interval, direction, price)
+    with _signal_journal_lock:
+        journal = _load_signal_journal()
+        if any(x.get("unique_key") == unique_key for x in journal[-120:]):
+            return False
+        rl = data.get("risk_levels") or {}
+        rec = {
+            "unique_key": unique_key,
+            "created_at": _now_iso(),
+            "ticker": ticker,
+            "interval": interval,
+            "source": source,
+            "signal": data.get("signal"),
+            "direction": direction,
+            "entry_price": price,
+            "atr": atr,
+            "confidence": int(data.get("confidence", 0) or 0),
+            "prob": _safe_float(data.get("prob"), 0),
+            "regime": data.get("regime"),
+            "micro_regime": data.get("micro_regime"),
+            "rr_ratio": _safe_float(rl.get("rr_ratio"), 0),
+            "risk_pct": _safe_float(rl.get("risk_pct"), 0),
+            "sl": _safe_float(rl.get("sl")),
+            "tp1": _safe_float(rl.get("tp1")),
+            "tp2": _safe_float(rl.get("tp2")),
+            "blockers": list(data.get("risk_blockers", [])),
+            "bull_score": _safe_float(data.get("bull_weight_sum"), 0),
+            "bear_score": _safe_float(data.get("bear_weight_sum"), 0),
+            "status": "open",
+            "evaluations": {},
+        }
+        journal.append(rec)
+        _save_signal_journal()
+        return True
+
+
+def _evaluate_record_with_ohlcv(rec, opens, highs, lows, closes):
+    entry = _safe_float(rec.get("entry_price"))
+    atr = _safe_float(rec.get("atr"))
+    direction = rec.get("direction")
+    if not entry or not atr or direction not in ("long", "short"):
+        return False
+    # Ищем свечу, где цена была максимально близко к цене сигнала.
+    idx = None
+    best_dist = None
+    lookback = min(len(closes), 450)
+    for i in range(len(closes) - lookback, len(closes)):
+        dist = abs(closes[i] - entry) / entry
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            idx = i
+    if idx is None or best_dist is None or best_dist > 0.025:
+        return False
+
+    changed = False
+    for h in SIGNAL_EVAL_HORIZONS:
+        key = f"{h}b"
+        if key in rec.get("evaluations", {}):
+            continue
+        end = idx + h
+        if end >= len(closes):
+            continue
+        future_high = max(highs[idx + 1:end + 1])
+        future_low = min(lows[idx + 1:end + 1])
+        future_close = closes[end]
+        if direction == "long":
+            mfe = (future_high - entry) / atr
+            mae = (entry - future_low) / atr
+            close_move = (future_close - entry) / atr
+        else:
+            mfe = (entry - future_low) / atr
+            mae = (future_high - entry) / atr
+            close_move = (entry - future_close) / atr
+        if close_move >= SIGNAL_EVAL_MIN_MOVE_ATR or mfe >= 1.0:
+            outcome = "win"
+        elif close_move <= -SIGNAL_EVAL_MIN_MOVE_ATR or mae >= 1.0:
+            outcome = "loss"
+        else:
+            outcome = "neutral"
+        rec.setdefault("evaluations", {})[key] = {
+            "outcome": outcome,
+            "close_move_atr": round(close_move, 3),
+            "mfe_atr": round(mfe, 3),
+            "mae_atr": round(mae, 3),
+            "evaluated_at": _now_iso(),
+        }
+        changed = True
+    if rec.get("evaluations"):
+        rec["status"] = "evaluated"
+    return changed
+
+
+def update_signal_journal_evaluations(ticker=None, interval=None):
+    """Оценивает старые сигналы, когда появились новые свечи."""
+    with _signal_journal_lock:
+        journal = _load_signal_journal()
+        targets = [r for r in journal if r.get("status") != "evaluated" or len(r.get("evaluations", {})) < len(SIGNAL_EVAL_HORIZONS)]
+    if ticker:
+        targets = [r for r in targets if r.get("ticker") == ticker]
+    if interval:
+        targets = [r for r in targets if r.get("interval") == interval]
+    if not targets:
+        return 0
+
+    grouped = {}
+    for r in targets[-300:]:
+        grouped.setdefault((r.get("ticker"), r.get("interval")), []).append(r)
+
+    changed_total = 0
+    for (tk, iv), recs in grouped.items():
+        if tk not in TICKERS or iv not in INTERVALS:
+            continue
+        try:
+            o, h, l, c, v = get_ohlcv(tk, iv)
+        except Exception as e:
+            print(f"  [journal] Не смог оценить {tk} {iv}: {e}")
+            continue
+        with _signal_journal_lock:
+            for rec in recs:
+                if _evaluate_record_with_ohlcv(rec, o, h, l, c):
+                    changed_total += 1
+            if changed_total:
+                _save_signal_journal()
+    return changed_total
+
+
+def summarize_signal_journal(ticker=None, interval=None, min_conf=None):
+    journal = list(_load_signal_journal())
+    rows = []
+    for r in journal:
+        if ticker and r.get("ticker") != ticker:
+            continue
+        if interval and r.get("interval") != interval:
+            continue
+        if min_conf is not None and int(r.get("confidence", 0) or 0) < min_conf:
+            continue
+        ev = r.get("evaluations", {})
+        main = ev.get("6b") or ev.get("3b") or ev.get("12b")
+        if not main:
+            continue
+        rows.append((r, main))
+
+    def _summary(filter_fn):
+        subset = [(r, e) for r, e in rows if filter_fn(r, e)]
+        if not subset:
+            return {"n": 0, "wr": 0, "avg_move": 0, "avg_mfe": 0, "avg_mae": 0}
+        wins = sum(1 for _, e in subset if e.get("outcome") == "win")
+        losses = sum(1 for _, e in subset if e.get("outcome") == "loss")
+        decided = wins + losses
+        avg_move = sum(e.get("close_move_atr", 0) for _, e in subset) / len(subset)
+        avg_mfe = sum(e.get("mfe_atr", 0) for _, e in subset) / len(subset)
+        avg_mae = sum(e.get("mae_atr", 0) for _, e in subset) / len(subset)
+        return {
+            "n": len(subset),
+            "wins": wins,
+            "losses": losses,
+            "wr": wins / decided * 100 if decided else 0,
+            "avg_move": avg_move,
+            "avg_mfe": avg_mfe,
+            "avg_mae": avg_mae,
+        }
+
+    by_direction = {d: _summary(lambda r, e, d=d: r.get("direction") == d) for d in ("long", "short")}
+    by_conf = {
+        "high": _summary(lambda r, e: int(r.get("confidence", 0) or 0) >= 70),
+        "mid": _summary(lambda r, e: 55 <= int(r.get("confidence", 0) or 0) < 70),
+        "low": _summary(lambda r, e: int(r.get("confidence", 0) or 0) < 55),
+    }
+    by_regime = {}
+    for rg in sorted({r.get("micro_regime") or r.get("regime") or "unknown" for r, _ in rows}):
+        by_regime[rg] = _summary(lambda r, e, rg=rg: (r.get("micro_regime") or r.get("regime") or "unknown") == rg)
+    return {
+        "total": _summary(lambda r, e: True),
+        "by_direction": by_direction,
+        "by_conf": by_conf,
+        "by_regime": by_regime,
+        "raw_count": len(journal),
+        "evaluated_count": len(rows),
+    }
+
+
+def format_signal_stats(chat_id=None):
+    # Заодно обновим оценки по всем активам в фоне текущего запроса.
+    try:
+        update_signal_journal_evaluations()
+    except Exception as e:
+        print(f"  [journal] update error: {e}")
+    s = summarize_signal_journal()
+    total = s["total"]
+    lines = [
+        "📈 <b>Статистика сигналов v5.6</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Записей в журнале: <b>{s['raw_count']}</b>",
+        f"Оценённых сигналов: <b>{s['evaluated_count']}</b>",
+    ]
+    if total["n"] == 0:
+        lines += [
+            "",
+            "Пока мало данных. Бот начнёт показывать статистику после нескольких сигналов и закрытых свечей.",
+            "Оставь авто-сигналы работать хотя бы 1–2 часа на 5m TF.",
+        ]
+        return "\n".join(lines)
+    lines += [
+        "",
+        f"Общий WR: <b>{total['wr']:.1f}%</b>  |  N={total['n']}",
+        f"Avg move: {total['avg_move']:+.2f} ATR | MFE {total['avg_mfe']:.2f} ATR | MAE {total['avg_mae']:.2f} ATR",
+        "",
+        "<b>По направлению:</b>",
+    ]
+    for d, label in (("long", "LONG"), ("short", "SHORT")):
+        x = s["by_direction"].get(d, {})
+        lines.append(f"  {label}: WR {x.get('wr',0):.1f}% | N={x.get('n',0)} | move {x.get('avg_move',0):+.2f} ATR")
+    lines += ["", "<b>По confidence:</b>"]
+    for key, label in (("high", "70+"), ("mid", "55–69"), ("low", "<55")):
+        x = s["by_conf"].get(key, {})
+        lines.append(f"  C{label}: WR {x.get('wr',0):.1f}% | N={x.get('n',0)}")
+    lines += ["", "<b>По режимам:</b>"]
+    for rg, x in sorted(s["by_regime"].items(), key=lambda kv: kv[1].get("n",0), reverse=True)[:7]:
+        lines.append(f"  {rg}: WR {x.get('wr',0):.1f}% | N={x.get('n',0)}")
+    lines += [
+        "",
+        "⚠️ Это статистика твоего бота по его же сигналам. Она нужна для отбора слабых сетапов, а не для гарантии прибыли.",
+    ]
+    return "\n".join(lines)
+
+
+def self_score_adjustment(ticker, interval, direction, confidence):
+    """Корректирует confidence по истории похожих сигналов."""
+    s = summarize_signal_journal(ticker=ticker, interval=interval)
+    total = s.get("total", {})
+    if total.get("n", 0) < 12:
+        return confidence, "мало истории для самооценки"
+    dstat = s.get("by_direction", {}).get(direction, {})
+    wr = dstat.get("wr", total.get("wr", 50))
+    n = dstat.get("n", 0)
+    adj = 0
+    if n >= 8:
+        if wr >= 62:
+            adj = +6
+        elif wr >= 56:
+            adj = +3
+        elif wr <= 42:
+            adj = -8
+        elif wr <= 48:
+            adj = -4
+    new_conf = int(max(0, min(95, confidence + adj)))
+    note = f"self-score {wr:.1f}% WR по {direction.upper()} N={n}, adj={adj:+d}"
+    return new_conf, note
+
+
+def calc_choppiness_index(highs, lows, closes, period=14):
+    if len(closes) < period + 2:
+        return None
+    tr_sum = 0.0
+    for i in range(len(closes) - period, len(closes)):
+        tr_sum += max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+    hh = max(highs[-period:])
+    ll = min(lows[-period:])
+    denom = hh - ll
+    if denom <= 0 or tr_sum <= 0:
+        return None
+    return 100 * math.log10(tr_sum / denom) / math.log10(period)
+
+
+def classify_micro_regime(highs, lows, closes, volumes):
+    atr = calc_atr(highs, lows, closes)
+    price = closes[-1]
+    atr_pct = atr / price * 100 if atr and price else 0
+    chop = calc_choppiness_index(highs, lows, closes)
+    ema20 = calc_ema(closes, 20)
+    ema50 = calc_ema(closes, 50)
+    ema200 = calc_ema(closes, 200)
+    vol_ratio = 1.0
+    if len(volumes) >= 20:
+        avg_v = sum(volumes[-20:-1]) / 19
+        vol_ratio = volumes[-1] / avg_v if avg_v > 0 else 1.0
+    last_body_pct = abs(closes[-1] - closes[-2]) / closes[-2] * 100 if len(closes) >= 2 else 0
+    if atr_pct > 3.5 or (vol_ratio > 2.5 and last_body_pct > atr_pct * 0.8):
+        return "PANIC/PUMP", chop, atr_pct, vol_ratio
+    if chop is not None and chop > 62:
+        return "CHOP/RANGE", chop, atr_pct, vol_ratio
+    if ema20 and ema50 and ema200:
+        if price > ema20 > ema50 > ema200:
+            return "TREND_UP", chop, atr_pct, vol_ratio
+        if price < ema20 < ema50 < ema200:
+            return "TREND_DOWN", chop, atr_pct, vol_ratio
+    if vol_ratio > 1.6 and chop is not None and chop < 45:
+        return "BREAKOUT", chop, atr_pct, vol_ratio
+    return "MIXED", chop, atr_pct, vol_ratio
+
+
+def build_risk_blockers(data, ticker, interval):
+    blockers = []
+    warnings = []
+    direction = data.get("direction") or _signal_direction_from_text(data.get("signal"))
+    price = _safe_float(data.get("price"))
+    atr = _safe_float(data.get("atr"))
+    ema20 = _safe_float(data.get("ema20"))
+    rl = data.get("risk_levels") or {}
+    rr = _safe_float(rl.get("rr_ratio"), 0) or 0
+    risk_pct = _safe_float(rl.get("risk_pct"), 0) or 0
+    vol_ratio = _safe_float(data.get("vol_ratio"), 1) or 1
+    micro = data.get("micro_regime") or "MIXED"
+    confidence = int(data.get("confidence", 0) or 0)
+
+    if direction:
+        if rr and rr < MIN_RR_TO_TRADE:
+            blockers.append(f"RR {rr:.1f}x ниже минимума {MIN_RR_TO_TRADE:.1f}x")
+        if risk_pct and risk_pct > 3.5:
+            blockers.append(f"SL далеко: риск {risk_pct:.1f}% до стопа")
+        if atr and ema20 and price:
+            dist_ema_atr = abs(price - ema20) / atr if atr > 0 else 0
+            data["distance_from_ema_atr"] = round(dist_ema_atr, 2)
+            if dist_ema_atr > MAX_DISTANCE_FROM_EMA_ATR:
+                blockers.append(f"цена убежала от EMA20 на {dist_ema_atr:.1f} ATR — лучше ждать ретест")
+            elif dist_ema_atr > 1.5:
+                warnings.append(f"цена далеко от EMA20: {dist_ema_atr:.1f} ATR")
+        if micro == "CHOP/RANGE" and "индикаторы" in str(data.get("signal", "")):
+            blockers.append("рынок пилит: CHOP/RANGE, трендовый вход слабый")
+        if micro == "PANIC/PUMP" and confidence < 78:
+            blockers.append("режим PANIC/PUMP: вход после импульса опасен")
+        if vol_ratio < 0.65 and micro in ("BREAKOUT", "TREND_UP", "TREND_DOWN"):
+            warnings.append(f"объём слабый: {vol_ratio:.1f}x")
+    data["risk_blockers"] = blockers
+    data["risk_warnings"] = warnings
+    return blockers, warnings
+
+
+# Сохраняем оригинальные функции и усиливаем их без разрушения старой логики.
+_base_full_analyze_v55 = full_analyze
+_base_format_msg_v55 = format_msg
+_base_format_auto_digest_v55 = format_auto_digest
+
+
+def full_analyze(ticker, interval):
+    data = _base_full_analyze_v55(ticker, interval)
+
+    # Оцениваем старые сигналы этого же тикера/TF при каждом новом анализе.
+    try:
+        update_signal_journal_evaluations(ticker, interval)
+    except Exception as e:
+        print(f"  [journal] eval error: {e}")
+
+    # Микро-режим рынка: отдельный слой над старым trend/flat/volatile.
+    try:
+        opens, highs, lows, closes, volumes = get_ohlcv(ticker, interval)
+        micro, chop, atr_pct, vol_ratio2 = classify_micro_regime(highs, lows, closes, volumes)
+        data["micro_regime"] = micro
+        data["choppiness"] = chop
+        data["atr_pct"] = atr_pct
+        data["vol_ratio_struct"] = vol_ratio2
+    except Exception:
+        data.setdefault("micro_regime", "MIXED")
+
+    b = _safe_float(data.get("bull_weight_sum"), 0) or 0
+    r = _safe_float(data.get("bear_weight_sum"), 0) or 0
+    total = max(0.0001, b + r)
+    edge = abs(b - r) / total
+    prob = _safe_float(data.get("prob"), 0) or 0
+    rr = _safe_float((data.get("risk_levels") or {}).get("rr_ratio"), 0) or 0
+    vol_ratio = _safe_float(data.get("vol_ratio"), 1) or 1
+    mtf_score = abs(_safe_float(data.get("mtf_score"), 0) or 0)
+    micro = data.get("micro_regime", "MIXED")
+
+    confidence = int(max(0, min(95, 35 + edge * 28 + prob * 25 + min(rr, 3.0) * 4 + min(mtf_score, 4) * 2)))
+    if vol_ratio >= 1.25:
+        confidence += 4
+    elif vol_ratio < 0.7:
+        confidence -= 6
+    if micro in ("TREND_UP", "TREND_DOWN", "BREAKOUT"):
+        confidence += 4
+    elif micro in ("CHOP/RANGE", "PANIC/PUMP"):
+        confidence -= 8
+    confidence = int(max(0, min(95, confidence)))
+    data["confidence"] = confidence
+
+    direction = data.get("direction") or _signal_direction_from_text(data.get("signal"))
+    blockers, warnings = build_risk_blockers(data, ticker, interval)
+
+    if direction:
+        conf2, self_note = self_score_adjustment(ticker, interval, direction, data["confidence"])
+        data["confidence"] = conf2
+        data["self_score_note"] = self_note
+
+    # Более строгая классификация сигнала.
+    signal = str(data.get("signal", "WAIT ⏸"))
+    if direction and blockers:
+        data["signal"] = f"WAIT ⏸ — сетап есть, но вход заблокирован"
+        data["direction"] = None
+    elif direction:
+        label = "LONG" if direction == "long" else "SHORT"
+        if data["confidence"] >= MIN_CONFIDENCE_FOR_STRONG:
+            data["signal"] = f"{'🟢' if direction=='long' else '🔴'} {label} (сильный confluence)"
+        elif data["confidence"] >= MIN_CONFIDENCE_FOR_ACTION:
+            data["signal"] = f"🟡 Вероятный {label}"
+        else:
+            data["signal"] = f"WAIT ⏸ — слабый {label}, нужен ретест/подтверждение"
+            data["direction"] = None
+
+    # Журналируем только сигналы, которые остались actionable.
+    try:
+        record_signal_journal(ticker, interval, data, source="full_analyze")
+    except Exception as e:
+        print(f"  [journal] record error: {e}")
+    return data
+
+
+def format_msg(data, ticker, interval):
+    msg = _base_format_msg_v55(data, ticker, interval)
+    extra = []
+    if data.get("confidence") is not None:
+        extra.append(f"🧠 Confidence: <b>{int(data.get('confidence', 0))}/95</b>")
+    if data.get("micro_regime"):
+        chop = data.get("choppiness")
+        chop_s = f" | Chop={chop:.1f}" if isinstance(chop, (int, float)) else ""
+        extra.append(f"🧭 Micro-regime: <b>{data.get('micro_regime')}</b>{chop_s}")
+    if data.get("self_score_note"):
+        extra.append(f"📚 {data.get('self_score_note')}")
+    if data.get("risk_warnings"):
+        extra.append("⚠️ Предупреждения: " + " | ".join(data.get("risk_warnings")[:3]))
+    if data.get("risk_blockers"):
+        extra.append("⛔ Блокеры входа: " + " | ".join(data.get("risk_blockers")[:3]))
+    if extra:
+        block = "\n".join(["", "━━━━━━━━━━━━━━━━━━━━", "<b>v5.6 Фильтр качества:</b>"] + extra)
+        msg = msg.replace("\n━━━━━━━━━━━━━━━━━━━━\n⚠️ Статистика, не гарантия. Paper Trading only!", block + "\n━━━━━━━━━━━━━━━━━━━━\n⚠️ Статистика, не гарантия. Paper Trading only!")
+    return msg
+
+
+def format_auto_digest(results, interval_label, analysis_tf_label):
+    now   = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines = [
+        f"⚡ <b>Авто-сигнал v5.6 | {now}</b>",
+        f"📊 Анализ: <b>{analysis_tf_label}</b>  |  Рассылка: <b>{interval_label}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    has_signal = False
+    for ticker, result in results:
+        if isinstance(result, str):
+            lines.append(f"❓ {TICKERS[ticker]['label']} — ошибка")
+            continue
+        d = result
+        tk = TICKERS[ticker]["label"]
+        p = d.get("price")
+        s = d.get("signal", "WAIT")
+        c = int(d.get("confidence", 0) or 0)
+        micro = d.get("micro_regime", "")
+        risk_icon = " ⛔" if d.get("risk_blockers") else (" ⚠️" if d.get("risk_warnings") else "")
+        rl_str = ""
+        if d.get("risk_levels"):
+            rl = d["risk_levels"]
+            rl_str = f" | SL {fmt_price(rl['sl'], ticker)} | TP {fmt_price(rl['tp1'], ticker)} | RR {rl['rr_ratio']:.1f}x"
+        if "LONG" in s and not d.get("risk_blockers"):
+            has_signal = True
+            lines.append(f"🟢 <b>{tk}</b> {fmt_price(p, ticker)} → <b>{s}</b> | C{c}{risk_icon} | {micro}{rl_str}")
+        elif "SHORT" in s and not d.get("risk_blockers"):
+            has_signal = True
+            lines.append(f"🔴 <b>{tk}</b> {fmt_price(p, ticker)} → <b>{s}</b> | C{c}{risk_icon} | {micro}{rl_str}")
+        elif "Вероятный" in s:
+            has_signal = True
+            lines.append(f"🟡 <b>{tk}</b> {fmt_price(p, ticker)} → {s} | C{c}{risk_icon} | {micro}")
+        else:
+            reason = ""
+            if d.get("risk_blockers"):
+                reason = " — " + d["risk_blockers"][0]
+            lines.append(f"⏸ {tk} {fmt_price(p, ticker)} → WAIT | C{c} | {micro}{reason}")
+    if not has_signal:
+        lines += ["", "📭 Активных сигналов нет"]
+    lines += ["", "⚠️ Не финансовая рекомендация"]
+    return "\n".join(lines)
+
+
+# ============================================================
+# АВТО-РАССЫЛКА — тикает каждую минуту, рассылает по персональным настройкам
+# ============================================================
+def auto_loop():
+    print("  [thread] auto_loop запущен (выровнен по UTC)")
+
+# При старте заполняем текущий слот чтобы не слать сразу
+    _now = datetime.now(timezone.utc)
+    _init_minutes = _now.hour * 60 + _now.minute
+    _sent_slots = {}
+    for _cid in list(auto_chat_ids):
+        _si = user_auto_send_interval.get(_cid, DEFAULT_AUTO_SEND_INTERVAL)
+        _iv_min = AUTO_SEND_INTERVALS[_si]["minutes"]
+        _sent_slots[f"{_cid}_{_si}"] = _init_minutes // _iv_min
+
+    while True:
+        # Ждём до следующей полной минуты
+        now = datetime.now(timezone.utc)
+        sleep_sec = 60 - now.second - now.microsecond / 1_000_000 + 1
+        time.sleep(sleep_sec)
+
+        now = datetime.now(timezone.utc)
+        if not auto_chat_ids:
+            continue
+
+        total_minutes = now.hour * 60 + now.minute  # 0..1439, сбрасывается в 00:00
+
+        groups = {}
+        for cid in list(auto_chat_ids):
+            si               = user_auto_send_interval.get(cid, DEFAULT_AUTO_SEND_INTERVAL)
+            tf               = user_auto_tf.get(cid, DEFAULT_AUTO_TF)
+            interval_minutes = AUTO_SEND_INTERVALS[si]["minutes"]
+
+            # Слот: номер интервала внутри суток (0, 1, 2, ...)
+            # Для 30m: 00:00=0, 00:30=1, 01:00=2 ... 23:30=47
+            current_slot = total_minutes // interval_minutes
+
+            # Уникальный ключ: пользователь + интервал
+            slot_key = f"{cid}_{si}"
+            last_slot = _sent_slots.get(slot_key, None)
+
+            # Новый ключ (смена интервала или новый пользователь) —
+            # запомнить текущий слот БЕЗ отправки, чтобы следующий
+            # сигнал пришёл ровно на границе следующего интервала
+            if last_slot is None:
+                _sent_slots[slot_key] = current_slot
+                continue
+
+            if current_slot != last_slot:
+                groups.setdefault((si, tf), []).append(cid)
+                _sent_slots[slot_key] = current_slot
+
+        if not groups:
+            continue
+
+        for (si, tf), chat_ids in groups.items():
+            threading.Thread(
+                target=_run_auto_group,
+                args=(si, tf, list(chat_ids)),
+                daemon=True
+            ).start()
+
+
+def _run_auto_group(si, tf, chat_ids):
+    si_seconds    = AUTO_SEND_INTERVALS[si]["minutes"] * 60
+    results       = []
+    signals_cache = {}
+
+    for ticker in AUTO_CRYPTO_TICKERS:
+        try:
+            data  = full_analyze(ticker, tf)
+            score = len(data["bull_args"]) - len(data["bear_args"])
+            signals_cache[ticker] = {"score": score, "signal": data["signal"], "data": data}
+        except Exception as e:
+            print(f"  [auto] Ошибка {ticker} {tf}: {e}")
+            signals_cache[ticker] = None
+
+    suppressed = set()
+    for pair in CORR_PAIRS:
+        t1, t2 = pair
+        if signals_cache.get(t1) is None or signals_cache.get(t2) is None:
+            continue
+        try:
+            _, _, _, c1, _ = get_ohlcv(t1, tf)
+            _, _, _, c2, _ = get_ohlcv(t2, tf)
+            corr = calc_rolling_correlation(c1, c2)
+            if corr and abs(corr) > CORR_THRESHOLD:
+                sc1 = abs(signals_cache[t1]["score"])
+                sc2 = abs(signals_cache[t2]["score"])
+                suppressed.add(t2 if sc1 >= sc2 else t1)
+        except Exception:
+            pass
+
+    for ticker in AUTO_CRYPTO_TICKERS:
+        sc         = signals_cache.get(ticker)
+        new_signal = sc["signal"] if sc else "error"
+        if sc and ("LONG" in new_signal or "SHORT" in new_signal):
+            group_id = f"{si}_{tf}"
+            if not should_send_signal(ticker, tf, new_signal, si_seconds, group_id):
+                d = sc["data"].copy(); d["signal"] = "⏸ дубль"; d["prob"] = 0
+                results.append((ticker, d)); continue
+        if sc is None:
+            results.append((ticker, "Ошибка"))
+        elif ticker in suppressed:
+            d = sc["data"].copy(); d["signal"] = "⏸ подавлен (корр)"; d["prob"] = 0
+            results.append((ticker, d))
+        else:
+            results.append((ticker, sc["data"]))
+
+    def _sort_key(item):
+        _, r = item
+        if isinstance(r, str): return 3
+        s = r.get("signal", "")
+        if "LONG"  in s: return 0
+        if "SHORT" in s: return 1
+        return 2
+
+    results.sort(key=_sort_key)
+
+    msg = format_auto_digest(
+        results,
+        AUTO_SEND_INTERVALS[si]["label"],
+        INTERVALS[tf]["label"],
+    )
+
+    for cid in chat_ids:
+        try:
+            send(cid, msg, main_keyboard())
+        except Exception as e:
+            print(f"  [auto] Ошибка отправки {cid}: {e}")
+            results       = []
+            signals_cache = {}
+
+            for ticker in AUTO_CRYPTO_TICKERS:
+                try:
+                    data  = full_analyze(ticker, tf)
+                    score = len(data["bull_args"]) - len(data["bear_args"])
+                    signals_cache[ticker] = {"score": score, "signal": data["signal"], "data": data}
+                except Exception as e:
+                    print(f"  [auto] Ошибка {ticker} {tf}: {e}")
+                    signals_cache[ticker] = None
+
+            suppressed = set()
+            for pair in CORR_PAIRS:
+                t1, t2 = pair
+                if signals_cache.get(t1) is None or signals_cache.get(t2) is None:
+                    continue
+                try:
+                    _, _, _, c1, _ = get_ohlcv(t1, tf)
+                    _, _, _, c2, _ = get_ohlcv(t2, tf)
+                    corr = calc_rolling_correlation(c1, c2)
+                    if corr and abs(corr) > CORR_THRESHOLD:
+                        sc1 = abs(signals_cache[t1]["score"])
+                        sc2 = abs(signals_cache[t2]["score"])
+                        suppressed.add(t2 if sc1 >= sc2 else t1)
+                except Exception:
+                    pass
+
+            for ticker in AUTO_CRYPTO_TICKERS:
+                sc         = signals_cache.get(ticker)
+                new_signal = sc["signal"] if sc else "error"
+                if sc and ("LONG" in new_signal or "SHORT" in new_signal):
+                    group_id = f"{si}_{tf}"
+                    if not should_send_signal(ticker, tf, new_signal, si_seconds, group_id):
+                        d = sc["data"].copy(); d["signal"] = "⏸ дубль"; d["prob"] = 0
+                        results.append((ticker, d)); continue
+                if sc is None:
+                    results.append((ticker, "Ошибка"))
+                elif ticker in suppressed:
+                    d = sc["data"].copy(); d["signal"] = "⏸ подавлен (корр)"; d["prob"] = 0
+                    results.append((ticker, d))
+                else:
+                    results.append((ticker, sc["data"]))
+
+            def _sort_key(item):
+                _, r = item
+                if isinstance(r, str): return 3
+                s = r.get("signal", "")
+                if "LONG"  in s: return 0
+                if "SHORT" in s: return 1
+                return 2
+
+            results.sort(key=_sort_key)
+
+            msg = format_auto_digest(
+                results,
+                AUTO_SEND_INTERVALS[si]["label"],
+                INTERVALS[tf]["label"],
+            )
+
+            for cid in chat_ids:
+                try:
+                    send(cid, msg, main_keyboard())
+                except Exception as e:
+                    print(f"  [auto] Ошибка отправки {cid}: {e}")
+
+
+# ============================================================
+# ТЕРМИНЫ
+# ============================================================
+EXPLAIN_PART_1 = """📖 <b>Термины — Часть 1: Новое в v5.2</b>
+━━━━━━━━━━━━━━━━━━━━
+
+🆕 <b>Изменения v5.2 (Flexible Auto Settings)</b>
+  • Авто-рассылка: каждый выбирает свой интервал
+  • Доступные интервалы рассылки: 1m / 5m / 15m / 30m / 1h
+  • Таймфрейм анализа выбирается независимо: 1m / 5m / 15m / 30m / 1h
+  • Cooldown между одинаковыми сигналами = интервал рассылки
+  • Настройки → ⚙️ Настройки авто в главном меню
+
+📂 <b>Менеджер позиций</b>
+После сигнала LONG/SHORT нажми <b>📂 Открыть позицию</b>.
+Бот запомнит вход, SL, TP1, TP2 и каждые 5 минут
+пришлёт совет: держать, взять TP1/TP2 или закрыть.
+
+🎯 <b>Уровни выхода:</b>
+  • TP1 → закрой 50%, SL → в безубыток
+  • TP2 → фиксируй всё немедленно
+  • SL пробит → экстренный алерт
+  • 3+ сигнала разворота → рекомендация выйти
+
+⚠️ Все советы — статистика, не гарантия!"""
+
+EXPLAIN_PART_2 = """📊 <b>Термины — Часть 2: Индикаторы</b>
+━━━━━━━━━━━━━━━━━━━━
+
+📈 RSI &lt;30=перепродан, &gt;70=перекуплен
+🔀 Stoch RSI K пересекает D вверх/вниз
+📉 EMA20/50/200 — краткосрочный/средний/долгосрочный тренд
+⚡ MACD — импульс и его направление
+🎸 Bollinger Bands — цена у полос = экстремум
+🌀 Supertrend — тренд-фильтр (разворот = сигнал)
+📦 OBV — накопление vs распределение
+☁️ Ichimoku — комплексный азиатский индикатор
+📡 MTF — подтверждение старшими таймфреймами
+  1m  → [5m, 15m]
+  5m  → [15m, 1h]
+  15m → [30m, 1h]
+  30m → [1h]
+  1h  → (нет старших)"""
+
+EXPLAIN_PART_3 = """🛡 <b>Термины — Часть 3: Риск и советы</b>
+━━━━━━━━━━━━━━━━━━━━
+
+🎯 <b>Критерий Келли (Half):</b>
+f = (WR × R − (1 − WR)) / R / 2
+Максимум 25% капитала.
+
+🛡 <b>Stop Loss / Take Profit:</b>
+  SL  = цена − ATR × 1.5
+  TP1 = цена + ATR × 2.5
+  TP2 = цена + ATR × 4.0
+
+💡 <b>Советы скальпера:</b>
+  1. Короткие TF (1m/5m) — очень короткий горизонт
+  2. Всегда ставь SL
+  3. Рискуй не более 0.5–1% депо за сделку
+  4. При TP1 → перенеси SL в точку входа (безубыток)
+  5. Бэктест ≠ гарантия
+
+⚠️ Не финансовая рекомендация!"""
+
+
+def send_explain_menu(chat_id):
+    send(chat_id, "📖 <b>Словарь терминов:</b>", explain_keyboard())
+
+
+# ============================================================
+# ФУНКЦИИ ЗАПРОСА
+# ============================================================
+def fetch_and_send_signal(chat_id):
+    iv     = user_intervals.get(chat_id, "15m")
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    send(chat_id, f"⏳ Анализирую {TICKERS[ticker]['label']} ({INTERVALS[iv]['label']})...")
+    try:
+        data = full_analyze(ticker, iv)
+        msg  = format_msg(data, ticker, iv)
+        if data.get("direction") and data.get("risk_levels"):
+            direction = data["direction"]
+            kb = {
+                "inline_keyboard": [
+                    [{"text": f"📂 Открыть {direction.upper()} позицию",
+                      "callback_data": f"open_pos_{ticker}_{iv}_{direction}"}],
+                    [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+                ]
+            }
+            send(chat_id, msg, kb)
+        else:
+            send(chat_id, msg, main_keyboard())
+    except Exception as e:
+        import traceback
+        print(f"  [signal] ОШИБКА: {traceback.format_exc()}")
+        send(chat_id, f"❌ Ошибка анализа: {e}", main_keyboard())
+
+def fetch_and_send_backtest(chat_id):
+    iv     = user_intervals.get(chat_id, "15m")
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    send(chat_id, f"⏳ Запускаю бэктест {TICKERS[ticker]['label']} ({INTERVALS[iv]['label']})...")
+    try:
+        stats, err = run_backtest(ticker, iv)
+        if err:
+            send(chat_id, f"❌ {err}", main_keyboard())
+        else:
+            send(chat_id, format_backtest(stats, ticker, iv), main_keyboard())
+    except Exception as e:
+        send(chat_id, f"❌ Ошибка бэктеста: {e}", main_keyboard())
+
+def fetch_and_send_wfo(chat_id):
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    iv     = user_intervals.get(chat_id, "1h")
+    send(chat_id, "⏳ Walk-Forward Optimization...")
+    try:
+        weights, report = run_walk_forward_optimization(ticker, iv, 200)
+        send(chat_id, report if weights else f"❌ {report}", main_keyboard())
+    except Exception as e:
+        send(chat_id, f"❌ Ошибка WFO: {e}", main_keyboard())
+
+
+# ============================================================
+# ОБРАБОТКА ОБНОВЛЕНИЙ
+# ============================================================
+def handle_update(update):
+    if "callback_query" in update:
+        cb      = update["callback_query"]
+        chat_id = cb["message"]["chat"]["id"]
+        data    = cb["data"]
+        seen_chat_ids.add(chat_id)
+
+        # ── Главное меню / Назад ──
+        if data == "back_main":
+            answer_callback(cb["id"])
+            _pending_balance_input.discard(chat_id)
+            _pending_edit_field.pop(chat_id, None)
+            send(chat_id, format_main_status(chat_id), main_keyboard())
+
+        # ── Настройки авто ──
+        elif data == "auto_settings":
+            answer_callback(cb["id"])
+            si  = user_auto_send_interval.get(chat_id, DEFAULT_AUTO_SEND_INTERVAL)
+            tf  = user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
+            status = "🔔 включены" if chat_id in auto_chat_ids else "🔕 выключены"
+            send(chat_id,
+                 f"⚙️ <b>Настройки авто-сигналов</b>\n\n"
+                 f"Статус: <b>{status}</b>\n"
+                 f"⏰ Интервал рассылки: <b>{AUTO_SEND_INTERVALS[si]['label']}</b>\n"
+                 f"📊 Таймфрейм анализа: <b>{INTERVALS[tf]['label']}</b>\n\n"
+                 f"Выбери что изменить:",
+                 auto_settings_keyboard(chat_id))
+
+        # ── Выбор интервала рассылки ──
+        elif data == "choose_auto_send_iv":
+            answer_callback(cb["id"])
+            send(chat_id,
+                 "⏰ <b>Выбери интервал авто-рассылки:</b>\n\n"
+                 "Как часто бот будет присылать дайджест сигналов.",
+                 auto_send_interval_keyboard())
+
+        elif data.startswith("auto_send_iv_"):
+            iv_key = data.replace("auto_send_iv_", "")
+            if iv_key in AUTO_SEND_INTERVALS:
+                user_auto_send_interval[chat_id] = iv_key
+                answer_callback(cb["id"], f"✅ Рассылка: {AUTO_SEND_INTERVALS[iv_key]['label']}")
+                send(chat_id,
+                     f"✅ Интервал рассылки установлен: <b>{AUTO_SEND_INTERVALS[iv_key]['label']}</b>",
+                     auto_settings_keyboard(chat_id))
+            else:
+                answer_callback(cb["id"], "❌ Неизвестный интервал")
+
+        # ── Выбор таймфрейма анализа ──
+        elif data == "choose_auto_tf":
+            answer_callback(cb["id"])
+            send(chat_id,
+                 "📊 <b>Выбери таймфрейм анализа для авто-сигналов:</b>\n\n"
+                 "На каком TF бот будет анализировать рынок.",
+                 auto_tf_keyboard())
+
+        elif data.startswith("auto_tf_"):
+            tf_key = data.replace("auto_tf_", "")
+            if tf_key in INTERVALS:
+                user_auto_tf[chat_id] = tf_key
+                answer_callback(cb["id"], f"✅ TF анализа: {INTERVALS[tf_key]['label']}")
+                send(chat_id,
+                     f"✅ Таймфрейм анализа установлен: <b>{INTERVALS[tf_key]['label']}</b>",
+                     auto_settings_keyboard(chat_id))
+            else:
+                answer_callback(cb["id"], "❌ Неизвестный таймфрейм")
+
+        # ── Открытие позиции ──
+        elif data.startswith("open_pos_"):
+            parts     = data.split("_")
+            ticker    = parts[2]
+            interval  = parts[3]
+            direction = parts[4]
+            answer_callback(cb["id"])
+            try:
+                analysis  = full_analyze(ticker, interval)
+                rl        = _risk_levels_from_analysis_or_entry(analysis)
+                price     = _risk_price_from_analysis(analysis)
+                if rl and price:
+                    balance   = user_balance.get(chat_id, DEFAULT_BALANCE)
+                    leverage  = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
+                    size_pct  = user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)
+                    kelly_pct = analysis.get("kelly_pct")
+                    regime    = analysis.get("regime", "neutral")
+                    decision  = build_trade_risk_decision(chat_id, ticker, interval, direction, price, rl, analysis, leverage, size_pct)
+                    calc      = decision.get("calc") or calc_position_details(balance, size_pct, leverage, price, rl["sl"], rl["tp1"], rl.get("tp2", rl["tp1"]), direction)
+                    calc_msg  = format_position_calc(balance, size_pct, leverage, price, calc, direction, ticker, regime, kelly_pct)
+                    risk_msg  = format_trade_risk_decision(decision)
+                    rows = []
+                    if decision.get("allowed"):
+                        rows.append([{"text": "✅ Подтвердить и открыть", "callback_data": f"confirm_pos_{ticker}_{interval}_{direction}"}])
+                    rows.extend([
+                        [{"text": f"⚡ Изменить плечо (x{leverage})", "callback_data": "set_leverage_menu"},
+                         {"text": f"🎲 Изменить размер ({size_pct}%)", "callback_data": "set_size_menu"}],
+                        [{"text": "◀️ Отмена", "callback_data": "back_main"}],
+                    ])
+                    send(chat_id, calc_msg + "\n\n" + risk_msg, {"inline_keyboard": rows})
+                else:
+                    send(chat_id, "❌ Не удалось рассчитать уровни риска.", main_keyboard())
+            except Exception as e:
+                send(chat_id, f"❌ Ошибка: {e}", main_keyboard())
+
+        elif data.startswith("confirm_pos_"):
+            parts     = data.split("_")
+            ticker    = parts[2]
+            interval  = parts[3]
+            direction = parts[4]
+            answer_callback(cb["id"])
+            try:
+                analysis = full_analyze(ticker, interval)
+                rl       = _risk_levels_from_analysis_or_entry(analysis)
+                price    = _risk_price_from_analysis(analysis)
+                if rl and price:
+                    balance  = user_balance.get(chat_id, DEFAULT_BALANCE)
+                    leverage = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
+                    size_pct = user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)
+                    decision = build_trade_risk_decision(chat_id, ticker, interval, direction, price, rl, analysis, leverage, size_pct)
+                    if not decision.get("allowed"):
+                        send(chat_id, format_trade_risk_decision(decision), main_keyboard())
+                        return
+                    calc     = decision.get("calc") or calc_position_details(
+                        balance, size_pct, leverage,
+                        price, rl["sl"], rl["tp1"], rl.get("tp2", rl["tp1"]), direction
+                    )
+                    pos_id = open_position(
+                        chat_id, ticker, interval, direction,
+                        price, rl["sl"], rl["tp1"], rl.get("tp2", rl["tp1"]),
+                        size_pct=size_pct,
+                    )
+                    with _positions_lock:
+                        if pos_id in _positions:
+                            _positions[pos_id]["leverage"] = leverage
+                            _positions[pos_id]["margin"]   = calc["margin"]
+                            _positions[pos_id]["pos_val"]  = calc["position_val"]
+                            _positions[pos_id]["risk_usd"] = decision.get("single_risk_usd", 0)
+                            _positions[pos_id]["risk_pct"] = decision.get("single_risk_pct", 0)
+                            _save_positions()
+                    register_position_open_risk(chat_id, pos_id, ticker, interval, direction, decision)
+
+                    dir_emoji = "🟢" if direction == "long" else "🔴"
+                    send(chat_id,
+                         f"✅ <b>Позиция открыта!</b>\n\n"
+                         f"{dir_emoji} <b>{TICKERS[ticker]['label']}</b>  {direction.upper()}\n"
+                         f"💵 Вход:  <b>{fmt_price(price, ticker)}</b>\n"
+                         f"⚡ Плечо: <b>x{leverage}</b>  |  Маржа: <b>${calc['margin']:.2f}</b>\n"
+                         f"📦 Объём: <b>${calc['position_val']:.2f}</b>\n\n"
+                         f"━━━━━━━━━━━━━━━━━━━━\n"
+                         f"🎯 TP1 → <b>+${calc['pnl_tp1']:.2f}</b> "
+                         f"(баланс → ${calc['balance_after_tp1']:.2f})\n"
+                         f"🎯 TP2 → <b>+${calc['pnl_tp2']:.2f}</b> "
+                         f"(баланс → ${calc['balance_after_tp2']:.2f})\n"
+                         f"🔴 SL  → <b>${calc['pnl_sl']:.2f}</b> "
+                         f"(баланс → ${calc['balance_after_sl']:.2f})\n"
+                         f"💥 Ликвидация: <b>{fmt_price(calc['liq_price'], ticker)}</b>\n\n"
+                         f"📊 Каждые 5 минут буду присылать совет.",
+                         position_close_keyboard(pos_id))
+                else:
+                    send(chat_id, "❌ Не удалось рассчитать уровни риска.", main_keyboard())
+            except Exception as e:
+                send(chat_id, f"❌ Ошибка подтверждения: {e}", main_keyboard())
+
+        # ── Закрытие позиции ──
+        elif data.startswith("close_pos_"):
+            pos_id = data[len("close_pos_"):]
+            answer_callback(cb["id"])
+            pos = close_position(pos_id)
+            if pos:
+                try:
+                    current_price = get_price(pos["ticker"])
+                    direction = pos["direction"]
+                    entry = pos["entry_price"]
+                    pnl = ((current_price - entry) / entry * 100 if direction == "long"
+                           else (entry - current_price) / entry * 100)
+                    register_position_close_risk(chat_id, pos, current_price, pnl)
+                    pnl_emoji = "📈" if pnl >= 0 else "📉"
+                    send(chat_id,
+                         f"🏁 <b>Позиция закрыта!</b>\n\n"
+                         f"{'🟢' if direction=='long' else '🔴'} {TICKERS[pos['ticker']]['label']}  {direction.upper()}\n"
+                         f"💵 Вход:  <b>{fmt_price(entry, pos['ticker'])}</b>\n"
+                         f"💰 Выход: <b>{fmt_price(current_price, pos['ticker'])}</b>\n"
+                         f"{pnl_emoji} PnL:   <b>{pnl:+.2f}%</b>",
+                         main_keyboard())
+                except Exception:
+                    send(chat_id, "🏁 Позиция закрыта.", main_keyboard())
+            else:
+                send(chat_id, "❌ Позиция не найдена (уже закрыта?).", main_keyboard())
+
+        # ── TP1 помечен ──
+        elif data.startswith("tp1_hit_"):
+            pos_id = data[len("tp1_hit_"):]
+            answer_callback(cb["id"], "✅ TP1 отмечен как взятый")
+            with _positions_lock:
+                if pos_id in _positions:
+                    _positions[pos_id]["tp1_hit"] = True
+                    _save_positions()
+                    send(chat_id,
+                         "✅ <b>TP1 отмечен как взятый!</b>\n\n"
+                         "Рекомендую:\n"
+                         "  1. Перенести SL в точку входа (безубыток)\n"
+                         "  2. Дождаться TP2 с оставшейся частью\n"
+                         "  3. Следить за сигналами разворота",
+                         position_close_keyboard(pos_id))
+                else:
+                    send(chat_id, "❌ Позиция не найдена.", main_keyboard())
+
+        # ── Список позиций ──
+        elif data == "my_positions":
+            answer_callback(cb["id"])
+            positions = get_user_positions(chat_id)
+            msg = format_positions_list(positions)
+            if positions:
+                buttons = []
+                for pos in positions:
+                    tk_label = TICKERS[pos['ticker']]['label']
+                    dir_label = pos['direction'].upper()
+                    buttons.append([
+                        {"text": f"❌ Закрыть {tk_label} {dir_label}",
+                         "callback_data": f"close_pos_{pos['pos_id']}"},
+                        {"text": "✏️ Ред.",
+                         "callback_data": f"edit_pos_{pos['pos_id']}"},
+                    ])
+                buttons.append([{"text": "◀️ Назад", "callback_data": "back_main"}])
+                send(chat_id, msg, {"inline_keyboard": buttons})
+            else:
+                send(chat_id, msg, main_keyboard())
+
+                    # ── Меню редактирования позиции ──
+        elif data.startswith("edit_pos_"):
+            pos_id = data[len("edit_pos_"):]
+            answer_callback(cb["id"])
+            with _positions_lock:
+                pos = _positions.get(pos_id)
+            if pos:
+                send(chat_id,
+                     f"✏️ <b>Редактирование позиции</b>\n"
+                     f"{TICKERS[pos['ticker']]['label']} {pos['direction'].upper()}\n\n"
+                     f"Выбери поле для изменения:",
+                     edit_pos_keyboard(pos_id, pos))
+            else:
+                send(chat_id, "❌ Позиция не найдена.", main_keyboard())
+
+        elif data.startswith("back_pos_"):
+            pos_id = data[len("back_pos_"):]
+            answer_callback(cb["id"])
+            with _positions_lock:
+                pos = _positions.get(pos_id)
+            if pos:
+                try:
+                    current_price = get_price(pos["ticker"])
+                    advice, reason, urgency = analyze_exit(
+                        pos, current_price,
+                        *get_ohlcv(pos["ticker"], pos["interval"])[2:]
+                    )
+                except Exception:
+                    current_price = pos["entry_price"]
+                    advice, reason, urgency = "hold", "Нет данных", "info"
+                msg = format_position_update(pos, current_price, advice, reason, urgency)
+                send(chat_id, msg, position_close_keyboard(pos_id))
+            else:
+                send(chat_id, "❌ Позиция не найдена.", main_keyboard())
+
+        elif data.startswith("editfield_"):
+            # формат: editfield_{pos_id}_{field}
+            # pos_id сам содержит "_", поэтому режем с конца
+            # field — последний сегмент, pos_id — всё между "editfield_" и "_field"
+            raw    = data[len("editfield_"):]   # убираем префикс
+            # field — одно из фиксированных слов без "_"
+            for _f in ("entry", "sl", "tp1", "leverage", "amount"):
+                if raw.endswith("_" + _f):
+                    field  = _f
+                    pos_id = raw[: -(len(_f) + 1)]
+                    break
+            else:
+                answer_callback(cb["id"], "❌ Неизвестное поле")
+                return
+            answer_callback(cb["id"])
+
+            field_labels = {
+                "entry":    ("💵 Цена входа",   "93.3500"),
+                "sl":       ("🔴 Stop Loss",     "92.9000"),
+                "tp1":      ("🎯 Take Profit",   "94.5000"),
+                "leverage": ("⚡ Плечо",         "10"),
+                "amount":   ("💰 Сумма маржи $", "19.50"),
+            }
+            label, example = field_labels.get(field, ("Значение", "0"))
+
+            _pending_edit_field[chat_id] = {"pos_id": pos_id, "field": field}
+            send(chat_id,
+                 f"✏️ <b>Введи новое значение для: {label}</b>\n\n"
+                 f"Пример: <code>{example}</code>",
+                 {"inline_keyboard": [[
+                     {"text": "◀️ Отмена", "callback_data": f"edit_pos_{pos_id}"}
+                 ]]})
+
+        elif data.startswith("ticker_"):
+            tk = data.replace("ticker_", "")
+            user_tickers[chat_id] = tk
+            answer_callback(cb["id"], f"✅ {TICKERS[tk]['label']}")
+            send(chat_id, f"✅ Актив: <b>{TICKERS[tk]['label']}</b>", main_keyboard())
+
+        elif data.startswith("interval_"):
+            iv = data.replace("interval_", "")
+            user_intervals[chat_id] = iv
+            answer_callback(cb["id"], f"✅ {INTERVALS[iv]['label']}")
+            send(chat_id, f"✅ Таймфрейм: <b>{INTERVALS[iv]['label']}</b>", main_keyboard())
+
+        elif data == "get_signal":
+            answer_callback(cb["id"], "Анализирую...")
+            fetch_and_send_signal(chat_id)
+
+        elif data == "run_backtest":
+            answer_callback(cb["id"], "Запускаю бэктест...")
+            threading.Thread(target=fetch_and_send_backtest, args=(chat_id,), daemon=True).start()
+
+        elif data == "run_wfo":
+            answer_callback(cb["id"], "Walk-Forward Opt...")
+            threading.Thread(target=fetch_and_send_wfo, args=(chat_id,), daemon=True).start()
+
+        elif data == "signal_stats":
+            answer_callback(cb["id"], "Собираю статистику...")
+            try:
+                send(chat_id, format_signal_stats(chat_id), main_keyboard())
+            except Exception as e:
+                send(chat_id, f"❌ Ошибка статистики сигналов: {e}", main_keyboard())
+
+        elif data == "market_heatmap":
+            answer_callback(cb["id"], "Собираю heatmap...")
+            try:
+                send(chat_id, format_market_heatmap(chat_id), main_keyboard())
+            except Exception as e:
+                send(chat_id, f"❌ Ошибка heatmap: {e}", main_keyboard())
+
+        elif data == "monte_carlo":
+            answer_callback(cb["id"], "Monte Carlo...")
+            try:
+                send(chat_id, format_monte_carlo_report(chat_id), main_keyboard())
+            except Exception as e:
+                send(chat_id, f"❌ Ошибка Monte Carlo: {e}", main_keyboard())
+
+        elif data == "portfolio_risk":
+            answer_callback(cb["id"], "Считаю риск...")
+            try:
+                send(chat_id, format_portfolio_risk(chat_id), main_keyboard())
+            except Exception as e:
+                send(chat_id, f"❌ Ошибка portfolio risk: {e}", main_keyboard())
+
+        elif data == "signal_clusters":
+            answer_callback(cb["id"], "Кластеризация...")
+            try:
+                send(chat_id, format_signal_clusters(chat_id), main_keyboard())
+            except Exception as e:
+                send(chat_id, f"❌ Ошибка кластеров: {e}", main_keyboard())
+
+        elif data == "oos_report":
+            answer_callback(cb["id"], "OOS...")
+            try:
+                send(chat_id, format_oos_report(chat_id), main_keyboard())
+            except Exception as e:
+                send(chat_id, f"❌ Ошибка OOS: {e}", main_keyboard())
+
+        elif data == "get_fg":
+            answer_callback(cb["id"])
+            send(chat_id, format_fear_greed_msg(), main_keyboard())
+
+        elif data == "get_price":
+            answer_callback(cb["id"])
+            ticker = user_tickers.get(chat_id, "BTCUSDT")
+            try:
+                price = get_price(ticker)
+                send(chat_id, f"💰 <b>{TICKERS[ticker]['label']}</b>: {fmt_price(price, ticker)}", main_keyboard())
+            except Exception as e:
+                send(chat_id, f"❌ Ошибка: {e}", main_keyboard())
+
+        elif data == "change_ticker":
+            answer_callback(cb["id"])
+            send(chat_id, "📊 Выбери актив:", ticker_keyboard())
+
+        elif data == "change_interval":
+            answer_callback(cb["id"])
+            send(chat_id, "⏱ Выбери таймфрейм:", interval_keyboard())
+
+        elif data == "explain":
+            answer_callback(cb["id"])
+            send_explain_menu(chat_id)
+
+        elif data == "explain_1":
+            answer_callback(cb["id"])
+            send(chat_id, EXPLAIN_PART_1, explain_keyboard())
+
+        elif data == "explain_2":
+            answer_callback(cb["id"])
+            send(chat_id, EXPLAIN_PART_2, explain_keyboard())
+
+        elif data == "explain_3":
+            answer_callback(cb["id"])
+            send(chat_id, EXPLAIN_PART_3, explain_keyboard())
+
+        elif data == "noop":
+            answer_callback(cb["id"])
+
+        elif data == "toggle_auto":
+            answer_callback(cb["id"])
+            if chat_id in auto_chat_ids:
+                auto_chat_ids.discard(chat_id)
+                send(chat_id, "🔕 <b>Авто-сигналы отключены.</b>", main_keyboard())
+            else:
+                auto_chat_ids.add(chat_id)
+                si = user_auto_send_interval.get(chat_id, DEFAULT_AUTO_SEND_INTERVAL)
+                tf = user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
+                send(chat_id,
+                     f"🔔 <b>Авто-сигналы включены!</b>\n\n"
+                     f"  ⏰ Интервал рассылки: <b>{AUTO_SEND_INTERVALS[si]['label']}</b>\n"
+                     f"  📊 Таймфрейм анализа: <b>{INTERVALS[tf]['label']}</b>\n"
+                     f"  📂 Мониторинг позиций: каждые 5 мин\n\n"
+                     f"Изменить настройки: ⚙️ <b>Настройки авто</b>",
+                     main_keyboard())
+
+        # ── Мой баланс ──────────────────────────────────────
+        elif data == "my_balance":
+            answer_callback(cb["id"])
+            bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+            lev = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
+            pct = user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)
+            margin  = bal * pct / 100
+            pos_val = margin * lev
+            send(chat_id,
+                 f"💼 <b>Мой баланс и параметры сделки</b>\n\n"
+                 f"💵 Баланс:         <b>${bal:.2f}</b>\n"
+                 f"⚡ Плечо:          <b>x{lev}</b>\n"
+                 f"🎲 Размер позиции: <b>{pct}%</b>\n\n"
+                 f"💡 При открытии сделки:\n"
+                 f"   Маржа (залог): <b>${margin:.2f}</b>\n"
+                 f"   Объём сделки:  <b>${pos_val:.2f}</b>\n\n"
+                 f"Нажми кнопку ниже чтобы изменить:",
+                 balance_keyboard(chat_id))
+
+        elif data == "set_balance_menu":
+            answer_callback(cb["id"])
+            _pending_balance_input.add(chat_id)
+            send(chat_id,
+                 "💵 <b>Введи свой текущий баланс в USDT</b>\n\n"
+                 "Просто напиши число, например:\n"
+                 "<code>19</code>  или  <code>19.50</code>",
+                 {"inline_keyboard": [[{"text": "◀️ Отмена", "callback_data": "my_balance"}]]})
+
+        elif data == "set_leverage_menu":
+            answer_callback(cb["id"])
+            lev = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
+            send(chat_id,
+                 f"⚡ <b>Выбери кредитное плечо:</b>\n\n"
+                 f"Сейчас: <b>x{lev}</b>\n"
+                 f"⚠️ Чем выше плечо — тем ближе ликвидация!\n"
+                 f"Новичкам рекомендую x3–x10.",
+                 leverage_keyboard())
+
+        elif data.startswith("lev_"):
+            lev_val = int(data.replace("lev_", ""))
+            user_leverage[chat_id] = lev_val
+            answer_callback(cb["id"], f"✅ Плечо x{lev_val}")
+            rec = recommend_size_pct(None, "neutral", lev_val)
+            bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+            send(chat_id,
+                 f"✅ Плечо установлено: <b>x{lev_val}</b>\n\n"
+                 f"🧠 Рекомендуемый размер позиции: <b>{rec}%</b>\n"
+                 f"   (маржа ≈ ${bal * rec / 100:.2f} из ${bal:.2f})",
+                 balance_keyboard(chat_id))
+
+        elif data == "set_size_menu":
+            answer_callback(cb["id"])
+            lev = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
+            bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+            rec = recommend_size_pct(None, "neutral", lev)
+            send(chat_id,
+                 f"🎲 <b>Выбери размер позиции (% от баланса):</b>\n\n"
+                 f"Это % который идёт в залог (маржу).\n"
+                 f"При плече x{lev} объём будет в {lev}x раз больше.\n\n"
+                 f"🧠 Рекомендую: <b>{rec}%</b>  (≈${bal * rec / 100:.2f})\n"
+                 f"⚠️ Больше 20% — очень рискованно!",
+                 size_pct_keyboard())
+
+        elif data.startswith("size_"):
+            size_val = float(data.replace("size_", ""))
+            user_size_pct[chat_id] = size_val
+            answer_callback(cb["id"], f"✅ Размер {size_val}%")
+            bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+            lev = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
+            margin  = bal * size_val / 100
+            pos_val = margin * lev
+            send(chat_id,
+                 f"✅ Размер позиции: <b>{size_val}%</b>\n\n"
+                 f"💵 Маржа:  <b>${margin:.2f}</b>\n"
+                 f"📦 Объём:  <b>${pos_val:.2f}</b>  (при плече x{lev})",
+                 balance_keyboard(chat_id))
+            ticker = user_tickers.get(chat_id, "BTCUSDT")
+            iv     = user_intervals.get(chat_id, "15m")
+            send(chat_id,
+                 f"Актив: <b>{TICKERS[ticker]['label']}</b>  |  Таймфрейм: <b>{INTERVALS[iv]['label']}</b>",
+                 main_keyboard())
+        return
+
+    if "message" not in update:
+        return
+    msg     = update["message"]
+    chat_id = msg["chat"]["id"]
+    text    = msg.get("text", "")
+    seen_chat_ids.add(chat_id)
+
+    if text in ("/start", "/help"):
+        ticker     = user_tickers.get(chat_id, "BTCUSDT")
+        iv         = user_intervals.get(chat_id, "15m")
+        si         = user_auto_send_interval.get(chat_id, DEFAULT_AUTO_SEND_INTERVAL)
+        tf         = user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
+        sub_status = "🔔 включены" if chat_id in auto_chat_ids else "🔕 отключены"
+        n_pos      = len(get_user_positions(chat_id))
+        send(chat_id,
+             "👋 <b>Quant Signal Bot v5.2 — Flexible Auto</b>\n\n"
+             "₿ Активы: BTC, ETH, SOL, BNB, XRP\n\n"
+             f"Ручной анализ: <b>{TICKERS[ticker]['label']}</b> | <b>{INTERVALS[iv]['label']}</b>\n"
+             f"Авто: <b>{sub_status}</b>\n"
+             f"  ⏰ Интервал рассылки: <b>{AUTO_SEND_INTERVALS[si]['label']}</b>\n"
+             f"  📊 TF анализа: <b>{INTERVALS[tf]['label']}</b>\n"
+             f"Позиции: <b>{n_pos}</b>",
+             main_keyboard())
+
+    elif text == "/signal":
+        fetch_and_send_signal(chat_id)
+
+    elif text == "/auto":
+        if chat_id in auto_chat_ids:
+            auto_chat_ids.discard(chat_id)
+            send(chat_id, "🔕 Авто-сигналы <b>отключены</b>.", main_keyboard())
+        else:
+            auto_chat_ids.add(chat_id)
+            si = user_auto_send_interval.get(chat_id, DEFAULT_AUTO_SEND_INTERVAL)
+            tf = user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
+            send(chat_id,
+                 f"🔔 Авто-сигналы <b>включены</b>!\n"
+                 f"Рассылка: {AUTO_SEND_INTERVALS[si]['label']} | TF: {INTERVALS[tf]['label']}",
+                 main_keyboard())
+
+    elif text == "/positions":
+        positions = get_user_positions(chat_id)
+        buttons   = [[{"text": f"❌ Закрыть {TICKERS[pos['ticker']]['label']}",
+                        "callback_data": f"close_pos_{pos['pos_id']}"}]
+                     for pos in positions]
+        buttons.append([{"text": "◀️ Назад", "callback_data": "back_main"}])
+        send(chat_id, format_positions_list(positions),
+             {"inline_keyboard": buttons} if positions else main_keyboard())
+
+    elif text == "/backtest":
+        threading.Thread(target=fetch_and_send_backtest, args=(chat_id,), daemon=True).start()
+
+    elif text == "/wfo":
+        threading.Thread(target=fetch_and_send_wfo, args=(chat_id,), daemon=True).start()
+
+    elif text == "/fg":
+        send(chat_id, format_fear_greed_msg(), main_keyboard())
+
+    elif text == "/ticker":
+        send(chat_id, "📊 Выбери актив:", ticker_keyboard())
+
+    elif text == "/interval":
+        send(chat_id, "⏱ Выбери таймфрейм:", interval_keyboard())
+
+    elif text == "/price":
+        ticker = user_tickers.get(chat_id, "BTCUSDT")
+        try:
+            price = get_price(ticker)
+            send(chat_id, f"💰 <b>{TICKERS[ticker]['label']}</b>: {fmt_price(price, ticker)}", main_keyboard())
+        except Exception as e:
+            send(chat_id, f"❌ Ошибка: {e}", main_keyboard())
+
+    elif text == "/explain":
+        send_explain_menu(chat_id)
+
+    elif chat_id in _pending_edit_field:
+        ctx    = _pending_edit_field.pop(chat_id)
+        pos_id = ctx["pos_id"]
+        field  = ctx["field"]
+        try:
+            value = float(text.replace(",", ".").replace("$", "").replace("x", "").strip())
+            if value <= 0:
+                raise ValueError("значение должно быть > 0")
+
+            with _positions_lock:
+                if pos_id not in _positions:
+                    send(chat_id, "❌ Позиция не найдена.", main_keyboard())
+                    return
+                pos = _positions[pos_id]
+
+                if field == "entry":
+                    _positions[pos_id]["entry_price"] = value
+                elif field == "sl":
+                    _positions[pos_id]["sl"] = value
+                elif field == "tp1":
+                    _positions[pos_id]["tp1"] = value
+                    _positions[pos_id]["tp2"] = value   # tp2 = tp1 (один TP)
+                elif field == "leverage":
+                    _positions[pos_id]["leverage"] = int(value)
+                elif field == "amount":
+                    _positions[pos_id]["margin"] = value
+
+                _save_positions()
+                updated_pos = _positions[pos_id]
+
+            field_labels = {
+                "entry":    "💵 Цена входа",
+                "sl":       "🔴 Stop Loss",
+                "tp1":      "🎯 Take Profit",
+                "leverage": "⚡ Плечо",
+                "amount":   "💰 Маржа",
+            }
+            send(chat_id,
+                 f"✅ <b>{field_labels.get(field, field)} обновлён!</b>\n"
+                 f"Новое значение: <b>{value}</b>",
+                 edit_pos_keyboard(pos_id, updated_pos))
+
+        except ValueError:
+            _pending_edit_field[chat_id] = ctx   # вернуть ожидание
+            send(chat_id,
+                 "❌ Неверный формат. Введи число, например: <code>93.35</code>",
+                 {"inline_keyboard": [[
+                     {"text": "◀️ Отмена", "callback_data": f"edit_pos_{pos_id}"}
+                 ]]})
+
+    elif chat_id in _pending_balance_input:
+        _pending_balance_input.discard(chat_id)
+        try:
+            new_bal = float(text.replace(",", ".").replace("$", "").strip())
+            if new_bal <= 0:
+                raise ValueError("отрицательный баланс")
+            user_balance[chat_id] = new_bal
+            lev = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
+            pct = user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)
+            margin  = new_bal * pct / 100
+            pos_val = margin * lev
+            send(chat_id,
+                 f"✅ <b>Баланс обновлён!</b>\n\n"
+                 f"💵 Баланс: <b>${new_bal:.2f}</b>\n"
+                 f"⚡ Плечо:  x{lev}  |  Размер: {pct}%\n"
+                 f"💡 Маржа:  <b>${margin:.2f}</b>  →  Объём: <b>${pos_val:.2f}</b>",
+                 balance_keyboard(chat_id))
+        except Exception:
+            _pending_balance_input.add(chat_id)   # ждём снова
+            send(chat_id,
+                 "❌ Неверный формат. Введи число, например: <code>19</code>",
+                 {"inline_keyboard": [[{"text": "◀️ Отмена", "callback_data": "my_balance"}]]})
+
+    else:
+        send(chat_id, "Используй кнопки ниже 👇", main_keyboard())
+
+
+# ============================================================
+# POLLING
+# ============================================================
+def run():
+    print("=" * 55)
+    print("  Quant Signal Bot v5.7 — Platform Upgrade Layer")
+    print(f"  Интервалы рассылки: {list(AUTO_SEND_INTERVALS.keys())}")
+    print(f"  TF анализа:        {AUTO_ANALYSIS_TFS}")
+    print(f"  Дефолт рассылки:   {DEFAULT_AUTO_SEND_INTERVAL}")
+    print(f"  Дефолт TF:         {DEFAULT_AUTO_TF}")
+    print("  Активы: BTC ETH SOL BNB XRP")
+    print("=" * 55)
+
+    init_quant_db()
+    _migrate_json_to_sqlite_once()
+    _load_positions()
+    _load_signal_journal()
+    print(f"  Загружено позиций: {len(_positions)}")
+    print(f"  SQLite DB: {DB_FILE}")
+    print(f"  Журнал сигналов: SQLite + legacy {SIGNAL_JOURNAL_FILE}")
+
+    if not BOT_TOKEN:
+        print("  ОШИБКА: переменная окружения TELEGRAM_BOT_TOKEN не задана.")
+        print('  Пример Windows PowerShell: $env:TELEGRAM_BOT_TOKEN="123:ABC"')
+        return
+
+    me = tg("getMe")
+    if me.get("ok"):
+        print(f"  Бот: @{me['result']['username']}")
+    else:
+        print(f"  ОШИБКА токена/API: {me}")
+        return
+
+    weights = load_weights()
+    print(f"  Веса индикаторов: {len(weights)} шт.")
+
+    resp    = tg("getUpdates", {"offset": -1})
+    updates = resp.get("result", [])
+    offset  = (updates[-1]["update_id"] + 1) if updates else 0
+    print(f"  Offset: {offset}\n")
+
+    threading.Thread(target=auto_loop,             daemon=True).start()
+    threading.Thread(target=wfo_weekly_loop,       daemon=True).start()
+    threading.Thread(target=position_monitor_loop, daemon=True).start()
+
+    global _session
+    _err_count = 0
+    _MAX_SLEEP = 60
+
+    while True:
+        try:
+            resp = _session.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                json={"offset": offset, "timeout": 25},
+                timeout=35,
+            ).json()
+
+            if not resp.get("ok"):
+                print(f"Ошибка API: {resp}")
+                time.sleep(5)
+                continue
+
+            _err_count = 0
+
+            for upd in resp.get("result", []):
+                offset = upd["update_id"] + 1
+                if "message" in upd:
+                    u = upd["message"]["chat"].get("username", "?")
+                    t = upd["message"].get("text", "")
+                    print(f"  [{datetime.now(timezone.utc).strftime('%H:%M')}] @{u}: {t}")
+                elif "callback_query" in upd:
+                    u = upd["callback_query"]["message"]["chat"].get("username", "?")
+                    print(f"  [{datetime.now(timezone.utc).strftime('%H:%M')}] @{u} → {upd['callback_query']['data']}")
+                handle_update(upd)
+
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                ConnectionResetError,
+                OSError) as e:
+            _err_count += 1
+            wait = min(_MAX_SLEEP, 2 ** min(_err_count, 6))
+            print(f"Сетевая ошибка #{_err_count}: {e} — жду {wait}с")
+            time.sleep(wait)
+            if _err_count % 3 == 0:
+                _session = _make_session()
+                print("  Сессия пересоздана")
+
+        except Exception as e:
+            print(f"Неизвестная ошибка polling: {e}")
+            time.sleep(5)
+
+
+
+# ============================================================
+# v5.7 — PLATFORM UPGRADE LAYER
+# SQLite, REST-cache, Monte Carlo, Heatmap, Portfolio Risk,
+# Signal Clustering, OOS diagnostics, simple ensemble layer.
+# ВАЖНО: async/websocket/PostgreSQL намеренно НЕ включены в этот файл.
+# Это стабильный промежуточный апгрейд без ломки текущей архитектуры.
+# ============================================================
+import sqlite3
+import random
+import statistics
+
+DB_FILE = os.getenv("QUANT_BOT_DB", "quant_bot_state.sqlite3")
+CANDLE_CACHE_TTL = {"1m": 20, "5m": 45, "15m": 120, "30m": 180, "1h": 300}
+_ohlcv_cache = {}
+_db_lock = threading.RLock()
+_sqlite_ready = False
+
+
+def _db_connect():
+    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    return conn
+
+
+def init_quant_db():
+    global _sqlite_ready
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS signals (
+                unique_key TEXT PRIMARY KEY,
+                created_at TEXT,
+                ticker TEXT,
+                interval TEXT,
+                direction TEXT,
+                confidence INTEGER,
+                rr_ratio REAL,
+                status TEXT,
+                data_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_signals_ticker_tf ON signals(ticker, interval);
+            CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at);
+            CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status);
+            CREATE TABLE IF NOT EXISTS positions (
+                pos_id TEXT PRIMARY KEY,
+                chat_id INTEGER,
+                ticker TEXT,
+                interval TEXT,
+                direction TEXT,
+                opened_at TEXT,
+                data_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_positions_chat ON positions(chat_id);
+            CREATE TABLE IF NOT EXISTS market_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT,
+                ticker TEXT,
+                interval TEXT,
+                signal TEXT,
+                direction TEXT,
+                confidence INTEGER,
+                micro_regime TEXT,
+                rr_ratio REAL,
+                data_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_tf ON market_snapshots(ticker, interval);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_created ON market_snapshots(created_at);
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+            """)
+            conn.commit()
+            _sqlite_ready = True
+        finally:
+            conn.close()
+
+
+def _migrate_json_to_sqlite_once():
+    if not _sqlite_ready:
+        init_quant_db()
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='json_migrated_v57'").fetchone()
+            if row and row["value"] == "1":
+                return
+            if os.path.exists(SIGNAL_JOURNAL_FILE):
+                try:
+                    with open(SIGNAL_JOURNAL_FILE, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
+                    if isinstance(raw, dict):
+                        raw = raw.get("signals", [])
+                    if isinstance(raw, list):
+                        for rec in raw[-SIGNAL_JOURNAL_MAX_RECORDS:]:
+                            if not isinstance(rec, dict):
+                                continue
+                            key = rec.get("unique_key") or f"legacy:{rec.get('ticker')}:{rec.get('interval')}:{rec.get('created_at')}:{random.random()}"
+                            conn.execute("""INSERT OR IGNORE INTO signals
+                                (unique_key, created_at, ticker, interval, direction, confidence, rr_ratio, status, data_json)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (key, rec.get("created_at"), rec.get("ticker"), rec.get("interval"), rec.get("direction"),
+                                 int(rec.get("confidence", 0) or 0), _safe_float(rec.get("rr_ratio"), 0), rec.get("status", "open"),
+                                 json.dumps(rec, ensure_ascii=False)))
+                except Exception as e:
+                    print(f"  [sqlite] journal migration skipped: {e}")
+            if os.path.exists(POSITIONS_FILE):
+                try:
+                    with open(POSITIONS_FILE, "r", encoding="utf-8") as f:
+                        rawp = json.load(f)
+                    if isinstance(rawp, dict):
+                        for pos_id, pos in rawp.items():
+                            if not isinstance(pos, dict):
+                                continue
+                            pos.setdefault("pos_id", pos_id)
+                            conn.execute("""INSERT OR IGNORE INTO positions
+                                (pos_id, chat_id, ticker, interval, direction, opened_at, data_json)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                (pos.get("pos_id"), int(pos.get("chat_id", 0) or 0), pos.get("ticker"), pos.get("interval"),
+                                 pos.get("direction"), pos.get("opened_at"), json.dumps(pos, ensure_ascii=False)))
+                except Exception as e:
+                    print(f"  [sqlite] positions migration skipped: {e}")
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('json_migrated_v57','1')")
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _load_positions():
+    global _positions
+    if not _sqlite_ready:
+        init_quant_db()
+        _migrate_json_to_sqlite_once()
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            rows = conn.execute("SELECT pos_id, data_json FROM positions").fetchall()
+            _positions = {}
+            for row in rows:
+                try:
+                    pos = json.loads(row["data_json"])
+                    _positions[row["pos_id"]] = pos
+                except Exception:
+                    continue
+        finally:
+            conn.close()
+
+
+def _save_positions():
+    if not _sqlite_ready:
+        init_quant_db()
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.execute("DELETE FROM positions")
+            for pos_id, pos in _positions.items():
+                conn.execute("""INSERT OR REPLACE INTO positions
+                    (pos_id, chat_id, ticker, interval, direction, opened_at, data_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (pos_id, int(pos.get("chat_id", 0) or 0), pos.get("ticker"), pos.get("interval"), pos.get("direction"),
+                     pos.get("opened_at"), json.dumps(pos, ensure_ascii=False)))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _load_signal_journal():
+    global _signal_journal_cache
+    if _signal_journal_cache is not None:
+        return _signal_journal_cache
+    if not _sqlite_ready:
+        init_quant_db()
+        _migrate_json_to_sqlite_once()
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            rows = conn.execute("SELECT data_json FROM signals ORDER BY created_at ASC LIMIT ?", (SIGNAL_JOURNAL_MAX_RECORDS,)).fetchall()
+            _signal_journal_cache = []
+            for row in rows:
+                try:
+                    _signal_journal_cache.append(json.loads(row["data_json"]))
+                except Exception:
+                    pass
+        finally:
+            conn.close()
+    return _signal_journal_cache
+
+
+def _save_signal_journal():
+    global _signal_journal_cache
+    if _signal_journal_cache is None:
+        return
+    if not _sqlite_ready:
+        init_quant_db()
+    data = _signal_journal_cache[-SIGNAL_JOURNAL_MAX_RECORDS:]
+    _signal_journal_cache = data
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.execute("DELETE FROM signals")
+            for rec in data:
+                if not isinstance(rec, dict):
+                    continue
+                key = rec.get("unique_key") or f"auto:{rec.get('ticker')}:{rec.get('interval')}:{rec.get('created_at')}:{random.random()}"
+                rec["unique_key"] = key
+                conn.execute("""INSERT OR REPLACE INTO signals
+                    (unique_key, created_at, ticker, interval, direction, confidence, rr_ratio, status, data_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (key, rec.get("created_at"), rec.get("ticker"), rec.get("interval"), rec.get("direction"),
+                     int(rec.get("confidence", 0) or 0), _safe_float(rec.get("rr_ratio"), 0), rec.get("status", "open"),
+                     json.dumps(rec, ensure_ascii=False)))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+_base_get_ohlcv_v56 = get_ohlcv
+
+def get_ohlcv(ticker, interval):
+    ttl = CANDLE_CACHE_TTL.get(interval, 60)
+    key = (ticker, interval)
+    now_ts = time.time()
+    cached = _ohlcv_cache.get(key)
+    if cached and now_ts - cached["ts"] < ttl:
+        return cached["data"]
+    data = _base_get_ohlcv_v56(ticker, interval)
+    _ohlcv_cache[key] = {"ts": now_ts, "data": data}
+    return data
+
+
+def store_market_snapshot(ticker, interval, data):
+    if not _sqlite_ready:
+        init_quant_db()
+    try:
+        rl = data.get("risk_levels") or {}
+        with _db_lock:
+            conn = _db_connect()
+            try:
+                conn.execute("""INSERT INTO market_snapshots
+                    (created_at, ticker, interval, signal, direction, confidence, micro_regime, rr_ratio, data_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (_now_iso(), ticker, interval, data.get("signal"), data.get("direction"),
+                     int(data.get("confidence", 0) or 0), data.get("micro_regime"), _safe_float(rl.get("rr_ratio"), 0),
+                     json.dumps(data, ensure_ascii=False, default=str)))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as e:
+        print(f"  [snapshot] save error: {e}")
+
+
+_base_full_analyze_v56 = full_analyze
+
+def _ensemble_adjustment(data):
+    direction = data.get("direction") or _signal_direction_from_text(data.get("signal"))
+    if direction not in ("long", "short"):
+        data["ensemble_score"] = 0
+        data["ensemble_note"] = "нет actionable-направления"
+        return data
+    score = 0
+    notes = []
+    micro = str(data.get("micro_regime", ""))
+    rr = _safe_float((data.get("risk_levels") or {}).get("rr_ratio"), 0) or 0
+    conf = int(data.get("confidence", 0) or 0)
+    vol_ratio = _safe_float(data.get("vol_ratio"), 1) or 1
+    mtf = _safe_float(data.get("mtf_score"), 0) or 0
+    bull = _safe_float(data.get("bull_weight_sum"), 0) or 0
+    bear = _safe_float(data.get("bear_weight_sum"), 0) or 0
+    if direction == "long":
+        if micro in ("TREND_UP", "BREAKOUT"):
+            score += 2; notes.append("режим поддерживает LONG")
+        if mtf > 0:
+            score += 1; notes.append("MTF за LONG")
+        if bull > bear:
+            score += 1
+    else:
+        if micro in ("TREND_DOWN", "BREAKOUT"):
+            score += 2; notes.append("режим поддерживает SHORT")
+        if mtf < 0:
+            score += 1; notes.append("MTF за SHORT")
+        if bear > bull:
+            score += 1
+    if rr >= 2.0:
+        score += 2; notes.append("RR сильный")
+    elif rr >= MIN_RR_TO_TRADE:
+        score += 1
+    else:
+        score -= 2; notes.append("RR слабый")
+    if vol_ratio >= 1.25:
+        score += 1; notes.append("объём подтверждает")
+    elif vol_ratio < 0.7:
+        score -= 1; notes.append("объём слабый")
+    if conf >= 75:
+        score += 2
+    elif conf >= 62:
+        score += 1
+    elif conf < 50:
+        score -= 2
+    if micro in ("CHOP/RANGE", "PANIC/PUMP"):
+        score -= 2; notes.append("режим риска")
+    data["ensemble_score"] = int(score)
+    data["ensemble_note"] = "; ".join(notes[:4]) if notes else "нейтрально"
+    adj = 5 if score >= 6 else (2 if score >= 4 else (-6 if score <= -2 else (-2 if score <= 0 else 0)))
+    data["confidence"] = int(max(0, min(95, conf + adj)))
+    return data
+
+
+def full_analyze(ticker, interval):
+    data = _base_full_analyze_v56(ticker, interval)
+    try:
+        data = _ensemble_adjustment(data)
+        store_market_snapshot(ticker, interval, data)
+    except Exception as e:
+        print(f"  [ensemble] error: {e}")
+    return data
+
+
+_base_format_msg_v56 = format_msg
+
+def format_msg(data, ticker, interval):
+    msg = _base_format_msg_v56(data, ticker, interval)
+    extra = []
+    if data.get("ensemble_score") is not None:
+        extra.append(f"🧬 Ensemble: <b>{int(data.get('ensemble_score', 0))}</b> — {data.get('ensemble_note', '—')}")
+    return msg if not extra else msg + "\n" + "\n".join(extra)
+
+
+def _journal_returns_r(ticker=None, interval=None):
+    rows = []
+    for rec in _load_signal_journal():
+        if ticker and rec.get("ticker") != ticker:
+            continue
+        if interval and rec.get("interval") != interval:
+            continue
+        ev = rec.get("evaluations", {})
+        main = ev.get("6b") or ev.get("3b") or ev.get("12b")
+        if not main:
+            continue
+        move = _safe_float(main.get("close_move_atr"), 0) or 0
+        rows.append(max(-2.0, min(3.0, move)))
+    return rows
+
+
+def run_monte_carlo_from_journal(ticker=None, interval=None, n_sims=1000, trades_per_sim=100, start_equity=100.0, risk_pct=1.0):
+    returns_r = _journal_returns_r(ticker, interval)
+    if len(returns_r) < 20:
+        return None, f"Недостаточно оценённых сигналов для Monte Carlo: {len(returns_r)}. Нужно хотя бы 20."
+    finals, max_dds = [], []
+    for _ in range(n_sims):
+        eq = start_equity; peak = eq; max_dd = 0.0
+        for r in random.choices(returns_r, k=trades_per_sim):
+            eq *= (1 + (risk_pct / 100.0) * r)
+            peak = max(peak, eq)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - eq) / peak * 100)
+        finals.append(eq); max_dds.append(max_dd)
+    fs = sorted(finals); ds = sorted(max_dds)
+    def pct(arr, p):
+        return arr[max(0, min(len(arr)-1, int(len(arr)*p/100)))]
+    return {"n_source": len(returns_r), "n_sims": n_sims, "trades_per_sim": trades_per_sim, "risk_pct": risk_pct,
+            "median_final": statistics.median(finals), "p10_final": pct(fs, 10), "p90_final": pct(fs, 90),
+            "median_dd": statistics.median(max_dds), "p90_dd": pct(ds, 90),
+            "loss_prob": sum(1 for x in finals if x < start_equity) / len(finals) * 100,
+            "ruin_prob_25dd": sum(1 for dd in max_dds if dd >= 25) / len(max_dds) * 100,
+            "avg_r": sum(returns_r) / len(returns_r)}, None
+
+
+def format_monte_carlo_report(chat_id=None):
+    ticker = user_tickers.get(chat_id, None) if chat_id else None
+    interval = user_intervals.get(chat_id, None) if chat_id else None
+    stats_mc, err = run_monte_carlo_from_journal(ticker=ticker, interval=interval)
+    title_scope = f"{ticker} {interval}" if ticker and interval else "все сигналы"
+    if err:
+        return f"🎲 <b>Monte Carlo</b> — {title_scope}\n\n❌ {err}\n\nСначала дай боту накопить историю: авто-сигналы + несколько закрытых свечей."
+    return "\n".join([
+        f"🎲 <b>Monte Carlo Stress Test</b> — {title_scope}", "",
+        f"Источник: <b>{stats_mc['n_source']}</b> оценённых сигналов",
+        f"Симуляций: <b>{stats_mc['n_sims']}</b> × {stats_mc['trades_per_sim']} сделок",
+        f"Риск на сделку: <b>{stats_mc['risk_pct']:.1f}%</b>", "━━━━━━━━━━━━━━━━━━━━",
+        f"Средний R: <b>{stats_mc['avg_r']:+.3f}</b>",
+        f"Median equity: <b>{stats_mc['median_final']:.2f}</b>",
+        f"P10 equity: <b>{stats_mc['p10_final']:.2f}</b>",
+        f"P90 equity: <b>{stats_mc['p90_final']:.2f}</b>",
+        f"Median DD: <b>{stats_mc['median_dd']:.1f}%</b>",
+        f"P90 DD: <b>{stats_mc['p90_dd']:.1f}%</b>",
+        f"Вероятность закончить ниже старта: <b>{stats_mc['loss_prob']:.1f}%</b>",
+        f"Риск DD ≥25%: <b>{stats_mc['ruin_prob_25dd']:.1f}%</b>", "",
+        "📌 Если P10 слабый или DD высокий — снижать риск на сделку."])
+
+
+def format_portfolio_risk(chat_id):
+    positions = get_user_positions(chat_id)
+    bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+    if not positions:
+        return "🛡 <b>Portfolio Risk</b>\n\nОткрытых позиций нет."
+    total_risk = 0.0; total_notional = 0.0
+    lines = ["🛡 <b>Portfolio Risk</b>", "", f"Баланс: <b>{fmt_money(bal)}</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    for pos in positions:
+        ticker = pos.get("ticker"); direction = pos.get("direction")
+        entry = _safe_float(pos.get("entry_price"), 0) or 0
+        sl = _safe_float(pos.get("sl"), 0) or 0
+        lev = int(pos.get("leverage", user_leverage.get(chat_id, DEFAULT_LEVERAGE)) or DEFAULT_LEVERAGE)
+        margin = _safe_float(pos.get("margin"), None)
+        if margin is None:
+            margin = bal * float(pos.get("size_pct", user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)) or DEFAULT_SIZE_PCT) / 100
+        notional = margin * lev
+        risk_usd = abs(entry - sl) / entry * notional if entry > 0 and sl > 0 else 0
+        total_risk += risk_usd; total_notional += notional
+        rpct = risk_usd / bal * 100 if bal > 0 else 0
+        lines.append(f"{TICKERS.get(ticker, {}).get('label', ticker)} {direction.upper()} | риск <b>{fmt_money(risk_usd)}</b> ({rpct:.1f}%) | notional {fmt_money(notional)}")
+    total_rpct = total_risk / bal * 100 if bal > 0 else 0
+    lines += ["━━━━━━━━━━━━━━━━━━━━", f"Суммарный риск до SL: <b>{fmt_money(total_risk)}</b> ({total_rpct:.1f}% баланса)", f"Суммарный notional: <b>{fmt_money(total_notional)}</b>"]
+    lines.append("🚨 Риск портфеля высокий. Лучше сократить размер/плечо." if total_rpct > 10 else ("⚠️ Риск повышенный. Не открывай новые коррелированные позиции." if total_rpct > 5 else "✅ Риск портфеля умеренный."))
+    return "\n".join(lines)
+
+
+def format_market_heatmap(chat_id=None):
+    interval = user_auto_tf.get(chat_id, DEFAULT_AUTO_TF) if chat_id else DEFAULT_AUTO_TF
+    rows = []
+    for tk in AUTO_CRYPTO_TICKERS:
+        try:
+            d = full_analyze(tk, interval)
+            sig = str(d.get("signal", "WAIT")); direction = d.get("direction") or _signal_direction_from_text(sig)
+            conf = int(d.get("confidence", 0) or 0); ens = int(d.get("ensemble_score", 0) or 0)
+            rr = _safe_float((d.get("risk_levels") or {}).get("rr_ratio"), 0) or 0; micro = d.get("micro_regime", "—")
+            if direction == "long": icon, side = "🟢", "LONG"
+            elif direction == "short": icon, side = "🔴", "SHORT"
+            else: icon, side = "⏸", "WAIT"
+            score = conf + ens * 3 + min(rr, 3) * 4
+            rows.append((score, f"{icon} <b>{TICKERS[tk]['label']}</b> {side} | C{conf} | E{ens:+d} | RR{rr:.1f} | {micro}"))
+        except Exception as e:
+            rows.append((-999, f"⚪ <b>{tk}</b> ошибка: {str(e)[:45]}"))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    return "\n".join([f"🔥 <b>Market Heatmap</b> | TF: <b>{INTERVALS[interval]['label']}</b>", ""] + [r[1] for r in rows] + ["", "📌 E = ensemble score. C = confidence."])
+
+
+def format_signal_clusters(chat_id=None):
+    clusters = {}
+    for rec in _load_signal_journal():
+        ev = rec.get("evaluations", {}); main = ev.get("6b") or ev.get("3b") or ev.get("12b")
+        if not main: continue
+        conf = int(rec.get("confidence", 0) or 0); bucket = "HIGH" if conf >= 70 else ("MID" if conf >= 55 else "LOW")
+        key = (rec.get("ticker"), rec.get("interval"), rec.get("direction"), rec.get("micro_regime"), bucket)
+        st = clusters.setdefault(key, {"n":0,"w":0,"l":0,"move":0.0})
+        st["n"] += 1
+        if main.get("outcome") == "win": st["w"] += 1
+        if main.get("outcome") == "loss": st["l"] += 1
+        st["move"] += _safe_float(main.get("close_move_atr"), 0) or 0
+    ranked=[]
+    for key, st in clusters.items():
+        if st["n"] < 3: continue
+        decided=st["w"]+st["l"]; wr=st["w"]/decided*100 if decided else 0; avg=st["move"]/st["n"]
+        ranked.append((wr, st["n"], avg, key, st))
+    ranked.sort(key=lambda x:(x[0],x[1],x[2]), reverse=True)
+    if not ranked:
+        return "🧩 <b>Signal Clustering</b>\n\nПока мало оценённых сигналов. Нужно больше истории."
+    lines=["🧩 <b>Signal Clustering</b>", ""]
+    for wr,n,avg,key,st in ranked[:12]:
+        tk,iv,direction,micro,bucket=key
+        lines.append(f"{TICKERS.get(tk, {}).get('label', tk)} {iv} {direction} {micro} {bucket}: <b>{wr:.0f}%</b> | n={n} | avg {avg:+.2f} ATR")
+    return "\n".join(lines)
+
+
+def format_oos_report(chat_id=None):
+    journal=[]
+    for rec in _load_signal_journal():
+        ev=rec.get("evaluations",{}); main=ev.get("6b") or ev.get("3b") or ev.get("12b")
+        if main: journal.append((rec.get("created_at") or "", rec, main))
+    journal.sort(key=lambda x:x[0])
+    if len(journal)<30:
+        return f"⚖️ <b>Out-of-Sample Diagnostics</b>\n\nПока мало оценённых сигналов: {len(journal)}. Нужно хотя бы 30."
+    split=int(len(journal)*0.7); ins=journal[:split]; oos=journal[split:]
+    def stat(rows):
+        wins=sum(1 for _,_,e in rows if e.get("outcome")=="win"); losses=sum(1 for _,_,e in rows if e.get("outcome")=="loss"); decided=wins+losses
+        avg=sum((_safe_float(e.get("close_move_atr"),0) or 0) for _,_,e in rows)/len(rows)
+        return wins/decided*100 if decided else 0, avg, len(rows)
+    wr_in,avg_in,n_in=stat(ins); wr_oos,avg_oos,n_oos=stat(oos); degradation=wr_in-wr_oos
+    verdict="🚨 Возможное переобучение: OOS сильно хуже." if degradation>15 else ("⚠️ Есть деградация. Веса/фильтры надо ужесточить." if degradation>7 else "✅ OOS не развалился. Пока приемлемо.")
+    return "\n".join(["⚖️ <b>Walk-Forward / Out-of-Sample Diagnostics</b>", "", f"In-sample: <b>{wr_in:.1f}%</b> WR | n={n_in} | avg {avg_in:+.2f} ATR", f"Out-of-sample: <b>{wr_oos:.1f}%</b> WR | n={n_oos} | avg {avg_oos:+.2f} ATR", f"Degradation: <b>{degradation:+.1f} pp</b>", "", verdict])
+
+
+def main_keyboard():
+    return {"inline_keyboard": [[
+        {"text":"🔄 Сигнал","callback_data":"get_signal"},{"text":"💰 Цена","callback_data":"get_price"}],
+        [{"text":"📊 Сменить актив","callback_data":"change_ticker"},{"text":"⏱ Сменить интервал","callback_data":"change_interval"}],
+        [{"text":"🔔 Авто-сигналы: ВКЛ/ВЫКЛ","callback_data":"toggle_auto"},{"text":"⚙️ Настройки авто","callback_data":"auto_settings"}],
+        [{"text":"📂 Мои позиции","callback_data":"my_positions"},{"text":"🛡 Portfolio Risk","callback_data":"portfolio_risk"}],
+        [{"text":"🔥 Heatmap","callback_data":"market_heatmap"},{"text":"🎲 Monte Carlo","callback_data":"monte_carlo"}],
+        [{"text":"🧩 Кластеры","callback_data":"signal_clusters"},{"text":"⚖️ OOS","callback_data":"oos_report"}],
+        [{"text":"🧪 Бэктест","callback_data":"run_backtest"},{"text":"⚖️ Walk-Forward обновить","callback_data":"run_wfo"}],
+        [{"text":"📈 Статистика сигналов","callback_data":"signal_stats"},{"text":"😱 Fear & Greed","callback_data":"get_fg"}],
+        [{"text":"💼 Мой баланс / Плечо","callback_data":"my_balance"},{"text":"📖 Термины","callback_data":"explain"}]]}
+
+
+# Legacy sync entrypoint kept for fallback.
+# if __name__ == "__main__":
+#     run()
+
+# ============================================================
+# v5.8 ASYNC / WEBSOCKET / ORDERFLOW RUNTIME
+# ============================================================
+"""
+Quant Signal Bot v5.8 — Async Market Microstructure Runtime
+
+Что добавлено поверх v5.7:
+  1. Async Telegram long polling через aiohttp.
+  2. Async HTTP client для Telegram и Binance.
+  3. Binance Futures websocket:
+       - aggTrade       → агрессивные покупки/продажи
+       - depth20@100ms  → order book imbalance
+       - forceOrder     → liquidation stream
+  4. Orderflow / footprint layer:
+       - taker buy/sell volume
+       - cumulative volume delta (CVD)
+       - trade imbalance
+       - book imbalance
+       - liquidation notional
+       - micro pressure score
+  5. PostgreSQL storage через asyncpg, если задан DATABASE_URL.
+     Если DATABASE_URL не задан или asyncpg не установлен — fallback на SQLite.
+  6. Async фоновые задачи:
+       - websocket market data
+       - Telegram polling
+       - periodic auto signals
+       - periodic position monitor
+       - periodic signal evaluation
+  7. Новые кнопки:
+       - 🌊 Orderflow
+       - 💥 Liquidations
+       - 🧱 Footprint
+       - 🗄 Storage
+
+Важно:
+  - Старые функции анализа из v5.7 сохранены.
+  - Для снижения риска поломки тяжёлый старый handle_update запускается в thread pool.
+  - Новый realtime layer добавлен как надстройка, а не как разрушительная замена.
+"""
+
+import asyncio
+import contextlib
+import statistics
+from collections import defaultdict, deque
+
+try:
+    import aiohttp
+except Exception:  # pragma: no cover
+    aiohttp = None
+
+try:
+    import asyncpg
+except Exception:  # pragma: no cover
+    asyncpg = None
+
+import sqlite3
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+ASYNC_SQLITE_FILE = os.getenv("BOT_SQLITE_FILE", "quant_bot_state.sqlite3").strip()
+
+BINANCE_FUTURES_REST = "https://fapi.binance.com"
+BINANCE_FUTURES_WS = "wss://fstream.binance.com/stream"
+
+ORDERFLOW_WINDOW_SEC = int(os.getenv("ORDERFLOW_WINDOW_SEC", "300"))
+DEPTH_LEVELS = int(os.getenv("ORDERFLOW_DEPTH_LEVELS", "20"))
+WS_SYMBOLS = [s.lower() for s in AUTO_CRYPTO_TICKERS]
+
+ASYNC_POLL_TIMEOUT = int(os.getenv("ASYNC_POLL_TIMEOUT", "30"))
+ASYNC_UPDATE_CONCURRENCY = int(os.getenv("ASYNC_UPDATE_CONCURRENCY", "4"))
+AUTO_LOOP_TICK_SEC = int(os.getenv("ASYNC_AUTO_LOOP_TICK_SEC", "10"))
+POSITION_LOOP_TICK_SEC = int(os.getenv("ASYNC_POSITION_LOOP_TICK_SEC", "60"))
+SIGNAL_EVAL_TICK_SEC = int(os.getenv("ASYNC_SIGNAL_EVAL_TICK_SEC", "120"))
+
+
+class AsyncStorage:
+    """PostgreSQL-first storage with SQLite fallback."""
+
+    def __init__(self, database_url=None, sqlite_file=ASYNC_SQLITE_FILE):
+        self.database_url = database_url or ""
+        self.sqlite_file = sqlite_file
+        self.pg_pool = None
+        self.mode = "sqlite"
+        self._sqlite_lock = asyncio.Lock()
+
+    async def connect(self):
+        if self.database_url and asyncpg is not None:
+            try:
+                self.pg_pool = await asyncpg.create_pool(self.database_url, min_size=1, max_size=5)
+                self.mode = "postgresql"
+                await self._init_pg()
+                print("  [storage] PostgreSQL connected")
+                return
+            except Exception as e:
+                print(f"  [storage] PostgreSQL недоступен, fallback SQLite: {e}")
+        elif self.database_url and asyncpg is None:
+            print("  [storage] DATABASE_URL задан, но asyncpg не установлен. Использую SQLite.")
+        self.mode = "sqlite"
+        await self._init_sqlite()
+        print(f"  [storage] SQLite active: {self.sqlite_file}")
+
+    async def close(self):
+        if self.pg_pool:
+            await self.pg_pool.close()
+
+    async def _init_pg(self):
+        ddl = """
+        CREATE TABLE IF NOT EXISTS orderflow_events (
+            id BIGSERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL,
+            symbol TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            price DOUBLE PRECISION,
+            qty DOUBLE PRECISION,
+            side TEXT,
+            notional DOUBLE PRECISION,
+            payload JSONB
+        );
+        CREATE INDEX IF NOT EXISTS idx_orderflow_symbol_ts ON orderflow_events(symbol, ts DESC);
+
+        CREATE TABLE IF NOT EXISTS market_microstructure (
+            id BIGSERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL,
+            symbol TEXT NOT NULL,
+            taker_buy_vol DOUBLE PRECISION,
+            taker_sell_vol DOUBLE PRECISION,
+            cvd DOUBLE PRECISION,
+            trade_imbalance DOUBLE PRECISION,
+            book_imbalance DOUBLE PRECISION,
+            liquidation_buy_usd DOUBLE PRECISION,
+            liquidation_sell_usd DOUBLE PRECISION,
+            micro_pressure DOUBLE PRECISION,
+            payload JSONB
+        );
+        CREATE INDEX IF NOT EXISTS idx_micro_symbol_ts ON market_microstructure(symbol, ts DESC);
+
+        CREATE TABLE IF NOT EXISTS bot_meta_async (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """
+        async with self.pg_pool.acquire() as con:
+            await con.execute(ddl)
+
+    async def _init_sqlite(self):
+        async with self._sqlite_lock:
+            con = sqlite3.connect(self.sqlite_file)
+            try:
+                con.executescript("""
+                CREATE TABLE IF NOT EXISTS orderflow_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    price REAL,
+                    qty REAL,
+                    side TEXT,
+                    notional REAL,
+                    payload TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_orderflow_symbol_ts ON orderflow_events(symbol, ts DESC);
+
+                CREATE TABLE IF NOT EXISTS market_microstructure (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    taker_buy_vol REAL,
+                    taker_sell_vol REAL,
+                    cvd REAL,
+                    trade_imbalance REAL,
+                    book_imbalance REAL,
+                    liquidation_buy_usd REAL,
+                    liquidation_sell_usd REAL,
+                    micro_pressure REAL,
+                    payload TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_micro_symbol_ts ON market_microstructure(symbol, ts DESC);
+
+                CREATE TABLE IF NOT EXISTS bot_meta_async (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT
+                );
+                """)
+                con.commit()
+            finally:
+                con.close()
+
+    async def insert_orderflow_event(self, symbol, event_type, price=None, qty=None, side=None, notional=None, payload=None):
+        ts = datetime.now(timezone.utc)
+        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+        if self.mode == "postgresql" and self.pg_pool:
+            async with self.pg_pool.acquire() as con:
+                await con.execute(
+                    """INSERT INTO orderflow_events(ts, symbol, event_type, price, qty, side, notional, payload)
+                       VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)""",
+                    ts, symbol.upper(), event_type, price, qty, side, notional, payload_json,
+                )
+        else:
+            async with self._sqlite_lock:
+                con = sqlite3.connect(self.sqlite_file)
+                try:
+                    con.execute(
+                        """INSERT INTO orderflow_events(ts, symbol, event_type, price, qty, side, notional, payload)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (ts.isoformat(), symbol.upper(), event_type, price, qty, side, notional, payload_json),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+
+    async def insert_micro_snapshot(self, symbol, snap):
+        ts = datetime.now(timezone.utc)
+        payload_json = json.dumps(snap, ensure_ascii=False, default=str)
+        vals = (
+            symbol.upper(),
+            float(snap.get("taker_buy_vol", 0) or 0),
+            float(snap.get("taker_sell_vol", 0) or 0),
+            float(snap.get("cvd", 0) or 0),
+            float(snap.get("trade_imbalance", 0) or 0),
+            float(snap.get("book_imbalance", 0) or 0),
+            float(snap.get("liquidation_buy_usd", 0) or 0),
+            float(snap.get("liquidation_sell_usd", 0) or 0),
+            float(snap.get("micro_pressure", 0) or 0),
+            payload_json,
+        )
+        if self.mode == "postgresql" and self.pg_pool:
+            async with self.pg_pool.acquire() as con:
+                await con.execute(
+                    """INSERT INTO market_microstructure
+                       (ts, symbol, taker_buy_vol, taker_sell_vol, cvd, trade_imbalance, book_imbalance,
+                        liquidation_buy_usd, liquidation_sell_usd, micro_pressure, payload)
+                       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)""",
+                    ts, *vals,
+                )
+        else:
+            async with self._sqlite_lock:
+                con = sqlite3.connect(self.sqlite_file)
+                try:
+                    con.execute(
+                        """INSERT INTO market_microstructure
+                           (ts, symbol, taker_buy_vol, taker_sell_vol, cvd, trade_imbalance, book_imbalance,
+                            liquidation_buy_usd, liquidation_sell_usd, micro_pressure, payload)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (ts.isoformat(), *vals),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+
+    async def count_rows(self, table):
+        table = table if table in {"orderflow_events", "market_microstructure"} else "market_microstructure"
+        if self.mode == "postgresql" and self.pg_pool:
+            async with self.pg_pool.acquire() as con:
+                return int(await con.fetchval(f"SELECT COUNT(*) FROM {table}"))
+        async with self._sqlite_lock:
+            con = sqlite3.connect(self.sqlite_file)
+            try:
+                return int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            finally:
+                con.close()
+
+
+class OrderflowState:
+    def __init__(self, max_age_sec=ORDERFLOW_WINDOW_SEC):
+        self.max_age_sec = max_age_sec
+        self.trades = defaultdict(lambda: deque(maxlen=8000))
+        self.liquidations = defaultdict(lambda: deque(maxlen=2000))
+        self.depth = {}
+        self.last_price = {}
+        self.connected = False
+        self.last_ws_ts = 0.0
+        self.storage = None
+
+    def attach_storage(self, storage):
+        self.storage = storage
+
+    def _now(self):
+        return time.time()
+
+    def _prune(self, symbol):
+        cutoff = self._now() - self.max_age_sec
+        q = self.trades[symbol]
+        while q and q[0][0] < cutoff:
+            q.popleft()
+        lq = self.liquidations[symbol]
+        while lq and lq[0][0] < cutoff:
+            lq.popleft()
+
+    async def on_agg_trade(self, symbol, data):
+        try:
+            price = float(data.get("p", 0))
+            qty = float(data.get("q", 0))
+            buyer_is_maker = bool(data.get("m", False))
+            side = "sell" if buyer_is_maker else "buy"  # taker side
+            notional = price * qty
+            self.last_price[symbol] = price
+            self.trades[symbol].append((self._now(), side, price, qty, notional))
+            self._prune(symbol)
+            if self.storage and notional >= 10_000:
+                await self.storage.insert_orderflow_event(symbol, "aggTrade", price, qty, side, notional, data)
+        except Exception as e:
+            print(f"  [orderflow] aggTrade parse error {symbol}: {e}")
+
+    async def on_depth(self, symbol, data):
+        try:
+            bids = [(float(p), float(q)) for p, q in data.get("b", [])[:DEPTH_LEVELS]]
+            asks = [(float(p), float(q)) for p, q in data.get("a", [])[:DEPTH_LEVELS]]
+            bid_notional = sum(p * q for p, q in bids)
+            ask_notional = sum(p * q for p, q in asks)
+            total = bid_notional + ask_notional
+            imbalance = (bid_notional - ask_notional) / total if total > 0 else 0.0
+            self.depth[symbol] = {
+                "bid_notional": bid_notional,
+                "ask_notional": ask_notional,
+                "book_imbalance": imbalance,
+                "best_bid": bids[0][0] if bids else None,
+                "best_ask": asks[0][0] if asks else None,
+                "ts": self._now(),
+            }
+        except Exception as e:
+            print(f"  [orderflow] depth parse error {symbol}: {e}")
+
+    async def on_force_order(self, symbol, data):
+        try:
+            order = data.get("o", data)
+            price = float(order.get("ap") or order.get("p") or 0)
+            qty = float(order.get("q") or 0)
+            side_raw = str(order.get("S", "")).upper()
+            # Binance forceOrder side is side of liquidated order. SELL means long liquidation.
+            liquidation_side = "long_liq" if side_raw == "SELL" else "short_liq"
+            notional = price * qty
+            self.liquidations[symbol].append((self._now(), liquidation_side, price, qty, notional))
+            self._prune(symbol)
+            if self.storage:
+                await self.storage.insert_orderflow_event(symbol, "forceOrder", price, qty, liquidation_side, notional, data)
+        except Exception as e:
+            print(f"  [orderflow] forceOrder parse error {symbol}: {e}")
+
+    def snapshot(self, symbol):
+        symbol = symbol.upper()
+        self._prune(symbol)
+        trades = list(self.trades.get(symbol, []))
+        liqs = list(self.liquidations.get(symbol, []))
+        buy_vol = sum(q for _, side, _, q, _ in trades if side == "buy")
+        sell_vol = sum(q for _, side, _, q, _ in trades if side == "sell")
+        buy_usd = sum(n for _, side, _, _, n in trades if side == "buy")
+        sell_usd = sum(n for _, side, _, _, n in trades if side == "sell")
+        total_usd = buy_usd + sell_usd
+        trade_imb = (buy_usd - sell_usd) / total_usd if total_usd > 0 else 0.0
+        cvd = buy_vol - sell_vol
+        d = self.depth.get(symbol, {})
+        book_imb = float(d.get("book_imbalance", 0) or 0)
+        long_liq_usd = sum(n for _, side, _, _, n in liqs if side == "long_liq")
+        short_liq_usd = sum(n for _, side, _, _, n in liqs if side == "short_liq")
+        liq_total = long_liq_usd + short_liq_usd
+        # short_liq often creates buy pressure, long_liq sell pressure
+        liq_pressure = (short_liq_usd - long_liq_usd) / liq_total if liq_total > 0 else 0.0
+        micro_pressure = 0.55 * trade_imb + 0.30 * book_imb + 0.15 * liq_pressure
+        if micro_pressure > 0.25:
+            bias = "BUY_PRESSURE"
+        elif micro_pressure < -0.25:
+            bias = "SELL_PRESSURE"
+        else:
+            bias = "NEUTRAL"
+        return {
+            "symbol": symbol,
+            "connected": self.connected,
+            "last_ws_age_sec": round(self._now() - self.last_ws_ts, 1) if self.last_ws_ts else None,
+            "window_sec": self.max_age_sec,
+            "trade_count": len(trades),
+            "taker_buy_vol": buy_vol,
+            "taker_sell_vol": sell_vol,
+            "taker_buy_usd": buy_usd,
+            "taker_sell_usd": sell_usd,
+            "cvd": cvd,
+            "trade_imbalance": trade_imb,
+            "book_imbalance": book_imb,
+            "bid_notional": float(d.get("bid_notional", 0) or 0),
+            "ask_notional": float(d.get("ask_notional", 0) or 0),
+            "best_bid": d.get("best_bid"),
+            "best_ask": d.get("best_ask"),
+            "liquidation_buy_usd": short_liq_usd,
+            "liquidation_sell_usd": long_liq_usd,
+            "liquidation_total_usd": liq_total,
+            "micro_pressure": micro_pressure,
+            "bias": bias,
+            "last_price": self.last_price.get(symbol),
+        }
+
+
+ORDERFLOW = OrderflowState()
+ASYNC_STORAGE = AsyncStorage(DATABASE_URL)
+
+
+def _fmt_usd_short(v):
+    try:
+        v = float(v or 0)
+    except Exception:
+        return "$0"
+    av = abs(v)
+    if av >= 1_000_000:
+        return f"${v/1_000_000:.2f}M"
+    if av >= 1_000:
+        return f"${v/1_000:.1f}K"
+    return f"${v:.0f}"
+
+
+def format_orderflow_msg(ticker):
+    s = ORDERFLOW.snapshot(ticker)
+    bias = s["bias"]
+    icon = "🟢" if bias == "BUY_PRESSURE" else ("🔴" if bias == "SELL_PRESSURE" else "⚪")
+    return "\n".join([
+        f"🌊 <b>Orderflow — {TICKERS.get(ticker, {}).get('label', ticker)}</b>",
+        "",
+        f"Status: <b>{'WS online' if s['connected'] else 'WS offline'}</b> | age: <b>{s['last_ws_age_sec']}</b>s",
+        f"Window: <b>{s['window_sec']}s</b> | Trades: <b>{s['trade_count']}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Taker Buy:  <b>{_fmt_usd_short(s['taker_buy_usd'])}</b>",
+        f"Taker Sell: <b>{_fmt_usd_short(s['taker_sell_usd'])}</b>",
+        f"Trade imbalance: <b>{s['trade_imbalance']:+.2f}</b>",
+        f"CVD: <b>{s['cvd']:+.4f}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Book bid: <b>{_fmt_usd_short(s['bid_notional'])}</b>",
+        f"Book ask: <b>{_fmt_usd_short(s['ask_notional'])}</b>",
+        f"Book imbalance: <b>{s['book_imbalance']:+.2f}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"{icon} Micro pressure: <b>{s['micro_pressure']:+.2f}</b> | <b>{bias}</b>",
+        "",
+        "📌 Это не сигнал сам по себе. Это краткосрочное давление агрессивных покупателей/продавцов.",
+    ])
+
+
+def format_liquidations_msg(ticker):
+    s = ORDERFLOW.snapshot(ticker)
+    buy = s["liquidation_buy_usd"]
+    sell = s["liquidation_sell_usd"]
+    total = s["liquidation_total_usd"]
+    if total <= 0:
+        verdict = "Ликвидаций в окне почти нет."
+    elif buy > sell * 1.5:
+        verdict = "Больше short liquidations → возможен squeeze вверх, но поздний вход опасен."
+    elif sell > buy * 1.5:
+        verdict = "Больше long liquidations → давление вниз, возможна паника/капитуляция."
+    else:
+        verdict = "Ликвидации сбалансированы."
+    return "\n".join([
+        f"💥 <b>Liquidations — {TICKERS.get(ticker, {}).get('label', ticker)}</b>",
+        "",
+        f"Window: <b>{s['window_sec']}s</b>",
+        f"Short liq / buy pressure: <b>{_fmt_usd_short(buy)}</b>",
+        f"Long liq / sell pressure: <b>{_fmt_usd_short(sell)}</b>",
+        f"Total: <b>{_fmt_usd_short(total)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        verdict,
+    ])
+
+
+def format_footprint_msg(ticker):
+    s = ORDERFLOW.snapshot(ticker)
+    total = s["taker_buy_usd"] + s["taker_sell_usd"]
+    if total <= 0:
+        bar = "нет данных"
+    else:
+        buy_pct = max(0, min(20, int((s["taker_buy_usd"] / total) * 20)))
+        bar = "🟢" * buy_pct + "🔴" * (20 - buy_pct)
+    return "\n".join([
+        f"🧱 <b>Footprint Lite — {TICKERS.get(ticker, {}).get('label', ticker)}</b>",
+        "",
+        f"{bar}",
+        "",
+        f"Buy notional: <b>{_fmt_usd_short(s['taker_buy_usd'])}</b>",
+        f"Sell notional: <b>{_fmt_usd_short(s['taker_sell_usd'])}</b>",
+        f"Delta: <b>{_fmt_usd_short(s['taker_buy_usd'] - s['taker_sell_usd'])}</b>",
+        f"Best bid/ask: <b>{fmt_price(s['best_bid'], ticker)}</b> / <b>{fmt_price(s['best_ask'], ticker)}</b>",
+        "",
+        "📌 Это lite-footprint: Binance public trades + top depth. Не полноценный биржевой footprint с bid/ask volume per price level.",
+    ])
+
+
+async def async_telegram_api(session, method, payload=None):
+    if not BOT_TOKEN:
+        return {"ok": False, "description": "TELEGRAM_BOT_TOKEN is not set"}
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    try:
+        async with session.post(url, json=payload or {}, timeout=45) as resp:
+            return await resp.json(content_type=None)
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+
+async def async_send(session, chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    res = await async_telegram_api(session, "sendMessage", payload)
+    if not res.get("ok"):
+        payload["parse_mode"] = None
+        payload["text"] = str(text).replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
+        res = await async_telegram_api(session, "sendMessage", payload)
+    return res
+
+
+async def async_answer_callback(session, callback_id, text=""):
+    return await async_telegram_api(session, "answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+
+async def async_handle_update(session, update, sem):
+    """Async router for new v5.8 buttons; legacy handler runs in a thread."""
+    async with sem:
+        try:
+            if "callback_query" in update:
+                cb = update["callback_query"]
+                data = cb.get("data", "")
+                chat_id = cb["message"]["chat"]["id"]
+                callback_id = cb.get("id")
+                ticker = user_tickers.get(chat_id, "BTCUSDT")
+
+                if data == "orderflow":
+                    await async_answer_callback(session, callback_id, "Orderflow")
+                    await async_send(session, chat_id, format_orderflow_msg(ticker), realtime_keyboard())
+                    return
+                if data == "liquidations":
+                    await async_answer_callback(session, callback_id, "Liquidations")
+                    await async_send(session, chat_id, format_liquidations_msg(ticker), realtime_keyboard())
+                    return
+                if data == "footprint":
+                    await async_answer_callback(session, callback_id, "Footprint")
+                    await async_send(session, chat_id, format_footprint_msg(ticker), realtime_keyboard())
+                    return
+                if data == "storage_status":
+                    await async_answer_callback(session, callback_id, "Storage")
+                    await async_send(session, chat_id, await format_storage_status(), realtime_keyboard())
+                    return
+
+            # Legacy v5.7 handler. It uses sync requests internally, so run in thread.
+            await asyncio.to_thread(handle_update, update)
+        except Exception as e:
+            print(f"  [async_update] error: {e}")
+
+
+def realtime_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "🌊 Orderflow", "callback_data": "orderflow"},
+            {"text": "💥 Liquidations", "callback_data": "liquidations"},
+        ],
+        [
+            {"text": "🧱 Footprint", "callback_data": "footprint"},
+            {"text": "🗄 Storage", "callback_data": "storage_status"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+# Override main keyboard to expose realtime buttons.
+def main_keyboard():
+    return {"inline_keyboard": [[
+        {"text":"🔄 Сигнал","callback_data":"get_signal"},{"text":"💰 Цена","callback_data":"get_price"}],
+        [{"text":"🌊 Orderflow","callback_data":"orderflow"},{"text":"💥 Liquidations","callback_data":"liquidations"}],
+        [{"text":"🧱 Footprint","callback_data":"footprint"},{"text":"🗄 Storage","callback_data":"storage_status"}],
+        [{"text":"📊 Сменить актив","callback_data":"change_ticker"},{"text":"⏱ Сменить интервал","callback_data":"change_interval"}],
+        [{"text":"🔔 Авто-сигналы: ВКЛ/ВЫКЛ","callback_data":"toggle_auto"},{"text":"⚙️ Настройки авто","callback_data":"auto_settings"}],
+        [{"text":"📂 Мои позиции","callback_data":"my_positions"},{"text":"🛡 Portfolio Risk","callback_data":"portfolio_risk"}],
+        [{"text":"🔥 Heatmap","callback_data":"market_heatmap"},{"text":"🎲 Monte Carlo","callback_data":"monte_carlo"}],
+        [{"text":"🧩 Кластеры","callback_data":"signal_clusters"},{"text":"⚖️ OOS","callback_data":"oos_report"}],
+        [{"text":"🧪 Бэктест","callback_data":"run_backtest"},{"text":"⚖️ Walk-Forward обновить","callback_data":"run_wfo"}],
+        [{"text":"📈 Статистика сигналов","callback_data":"signal_stats"},{"text":"😱 Fear & Greed","callback_data":"get_fg"}],
+        [{"text":"💼 Мой баланс / Плечо","callback_data":"my_balance"},{"text":"📖 Термины","callback_data":"explain"}]]}
+
+
+async def format_storage_status():
+    micro = await ASYNC_STORAGE.count_rows("market_microstructure")
+    events = await ASYNC_STORAGE.count_rows("orderflow_events")
+    return "\n".join([
+        "🗄 <b>Storage Status</b>",
+        "",
+        f"Mode: <b>{ASYNC_STORAGE.mode}</b>",
+        f"File/URL: <b>{'DATABASE_URL' if ASYNC_STORAGE.mode == 'postgresql' else ASYNC_STORAGE.sqlite_file}</b>",
+        f"Orderflow events: <b>{events}</b>",
+        f"Micro snapshots: <b>{micro}</b>",
+        "",
+        "PostgreSQL включается через переменную DATABASE_URL.",
+    ])
+
+
+async def telegram_polling_loop(session):
+    print("  [async] Telegram polling started")
+    sem = asyncio.Semaphore(ASYNC_UPDATE_CONCURRENCY)
+    offset = None
+    # Clear old updates once.
+    try:
+        res = await async_telegram_api(session, "getUpdates", {"offset": -1, "timeout": 1})
+        if res.get("ok") and res.get("result"):
+            offset = res["result"][-1]["update_id"] + 1
+    except Exception:
+        pass
+
+    while True:
+        try:
+            payload = {"timeout": ASYNC_POLL_TIMEOUT, "allowed_updates": ["message", "callback_query"]}
+            if offset is not None:
+                payload["offset"] = offset
+            res = await async_telegram_api(session, "getUpdates", payload)
+            if not res.get("ok"):
+                print(f"  [async_poll] Telegram error: {res}")
+                await asyncio.sleep(3)
+                continue
+            tasks = []
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                tasks.append(asyncio.create_task(async_handle_update(session, upd, sem)))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  [async_poll] error: {e}")
+            await asyncio.sleep(3)
+
+
+async def binance_ws_loop(session):
+    if aiohttp is None:
+        print("  [ws] aiohttp не установлен. Websocket отключён.")
+        return
+    streams = []
+    for sym in WS_SYMBOLS:
+        streams.extend([f"{sym}@aggTrade", f"{sym}@depth20@100ms", f"{sym}@forceOrder"])
+    url = BINANCE_FUTURES_WS + "?streams=" + "/".join(streams)
+    print(f"  [ws] Binance Futures streams: {len(streams)}")
+    backoff = 1
+    while True:
+        try:
+            async with session.ws_connect(url, heartbeat=20, timeout=30) as ws:
+                ORDERFLOW.connected = True
+                backoff = 1
+                print("  [ws] Binance connected")
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        packet = json.loads(msg.data)
+                        stream = packet.get("stream", "")
+                        data = packet.get("data", {})
+                        symbol = str(data.get("s") or stream.split("@")[0]).upper()
+                        ORDERFLOW.last_ws_ts = time.time()
+                        if "aggTrade" in stream:
+                            await ORDERFLOW.on_agg_trade(symbol, data)
+                        elif "depth" in stream:
+                            await ORDERFLOW.on_depth(symbol, data)
+                        elif "forceOrder" in stream:
+                            await ORDERFLOW.on_force_order(symbol, data)
+                    elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            ORDERFLOW.connected = False
+            print(f"  [ws] disconnected/error: {e}; reconnect in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(60, backoff * 2)
+
+
+async def micro_snapshot_loop():
+    while True:
+        try:
+            for sym in AUTO_CRYPTO_TICKERS:
+                snap = ORDERFLOW.snapshot(sym)
+                if snap.get("trade_count", 0) or snap.get("liquidation_total_usd", 0):
+                    await ASYNC_STORAGE.insert_micro_snapshot(sym, snap)
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  [micro_snapshot] error: {e}")
+            await asyncio.sleep(10)
+
+
+async def async_auto_signal_loop(session):
+    """Async scheduler around existing sync signal generation."""
+    print("  [async] auto signal loop started")
+    while True:
+        try:
+            now_ts = time.time()
+            for chat_id in list(auto_chat_ids):
+                send_iv = user_auto_send_interval.get(chat_id, DEFAULT_AUTO_SEND_INTERVAL)
+                minutes = AUTO_SEND_INTERVALS.get(send_iv, AUTO_SEND_INTERVALS[DEFAULT_AUTO_SEND_INTERVAL])["minutes"]
+                last = user_auto_last_sent.get(chat_id, 0)
+                if now_ts - last < minutes * 60:
+                    continue
+                user_auto_last_sent[chat_id] = now_ts
+                # Use existing auto message function if present.
+                try:
+                    msg = await asyncio.to_thread(build_auto_signals_message, chat_id)
+                    await async_send(session, chat_id, msg, main_keyboard())
+                except NameError:
+                    # Fallback: send heatmap.
+                    msg = await asyncio.to_thread(format_market_heatmap, chat_id)
+                    await async_send(session, chat_id, msg, main_keyboard())
+                except Exception as e:
+                    await async_send(session, chat_id, f"❌ Ошибка авто-сигналов: {e}", main_keyboard())
+            await asyncio.sleep(AUTO_LOOP_TICK_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  [async_auto] error: {e}")
+            await asyncio.sleep(10)
+
+
+async def async_position_monitor_loop(session):
+    print("  [async] position monitor loop started")
+    while True:
+        try:
+            # Reuse legacy check by running one pass from existing logic is hard because old loop is infinite.
+            # So we do a lightweight async-safe pass here.
+            for pos in get_all_positions():
+                try:
+                    ticker = pos["ticker"]
+                    chat_id = pos["chat_id"]
+                    current_price = await asyncio.to_thread(get_price, ticker)
+                    opens, highs, lows, closes, volumes = await asyncio.to_thread(get_ohlcv, ticker, pos["interval"])
+                    advice, reason, urgency = await asyncio.to_thread(analyze_exit, pos, current_price, closes, highs, lows, volumes)
+                    now_ts = time.time()
+                    last_advice = pos.get("last_advice", "")
+                    last_advice_ts = pos.get("last_advice_ts", 0)
+                    elapsed = now_ts - last_advice_ts
+                    if urgency == "critical":
+                        skip = False
+                    elif urgency == "warning":
+                        skip = (advice == last_advice and elapsed < 4 * 60)
+                    else:
+                        skip = (advice == last_advice and elapsed < 14 * 60)
+                    if skip:
+                        continue
+                    with _positions_lock:
+                        if pos["pos_id"] in _positions:
+                            if advice == "take_tp1":
+                                _positions[pos["pos_id"]]["tp1_hit"] = True
+                            _positions[pos["pos_id"]]["last_advice"] = advice
+                            _positions[pos["pos_id"]]["last_advice_ts"] = now_ts
+                            _save_positions()
+                    await async_send(session, chat_id, format_position_update(pos, current_price, advice, reason, urgency), position_close_keyboard(pos["pos_id"]))
+                except Exception as e:
+                    print(f"  [async_pos] position error: {e}")
+            await asyncio.sleep(POSITION_LOOP_TICK_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  [async_pos] error: {e}")
+            await asyncio.sleep(10)
+
+
+async def async_signal_eval_loop():
+    print("  [async] signal evaluation loop started")
+    while True:
+        try:
+            await asyncio.to_thread(update_signal_journal_evaluations)
+            await asyncio.sleep(SIGNAL_EVAL_TICK_SEC)
+        except NameError:
+            await asyncio.sleep(SIGNAL_EVAL_TICK_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  [async_eval] error: {e}")
+            await asyncio.sleep(20)
+
+
+async def async_bootstrap():
+    if aiohttp is None:
+        print("ОШИБКА: aiohttp не установлен. Установи: pip install aiohttp")
+        return
+    if not BOT_TOKEN:
+        print("  ОШИБКА: переменная окружения TELEGRAM_BOT_TOKEN не задана.")
+        print('  Пример PowerShell: $env:TELEGRAM_BOT_TOKEN="123:ABC"')
+        return
+
+    print("=======================================================")
+    print(f"  Quant Signal Bot {BOT_VERSION_LABEL}")
+    print(f"  Storage target: {'PostgreSQL' if DATABASE_URL else 'SQLite fallback'}")
+    print(f"  WS symbols: {', '.join(AUTO_CRYPTO_TICKERS)}")
+    print("=======================================================")
+
+    _load_positions()
+    load_weights()
+    ORDERFLOW.attach_storage(ASYNC_STORAGE)
+    await ASYNC_STORAGE.connect()
+
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        me = await async_telegram_api(session, "getMe")
+        if not me.get("ok"):
+            print(f"  Telegram getMe error: {me}")
+        else:
+            print(f"  Telegram bot: @{me.get('result', {}).get('username', '?')}")
+
+        tasks = [
+            asyncio.create_task(telegram_polling_loop(session), name="telegram_polling"),
+            asyncio.create_task(binance_ws_loop(session), name="binance_ws"),
+            asyncio.create_task(micro_snapshot_loop(), name="micro_snapshot"),
+            asyncio.create_task(async_auto_signal_loop(session), name="auto_signal"),
+            asyncio.create_task(async_position_monitor_loop(session), name="position_monitor"),
+            asyncio.create_task(async_signal_eval_loop(), name="signal_eval"),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await ASYNC_STORAGE.close()
+
+
+
+# ============================================================
+# v5.9 — ORGANIZED UI + FULL TERMS GUIDE
+# ============================================================
+# This layer reorganizes the Telegram UI without removing any
+# existing v5.8 functionality. The old callbacks still work.
+
+BOT_VERSION_LABEL = "v5.9 Organized UI + Terms"
+
+
+def section_back_keyboard(section="main"):
+    target = "back_main" if section == "main" else section
+    label = "◀️ Главное меню" if target == "back_main" else "◀️ Назад"
+    return {"inline_keyboard": [[{"text": label, "callback_data": target}]]}
+
+
+def main_keyboard():
+    """Clean home screen. Heavy/advanced tools moved into submenus."""
+    return {"inline_keyboard": [
+        [
+            {"text": "🔄 Сигнал", "callback_data": "get_signal"},
+            {"text": "💰 Цена", "callback_data": "get_price"},
+        ],
+        [
+            {"text": "🌊 Market Flow", "callback_data": "menu_flow"},
+            {"text": "📊 Аналитика", "callback_data": "menu_analytics"},
+        ],
+        [
+            {"text": "📂 Позиции / Риск", "callback_data": "menu_positions"},
+            {"text": "⚙️ Настройки", "callback_data": "menu_settings"},
+        ],
+        [
+            {"text": "📖 Обучение", "callback_data": "menu_learn"},
+            {"text": "😱 Fear & Greed", "callback_data": "get_fg"},
+        ],
+    ]}
+
+
+def market_flow_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "🌊 Orderflow", "callback_data": "orderflow"},
+            {"text": "💥 Liquidations", "callback_data": "liquidations"},
+        ],
+        [
+            {"text": "🧱 Footprint", "callback_data": "footprint"},
+            {"text": "🔥 Heatmap", "callback_data": "market_heatmap"},
+        ],
+        [{"text": "📖 Как читать Market Flow", "callback_data": "learn_flow"}],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def analytics_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "📈 Статистика сигналов", "callback_data": "signal_stats"},
+            {"text": "🧩 Кластеры", "callback_data": "signal_clusters"},
+        ],
+        [
+            {"text": "🧪 Бэктест", "callback_data": "run_backtest"},
+            {"text": "🎲 Monte Carlo", "callback_data": "monte_carlo"},
+        ],
+        [
+            {"text": "⚖️ OOS", "callback_data": "oos_report"},
+            {"text": "⚖️ Walk-Forward", "callback_data": "run_wfo"},
+        ],
+        [{"text": "📖 Как читать аналитику", "callback_data": "learn_analytics"}],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def positions_risk_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "📂 Мои позиции", "callback_data": "my_positions"},
+            {"text": "🛡 Portfolio Risk", "callback_data": "portfolio_risk"},
+        ],
+        [
+            {"text": "💼 Баланс / Плечо", "callback_data": "my_balance"},
+            {"text": "📖 Риск простыми словами", "callback_data": "learn_risk"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def settings_keyboard_v59():
+    return {"inline_keyboard": [
+        [
+            {"text": "📊 Сменить актив", "callback_data": "change_ticker"},
+            {"text": "⏱ Сменить интервал", "callback_data": "change_interval"},
+        ],
+        [
+            {"text": "🔔 Авто ВКЛ/ВЫКЛ", "callback_data": "toggle_auto"},
+            {"text": "⚙️ Настройки авто", "callback_data": "auto_settings"},
+        ],
+        [
+            {"text": "🗄 Storage", "callback_data": "storage_status"},
+            {"text": "📖 Что такое Storage", "callback_data": "learn_storage"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def learn_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "🚦 Что нажимать новичку", "callback_data": "learn_start"},
+            {"text": "🧠 Как читать сигнал", "callback_data": "learn_signal"},
+        ],
+        [
+            {"text": "🌊 Market Flow", "callback_data": "learn_flow"},
+            {"text": "📊 Аналитика", "callback_data": "learn_analytics"},
+        ],
+        [
+            {"text": "🛡 Риск", "callback_data": "learn_risk"},
+            {"text": "🗄 Storage", "callback_data": "learn_storage"},
+        ],
+        [
+            {"text": "📚 Индикаторы", "callback_data": "explain_2"},
+            {"text": "⚠️ Опасные ошибки", "callback_data": "learn_traps"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def explain_keyboard():
+    """Backward-compatible dictionary menu for old explain callbacks."""
+    return {"inline_keyboard": [
+        [
+            {"text": "🚦 Новичку", "callback_data": "learn_start"},
+            {"text": "🧠 Сигнал", "callback_data": "learn_signal"},
+        ],
+        [
+            {"text": "🌊 Flow", "callback_data": "learn_flow"},
+            {"text": "📊 Аналитика", "callback_data": "learn_analytics"},
+        ],
+        [
+            {"text": "📚 Индикаторы", "callback_data": "explain_2"},
+            {"text": "🛡 Риск", "callback_data": "learn_risk"},
+        ],
+        [
+            {"text": "🗄 Storage", "callback_data": "learn_storage"},
+            {"text": "⚠️ Ошибки", "callback_data": "learn_traps"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def realtime_keyboard():
+    """Keep old v5.8 function name, but return organized Market Flow menu."""
+    return market_flow_keyboard()
+
+
+LEARN_TEXTS = {
+    "learn_start": """🚦 <b>Что нажимать новичку</b>
+━━━━━━━━━━━━━━━━━━━━
+
+1️⃣ <b>🔄 Сигнал</b>
+Главная кнопка. Бот анализирует выбранный актив и таймфрейм.
+
+2️⃣ <b>📊 Сменить актив</b>
+Выбери BTC / ETH / SOL / BNB / XRP / DOGE / SHIB.
+
+3️⃣ <b>⏱ Сменить интервал</b>
+Для скальпинга чаще смотри 5m / 15m. 1m шумнее.
+
+4️⃣ <b>📂 Позиции / Риск</b>
+Здесь открытые позиции, риск по портфелю, баланс и плечо.
+
+5️⃣ <b>🌊 Market Flow</b>
+Продвинутый раздел. Не используй его как одиночный сигнал. Это контекст.
+
+Правило: сначала смотри <b>Сигнал</b>, потом подтверждай через <b>Market Flow</b> и <b>Portfolio Risk</b>.""",
+
+    "learn_signal": """🧠 <b>Как читать сигнал</b>
+━━━━━━━━━━━━━━━━━━━━
+
+<b>LONG</b> — сценарий роста.
+<b>SHORT</b> — сценарий падения.
+<b>WAIT</b> — лучше не входить сейчас.
+
+<b>Confidence</b> — качество совпадения факторов. Это не гарантия.
+Пример: C72 лучше, чем C55, но C72 тоже может быть ошибочным.
+
+<b>RR</b> — risk/reward. Если RR=2.0, потенциальная цель примерно в 2 раза больше риска.
+
+<b>Blockers</b> — причины не входить: слабый RR, цена перегрета, рынок пилит, нет объёма.
+
+<b>Главная логика:</b>
+Хороший сигнал = направление + нормальный RR + нет сильных блокеров + риск под контролем.""",
+
+    "learn_flow": """🌊 <b>Market Flow</b>
+━━━━━━━━━━━━━━━━━━━━
+
+<b>Orderflow</b> — кто агрессивнее прямо сейчас: покупатели или продавцы.
+
+<b>CVD</b> — cumulative volume delta. Если растёт, агрессивные покупки сильнее продаж. Если падает — наоборот.
+
+<b>Trade imbalance</b> — дисбаланс рыночных покупок и продаж.
+
+<b>Order book imbalance</b> — перевес заявок в стакане. Это не гарантия: заявки могут убирать.
+
+<b>Liquidations</b> — принудительное закрытие позиций. Большие ликвидации часто дают резкие импульсы или развороты.
+
+<b>Footprint lite</b> — приближённый footprint через публичные Binance streams: trades + depth + delta. Это не полный профессиональный footprint, но полезный контекст.
+
+Правило: Market Flow подтверждает или ослабляет сигнал, но не заменяет риск-менеджмент.""",
+
+    "learn_analytics": """📊 <b>Аналитика</b>
+━━━━━━━━━━━━━━━━━━━━
+
+<b>Статистика сигналов</b> — как прошлые сигналы отработали по направлениям, монетам и confidence.
+
+<b>Кластеры</b> — группы похожих сигналов: тикер + TF + направление + режим рынка. Помогает понять, какие сетапы реально лучше.
+
+<b>Бэктест</b> — проверка стратегии на истории. Важно: история не гарантирует будущий результат.
+
+<b>Monte Carlo</b> — стресс-тест последовательности сделок. Показывает, насколько стратегия может просесть при другом порядке win/loss.
+
+<b>OOS</b> — out-of-sample. Проверяет, не подогнана ли стратегия под старые данные.
+
+<b>Walk-Forward</b> — адаптация весов на скользящих участках истории.""",
+
+    "learn_risk": """🛡 <b>Риск</b>
+━━━━━━━━━━━━━━━━━━━━
+
+<b>Portfolio Risk</b> — общий риск всех открытых позиций до Stop Loss.
+
+<b>Leverage</b> увеличивает и прибыль, и убыток. x20+ уже высокий риск.
+
+<b>Размер позиции</b> важнее точности сигнала. Даже хороший сигнал может дать убыток.
+
+<b>SL</b> — точка, где идея сделки признана неверной.
+<b>TP</b> — зона фиксации прибыли.
+
+Базовое правило: риск на одну сделку лучше держать около 0.5–1% депозита, особенно на фьючерсах.""",
+
+    "learn_storage": """🗄 <b>Storage</b>
+━━━━━━━━━━━━━━━━━━━━
+
+Storage показывает, где бот хранит данные.
+
+<b>SQLite</b> — локальный файл базы данных рядом с проектом. Работает без установки сервера.
+
+<b>PostgreSQL</b> — полноценная база данных для более серьёзного проекта. Включается через DATABASE_URL.
+
+Что хранится:
+• сигналы;
+• позиции;
+• orderflow события;
+• microstructure snapshots;
+• служебные данные.
+
+Если DATABASE_URL не задан, бот использует SQLite fallback.""",
+
+    "learn_traps": """⚠️ <b>Опасные ошибки</b>
+━━━━━━━━━━━━━━━━━━━━
+
+1️⃣ Входить только потому, что сигнал LONG/SHORT.
+Нужно смотреть RR, blockers и риск.
+
+2️⃣ Покупать после сильного импульса без ретеста.
+Часто это вход в конец движения.
+
+3️⃣ Увеличивать плечо после серии плюсов.
+Серия выигрышей не отменяет риск ликвидации.
+
+4️⃣ Верить бэктесту без OOS и Monte Carlo.
+Красивый бэктест может быть переобучением.
+
+5️⃣ Игнорировать BTC context для альтов.
+Если BTC резко падает, альты часто ломаются быстрее.""",
+}
+
+
+def format_menu_header(title, body):
+    return f"{title}\n━━━━━━━━━━━━━━━━━━━━\n\n{body}"
+
+
+async def send_v59_menu(session, chat_id, menu_name):
+    if menu_name == "menu_flow":
+        await async_send(session, chat_id, format_menu_header(
+            "🌊 <b>Market Flow</b>",
+            "Realtime-контекст рынка: агрессивные сделки, стакан, ликвидации и heatmap.\n\nИспользуй как подтверждение к основному сигналу, а не как отдельный вход."
+        ), market_flow_keyboard())
+    elif menu_name == "menu_analytics":
+        await async_send(session, chat_id, format_menu_header(
+            "📊 <b>Аналитика</b>",
+            "Статистика, проверка качества сигналов, бэктесты, Monte Carlo, OOS и Walk-Forward."
+        ), analytics_keyboard())
+    elif menu_name == "menu_positions":
+        await async_send(session, chat_id, format_menu_header(
+            "📂 <b>Позиции / Риск</b>",
+            "Управление открытыми позициями, общий риск портфеля, баланс, плечо и размер позиции."
+        ), positions_risk_keyboard())
+    elif menu_name == "menu_settings":
+        await async_send(session, chat_id, format_menu_header(
+            "⚙️ <b>Настройки</b>",
+            "Актив, таймфрейм, авто-сигналы, параметры авто-анализа и storage status."
+        ), settings_keyboard_v59())
+    elif menu_name == "menu_learn":
+        await async_send(session, chat_id, "📖 <b>Обучение / Термины</b>\n\nВыбери тему:", learn_keyboard())
+    else:
+        await async_send(session, chat_id, "🏠 <b>Главное меню</b>", main_keyboard())
+
+
+# Keep reference to v5.8 router, then wrap it.
+_async_handle_update_v58 = async_handle_update
+
+
+async def async_handle_update(session, update, sem):
+    """v5.9 router: organized menus + full terms, then fallback to v5.8/v5.7.
+
+    Do not acquire `sem` here before fallback: the original v5.8 router
+    already manages the semaphore. This avoids nested semaphore waits.
+    """
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+            ticker = user_tickers.get(chat_id, "BTCUSDT")
+
+            if data in {"menu_flow", "menu_analytics", "menu_positions", "menu_settings", "menu_learn"}:
+                await async_answer_callback(session, callback_id, "Меню")
+                await send_v59_menu(session, chat_id, data)
+                return
+
+            if data in LEARN_TEXTS:
+                await async_answer_callback(session, callback_id, "Термины")
+                await async_send(session, chat_id, LEARN_TEXTS[data], learn_keyboard())
+                return
+
+            # New organized training hub.
+            if data == "explain":
+                await async_answer_callback(session, callback_id, "Обучение")
+                await send_v59_menu(session, chat_id, "menu_learn")
+                return
+
+            # Keep realtime callbacks in Market Flow menu.
+            if data == "orderflow":
+                await async_answer_callback(session, callback_id, "Orderflow")
+                await async_send(session, chat_id, format_orderflow_msg(ticker), market_flow_keyboard())
+                return
+            if data == "liquidations":
+                await async_answer_callback(session, callback_id, "Liquidations")
+                await async_send(session, chat_id, format_liquidations_msg(ticker), market_flow_keyboard())
+                return
+            if data == "footprint":
+                await async_answer_callback(session, callback_id, "Footprint")
+                await async_send(session, chat_id, format_footprint_msg(ticker), market_flow_keyboard())
+                return
+            if data == "storage_status":
+                await async_answer_callback(session, callback_id, "Storage")
+                await async_send(session, chat_id, await format_storage_status(), settings_keyboard_v59())
+                return
+
+        # Fallback to v5.8 router and legacy sync handler.
+        await _async_handle_update_v58(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v59] error: {e}")
+
+
+
+# ============================================================
+# v6.0 — ENTRY TIMING / ENTRY POINT ENGINE
+# ============================================================
+# Цель: не только сказать LONG/SHORT/WAIT, а оценить, выгодно ли входить
+# прямо сейчас, или лучше ждать ретест/подтверждение. Это решает проблему,
+# когда направление было верным, но точка входа была уже поздней.
+
+ENTRY_MIN_NOW_SCORE = 70
+ENTRY_MIN_RR_NOW = 1.35
+ENTRY_MAX_PROGRESS_TO_TP = 0.50      # если движение уже прошло 50% до TP1 — вход считается поздним
+ENTRY_MAX_DISTANCE_EMA_ATR = 1.15    # дальше от EMA20 = чаще ждать ретест
+ENTRY_MAX_DISTANCE_VWAP_ATR = 1.00
+ENTRY_NEAR_TP_ATR = 0.35             # если до TP1 осталось меньше 0.35 ATR — поздно входить
+ENTRY_RETEST_ZONE_ATR = 0.30
+
+
+def _entry_clamp(v, lo, hi):
+    try:
+        return max(lo, min(hi, float(v)))
+    except Exception:
+        return lo
+
+
+def _entry_side_label(direction):
+    return "LONG" if direction == "long" else ("SHORT" if direction == "short" else "WAIT")
+
+
+def _flow_snapshot_safe(ticker):
+    try:
+        if "ORDERFLOW" in globals() and ORDERFLOW is not None:
+            return ORDERFLOW.snapshot(ticker)
+    except Exception:
+        pass
+    return {
+        "bias": "NO_WS_DATA",
+        "micro_pressure": 0.0,
+        "trade_imbalance": 0.0,
+        "book_imbalance": 0.0,
+        "liquidation_total_usd": 0.0,
+        "trade_count": 0,
+    }
+
+
+def _flow_alignment(direction, flow):
+    """Возвращает (score_delta, note, state)."""
+    if not direction:
+        return 0, "нет направления", "neutral"
+    bias = str(flow.get("bias", "NEUTRAL"))
+    pressure = _safe_float(flow.get("micro_pressure"), 0) or 0
+    trades = int(flow.get("trade_count", 0) or 0)
+    if trades < 10:
+        return 0, "orderflow ещё не накопил достаточно сделок", "unknown"
+    if direction == "long":
+        if bias == "BUY_PRESSURE" or pressure > 0.15:
+            return 10, f"orderflow поддерживает LONG: pressure={pressure:+.2f}", "support"
+        if bias == "SELL_PRESSURE" or pressure < -0.15:
+            return -16, f"orderflow против LONG: pressure={pressure:+.2f}", "oppose"
+    if direction == "short":
+        if bias == "SELL_PRESSURE" or pressure < -0.15:
+            return 10, f"orderflow поддерживает SHORT: pressure={pressure:+.2f}", "support"
+        if bias == "BUY_PRESSURE" or pressure > 0.15:
+            return -16, f"orderflow против SHORT: pressure={pressure:+.2f}", "oppose"
+    return 0, f"orderflow нейтральный: pressure={pressure:+.2f}", "neutral"
+
+
+def _calc_progress_to_tp(direction, signal_price, live_price, tp1):
+    try:
+        signal_price = float(signal_price); live_price = float(live_price); tp1 = float(tp1)
+        if direction == "long":
+            denom = tp1 - signal_price
+            return (live_price - signal_price) / denom if denom > 0 else 0.0
+        if direction == "short":
+            denom = signal_price - tp1
+            return (signal_price - live_price) / denom if denom > 0 else 0.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _distance_to_target_atr(direction, live_price, tp1, atr):
+    try:
+        if not atr or atr <= 0:
+            return None
+        if direction == "long":
+            return (float(tp1) - float(live_price)) / float(atr)
+        if direction == "short":
+            return (float(live_price) - float(tp1)) / float(atr)
+    except Exception:
+        return None
+    return None
+
+
+def _build_entry_zone(direction, live_price, signal_price, ema20, vwap, support, resistance, atr, status):
+    """Строит понятную зону входа: now-zone или retest-zone."""
+    atr = float(atr or 0)
+    live_price = float(live_price or signal_price or 0)
+    signal_price = float(signal_price or live_price or 0)
+    anchors = []
+    for x in (ema20, vwap):
+        try:
+            x = float(x)
+            if x > 0:
+                anchors.append(x)
+        except Exception:
+            pass
+
+    if direction == "long":
+        # Для LONG хорошая точка чаще около EMA20/VWAP/поддержки, а не после сильной зелёной свечи.
+        if support:
+            try:
+                anchors.append(float(support))
+            except Exception:
+                pass
+        center = sum(anchors) / len(anchors) if anchors else live_price
+        if status == "ENTER_NOW":
+            center = live_price
+        lo = center - ENTRY_RETEST_ZONE_ATR * atr
+        hi = center + ENTRY_RETEST_ZONE_ATR * atr
+        return min(lo, hi), max(lo, hi), center
+
+    if direction == "short":
+        # Для SHORT хорошая точка чаще около EMA20/VWAP/сопротивления, а не после сильной красной свечи.
+        if resistance:
+            try:
+                anchors.append(float(resistance))
+            except Exception:
+                pass
+        center = sum(anchors) / len(anchors) if anchors else live_price
+        if status == "ENTER_NOW":
+            center = live_price
+        lo = center - ENTRY_RETEST_ZONE_ATR * atr
+        hi = center + ENTRY_RETEST_ZONE_ATR * atr
+        return min(lo, hi), max(lo, hi), center
+
+    return None, None, None
+
+
+def build_entry_plan(data, ticker, interval):
+    """Главный движок точки входа.
+
+    Он отделяет направление от входа:
+      - направление может быть SHORT/LONG;
+      - вход прямо сейчас может быть плохим, если цена уже убежала, RR испортился,
+        orderflow против, TP близко или рынок пилит.
+    """
+    direction = data.get("direction") or _signal_direction_from_text(data.get("signal"))
+    signal = str(data.get("signal", "WAIT"))
+    signal_price = _safe_float(data.get("price"), None)
+    atr = _safe_float(data.get("atr"), None)
+    ema20 = _safe_float(data.get("ema20"), None)
+    support = _safe_float(data.get("support"), None)
+    resistance = _safe_float(data.get("resistance"), None)
+    confidence = int(data.get("confidence", 0) or 0)
+    micro = data.get("micro_regime") or data.get("regime") or "MIXED"
+    blockers = list(data.get("risk_blockers") or [])
+    warnings = list(data.get("risk_warnings") or [])
+
+    try:
+        opens, highs, lows, closes, volumes = get_ohlcv(ticker, interval)
+        vwap = calc_vwap(highs, lows, closes, volumes)
+        if atr is None:
+            atr = calc_atr(highs, lows, closes)
+        if ema20 is None:
+            ema20 = calc_ema(closes, 20)
+        if signal_price is None:
+            signal_price = closes[-1]
+    except Exception:
+        vwap = None
+
+    try:
+        live_price = get_price(ticker)
+    except Exception:
+        live_price = signal_price
+
+    plan = {
+        "direction": direction,
+        "side": _entry_side_label(direction),
+        "status": "NO_SETUP",
+        "score": 0,
+        "live_price": live_price,
+        "signal_price": signal_price,
+        "entry_zone_low": None,
+        "entry_zone_high": None,
+        "preferred_entry": None,
+        "sl": None,
+        "tp1": None,
+        "tp2": None,
+        "rr_now": 0,
+        "progress_to_tp": 0,
+        "dist_ema_atr": None,
+        "dist_vwap_atr": None,
+        "why": [],
+        "warnings": [],
+        "invalidation": None,
+        "action": "Ждать. Нет нормальной точки входа.",
+        "validity": "План актуален только пока не изменилась структура и не закрылась новая сильная свеча против идеи.",
+    }
+
+    if not direction or "WAIT" in signal and not ("LONG" in signal or "SHORT" in signal):
+        plan["why"].append("Бот не видит достаточного направления. Без направления точка входа не строится.")
+        return plan
+
+    if not atr or atr <= 0 or not live_price or live_price <= 0:
+        plan["status"] = "NO_ENTRY"
+        plan["why"].append("Не хватает ATR/цены для расчёта нормального SL, TP и зоны входа.")
+        return plan
+
+    # Пересчитываем SL/TP именно от текущей live-цены, потому что вход может быть уже поздним.
+    current_rl = calc_risk_levels(live_price, atr, direction, support, resistance)
+    old_rl = data.get("risk_levels") or current_rl or {}
+    tp1_ref = _safe_float(old_rl.get("tp1"), None) or _safe_float(current_rl.get("tp1"), None)
+    rr_now = _safe_float((current_rl or {}).get("rr_ratio"), 0) or 0
+    risk_pct_now = _safe_float((current_rl or {}).get("risk_pct"), 0) or 0
+    progress = _calc_progress_to_tp(direction, signal_price, live_price, tp1_ref)
+    dist_to_tp_atr = _distance_to_target_atr(direction, live_price, tp1_ref, atr)
+
+    plan["sl"] = (current_rl or {}).get("sl")
+    plan["tp1"] = (current_rl or {}).get("tp1")
+    plan["tp2"] = (current_rl or {}).get("tp2")
+    plan["rr_now"] = round(rr_now, 2)
+    plan["risk_pct_now"] = round(risk_pct_now, 2)
+    plan["progress_to_tp"] = round(progress, 2)
+
+    score = 45
+    score += (confidence - 55) * 0.45
+
+    if rr_now >= 2.0:
+        score += 12; plan["why"].append(f"RR сейчас сильный: {rr_now:.1f}x")
+    elif rr_now >= ENTRY_MIN_RR_NOW:
+        score += 5; plan["why"].append(f"RR сейчас допустимый: {rr_now:.1f}x")
+    else:
+        score -= 22; plan["warnings"].append(f"RR сейчас слабый: {rr_now:.1f}x. Вход невыгодный.")
+
+    if blockers:
+        score -= 24
+        plan["warnings"].append("Есть блокеры входа: " + " | ".join(blockers[:2]))
+    if warnings:
+        score -= 5
+        plan["warnings"].extend(warnings[:2])
+
+    if ema20 and atr:
+        dist_ema = abs(live_price - ema20) / atr
+        plan["dist_ema_atr"] = round(dist_ema, 2)
+        if dist_ema <= 0.65:
+            score += 12; plan["why"].append(f"Цена близко к EMA20: {dist_ema:.1f} ATR — вход не выглядит поздним")
+        elif dist_ema <= ENTRY_MAX_DISTANCE_EMA_ATR:
+            score += 2; plan["why"].append(f"Цена умеренно далеко от EMA20: {dist_ema:.1f} ATR")
+        else:
+            score -= 20; plan["warnings"].append(f"Цена убежала от EMA20 на {dist_ema:.1f} ATR — лучше ждать ретест")
+
+    if vwap and atr:
+        dist_vwap = abs(live_price - vwap) / atr
+        plan["dist_vwap_atr"] = round(dist_vwap, 2)
+        if dist_vwap <= 0.55:
+            score += 8; plan["why"].append(f"Цена около VWAP: {dist_vwap:.1f} ATR — вход адекватнее")
+        elif dist_vwap > ENTRY_MAX_DISTANCE_VWAP_ATR:
+            score -= 10; plan["warnings"].append(f"Цена далеко от VWAP: {dist_vwap:.1f} ATR")
+
+    if progress >= ENTRY_MAX_PROGRESS_TO_TP:
+        score -= 24
+        plan["warnings"].append(f"Движение уже прошло примерно {progress*100:.0f}% пути до TP1 — вход поздний")
+    elif progress >= 0.25:
+        score -= 8
+        plan["warnings"].append(f"Часть движения уже прошла: {progress*100:.0f}% до TP1")
+    elif progress < -0.35:
+        score -= 14
+        plan["warnings"].append("Цена уже пошла против сигнала — нужен новый подтверждающий импульс")
+    else:
+        score += 5
+        plan["why"].append("Сигнал ещё не выглядит сильно опоздавшим")
+
+    if dist_to_tp_atr is not None and dist_to_tp_atr < ENTRY_NEAR_TP_ATR:
+        score -= 30
+        plan["warnings"].append("TP1 уже слишком близко — плохое соотношение риска к прибыли")
+
+    if micro in ("TREND_UP", "TREND_DOWN", "BREAKOUT"):
+        if (direction == "long" and micro in ("TREND_UP", "BREAKOUT")) or (direction == "short" and micro in ("TREND_DOWN", "BREAKOUT")):
+            score += 9; plan["why"].append(f"Режим рынка поддерживает идею: {micro}")
+        else:
+            score -= 8; plan["warnings"].append(f"Режим рынка спорный для входа: {micro}")
+    elif micro == "CHOP/RANGE":
+        score -= 10; plan["warnings"].append("Рынок пилит. Входить по трендовому сигналу опаснее.")
+    elif micro == "PANIC/PUMP":
+        score -= 16; plan["warnings"].append("Режим PANIC/PUMP: можно попасть в конец импульса.")
+
+    flow = _flow_snapshot_safe(ticker)
+    flow_delta, flow_note, flow_state = _flow_alignment(direction, flow)
+    score += flow_delta
+    plan["orderflow_state"] = flow_state
+    plan["orderflow_note"] = flow_note
+    if flow_state == "support":
+        plan["why"].append(flow_note)
+    elif flow_state == "oppose":
+        plan["warnings"].append(flow_note)
+    else:
+        plan["why"].append(flow_note)
+
+    score = int(_entry_clamp(score, 0, 100))
+    plan["score"] = score
+
+    # Итоговое решение.
+    hard_no = (rr_now < 1.15 or bool(blockers) or (dist_to_tp_atr is not None and dist_to_tp_atr < ENTRY_NEAR_TP_ATR))
+    chased = (progress >= ENTRY_MAX_PROGRESS_TO_TP or
+              (plan.get("dist_ema_atr") is not None and plan["dist_ema_atr"] > ENTRY_MAX_DISTANCE_EMA_ATR) or
+              (plan.get("dist_vwap_atr") is not None and plan["dist_vwap_atr"] > ENTRY_MAX_DISTANCE_VWAP_ATR + 0.25))
+    needs_confirmation = (flow_state == "oppose" or micro in ("CHOP/RANGE", "PANIC/PUMP") or progress < -0.35)
+
+    if hard_no:
+        plan["status"] = "NO_ENTRY"
+        plan["action"] = "Не входить сейчас. Цена/риск дают плохую точку входа. Ждать новый сетап."
+    elif score >= ENTRY_MIN_NOW_SCORE and not chased and not needs_confirmation:
+        plan["status"] = "ENTER_NOW"
+        plan["action"] = "Вход допустим маленьким риском. Не all-in. SL обязателен."
+    elif chased:
+        plan["status"] = "WAIT_RETEST"
+        plan["action"] = "Не догонять цену. Ждать ретест зоны входа и подтверждение объёмом."
+    elif needs_confirmation:
+        plan["status"] = "WAIT_CONFIRMATION"
+        plan["action"] = "Ждать подтверждение: закрытие свечи в сторону идеи + orderflow перестаёт быть против."
+    else:
+        plan["status"] = "WAIT_RETEST"
+        plan["action"] = "Идея есть, но точка входа средняя. Лучше ждать цену ближе к зоне входа."
+
+    zone_lo, zone_hi, center = _build_entry_zone(
+        direction, live_price, signal_price, ema20, vwap, support, resistance, atr, plan["status"]
+    )
+    plan["entry_zone_low"] = zone_lo
+    plan["entry_zone_high"] = zone_hi
+    plan["preferred_entry"] = center
+
+    if direction == "long":
+        plan["invalidation"] = f"Идея LONG ломается, если цена закрепится ниже SL {fmt_price(plan['sl'], ticker)} или структура начнёт делать lower low."
+    elif direction == "short":
+        plan["invalidation"] = f"Идея SHORT ломается, если цена закрепится выше SL {fmt_price(plan['sl'], ticker)} или структура начнёт делать higher high."
+
+    return plan
+
+
+def format_entry_plan(plan, ticker, compact=False):
+    status = plan.get("status", "NO_SETUP")
+    side = plan.get("side", "WAIT")
+    score = int(plan.get("score", 0) or 0)
+
+    status_ru = {
+        "ENTER_NOW": "✅ Вход сейчас допустим",
+        "WAIT_RETEST": "🟡 Ждать ретест / лучшую цену",
+        "WAIT_CONFIRMATION": "🟠 Ждать подтверждение",
+        "NO_ENTRY": "⛔ Не входить сейчас",
+        "NO_SETUP": "⏸ Нет сетапа для входа",
+    }.get(status, status)
+
+    live = plan.get("live_price")
+    lo = plan.get("entry_zone_low")
+    hi = plan.get("entry_zone_high")
+    pref = plan.get("preferred_entry")
+    rr = plan.get("rr_now", 0)
+    progress = plan.get("progress_to_tp", 0)
+
+    if compact:
+        return f"{status_ru} | EntryScore {score}/100 | RR {rr:.1f}x"
+
+    lines = [
+        "🎯 <b>Точка входа / Entry Timing</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Направление: <b>{side}</b>",
+        f"Решение: <b>{status_ru}</b>",
+        f"EntryScore: <b>{score}/100</b>",
+        f"Текущая цена: <b>{fmt_price(live, ticker)}</b>",
+    ]
+
+    if lo and hi:
+        lines += [
+            f"Зона входа: <b>{fmt_price(lo, ticker)} — {fmt_price(hi, ticker)}</b>",
+            f"Оптимально ближе к: <b>{fmt_price(pref, ticker)}</b>",
+        ]
+
+    if plan.get("sl") and plan.get("tp1"):
+        lines += [
+            "",
+            f"SL: <b>{fmt_price(plan.get('sl'), ticker)}</b>",
+            f"TP1: <b>{fmt_price(plan.get('tp1'), ticker)}</b>",
+            f"TP2: <b>{fmt_price(plan.get('tp2'), ticker)}</b>",
+            f"RR сейчас: <b>{rr:.2f}x</b>",
+            f"Движение уже прошло до TP1: <b>{progress*100:.0f}%</b>",
+        ]
+
+    why = plan.get("why") or []
+    warnings = plan.get("warnings") or []
+    if why:
+        lines += ["", "✅ <b>Почему вход может быть нормальным:</b>"]
+        lines += [f"• {x}" for x in why[:4]]
+    if warnings:
+        lines += ["", "⚠️ <b>Почему вход может быть плохим:</b>"]
+        lines += [f"• {x}" for x in warnings[:5]]
+
+    lines += [
+        "",
+        "🧠 <b>Что делать осторожному трейдеру:</b>",
+        plan.get("action", "Ждать."),
+    ]
+    if plan.get("invalidation"):
+        lines += ["", "❌ <b>Invalidation:</b>", plan.get("invalidation")]
+    lines += ["", "⏳ <b>Актуальность:</b>", plan.get("validity", "План требует обновления после новой свечи.")]
+    lines += ["", "⚠️ Не финансовая рекомендация. Риск на сделку лучше держать маленьким."]
+    return "\n".join(lines)
+
+
+# Сохраняем v5.9 функции и добавляем Entry Timing без разрушения старой логики.
+_base_full_analyze_v59 = full_analyze
+_base_format_msg_v59 = format_msg
+_base_format_auto_digest_v59 = format_auto_digest
+_base_main_keyboard_v59 = main_keyboard
+_base_fetch_and_send_signal_v59 = fetch_and_send_signal
+_base_async_handle_update_v59 = async_handle_update
+
+
+def full_analyze(ticker, interval):
+    data = _base_full_analyze_v59(ticker, interval)
+    try:
+        data["entry_plan"] = build_entry_plan(data, ticker, interval)
+    except Exception as e:
+        print(f"  [entry] build error {ticker} {interval}: {e}")
+        data["entry_plan"] = {"status": "NO_SETUP", "score": 0, "why": [f"Entry engine error: {e}"]}
+    return data
+
+
+def format_msg(data, ticker, interval):
+    msg = _base_format_msg_v59(data, ticker, interval)
+    try:
+        ep = data.get("entry_plan") or build_entry_plan(data, ticker, interval)
+        entry_block = format_entry_plan(ep, ticker, compact=False)
+        # Вставляем блок перед финальным предупреждением, если оно есть; иначе добавляем в конец.
+        marker = "\n━━━━━━━━━━━━━━━━━━━━\n⚠️ Статистика, не гарантия. Paper Trading only!"
+        if marker in msg:
+            return msg.replace(marker, "\n\n" + entry_block + marker)
+        return msg + "\n\n" + entry_block
+    except Exception as e:
+        return msg + f"\n\n🎯 Entry Timing: ошибка расчёта: {e}"
+
+
+def format_auto_digest(results, interval_label, analysis_tf_label):
+    # Более безопасный auto-digest: показывает не только LONG/SHORT, но и можно ли входить сейчас.
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines = [
+        f"⚡ <b>Авто-сигнал v6.0 Entry | {now}</b>",
+        f"📊 Анализ: <b>{analysis_tf_label}</b>  |  Рассылка: <b>{interval_label}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    has_actionable = False
+    for ticker, result in results:
+        tk = TICKERS.get(ticker, {}).get("label", ticker)
+        if isinstance(result, str):
+            lines.append(f"❓ {tk} — ошибка")
+            continue
+        d = result
+        p = d.get("price")
+        s = str(d.get("signal", "WAIT"))
+        c = int(d.get("confidence", 0) or 0)
+        micro = d.get("micro_regime", "")
+        ep = d.get("entry_plan") or {}
+        est = ep.get("status", "NO_SETUP")
+        escore = int(ep.get("score", 0) or 0)
+        rr = _safe_float(ep.get("rr_now"), 0) or _safe_float((d.get("risk_levels") or {}).get("rr_ratio"), 0) or 0
+        if est == "ENTER_NOW":
+            has_actionable = True
+            tag = "✅ ENTRY"
+        elif est == "WAIT_RETEST":
+            tag = "🟡 RETEST"
+        elif est == "WAIT_CONFIRMATION":
+            tag = "🟠 CONFIRM"
+        elif est == "NO_ENTRY":
+            tag = "⛔ NO ENTRY"
+        else:
+            tag = "⏸ WAIT"
+        side = "LONG" if "LONG" in s else ("SHORT" if "SHORT" in s else "WAIT")
+        zone = ""
+        if ep.get("entry_zone_low") and ep.get("entry_zone_high"):
+            zone = f" | zone {fmt_price(ep.get('entry_zone_low'), ticker)}-{fmt_price(ep.get('entry_zone_high'), ticker)}"
+        lines.append(f"<b>{tk}</b> {fmt_price(p, ticker)} → <b>{side}</b> | {tag} E{escore} C{c} RR {rr:.1f}x | {micro}{zone}")
+    if not has_actionable:
+        lines += ["", "📭 Прямо сейчас хороших точек входа нет. Это нормально: лучше пропустить, чем догонять цену."]
+    lines += ["", "⚠️ Сигнал направления ≠ разрешение входить. Смотри EntryScore, RR и зону входа."]
+    return "\n".join(lines)
+
+
+def main_keyboard():
+    # Компактное меню v5.9 + отдельная кнопка для точки входа.
+    return {"inline_keyboard": [
+        [
+            {"text": "🔄 Сигнал", "callback_data": "get_signal"},
+            {"text": "🎯 Точка входа", "callback_data": "entry_point"},
+        ],
+        [
+            {"text": "💰 Цена", "callback_data": "get_price"},
+            {"text": "🌊 Market Flow", "callback_data": "menu_flow"},
+        ],
+        [
+            {"text": "📊 Аналитика", "callback_data": "menu_analytics"},
+            {"text": "📂 Позиции / Риск", "callback_data": "menu_positions"},
+        ],
+        [
+            {"text": "⚙️ Настройки", "callback_data": "menu_settings"},
+            {"text": "📖 Обучение", "callback_data": "menu_learn"},
+        ],
+        [
+            {"text": "😱 Fear & Greed", "callback_data": "get_fg"},
+        ],
+    ]}
+
+
+def fetch_and_send_entry_point(chat_id):
+    iv = user_intervals.get(chat_id, "15m")
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    send(chat_id, f"⏳ Ищу точку входа {TICKERS[ticker]['label']} ({INTERVALS[iv]['label']})...")
+    try:
+        data = full_analyze(ticker, iv)
+        ep = data.get("entry_plan") or build_entry_plan(data, ticker, iv)
+        msg = format_entry_plan(ep, ticker, compact=False)
+        kb_rows = []
+        if ep.get("status") == "ENTER_NOW" and data.get("direction") and data.get("risk_levels"):
+            rl_for_risk = _risk_levels_from_analysis_or_entry(data) if "_risk_levels_from_analysis_or_entry" in globals() else data.get("risk_levels")
+            price_for_risk = _risk_price_from_analysis(data) if "_risk_price_from_analysis" in globals() else data.get("price")
+            decision = build_trade_risk_decision(chat_id, ticker, iv, data["direction"], price_for_risk, rl_for_risk, data)
+            if decision.get("allowed"):
+                kb_rows.append([{"text": f"📂 Открыть {data['direction'].upper()} позицию", "callback_data": f"open_pos_{ticker}_{iv}_{data['direction']}"}])
+            else:
+                msg += "\n\n" + format_trade_risk_decision(decision, compact=True)
+        kb_rows.append([{"text": "🔄 Обновить точку входа", "callback_data": "entry_point"}])
+        kb_rows.append([{"text": "◀️ Главное меню", "callback_data": "back_main"}])
+        send(chat_id, msg, {"inline_keyboard": kb_rows})
+    except Exception as e:
+        import traceback
+        print(f"  [entry] ОШИБКА: {traceback.format_exc()}")
+        send(chat_id, f"❌ Ошибка расчёта точки входа: {e}", main_keyboard())
+
+
+def fetch_and_send_signal(chat_id):
+    iv = user_intervals.get(chat_id, "15m")
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    send(chat_id, f"⏳ Анализирую {TICKERS[ticker]['label']} ({INTERVALS[iv]['label']})...")
+    try:
+        data = full_analyze(ticker, iv)
+        msg = format_msg(data, ticker, iv)
+        ep = data.get("entry_plan") or {}
+        kb_rows = []
+        # Открывать позицию прямо из сигнала разрешаем только если точка входа реально допустима.
+        if ep.get("status") == "ENTER_NOW" and data.get("direction") and data.get("risk_levels"):
+            direction = data["direction"]
+            rl_for_risk = _risk_levels_from_analysis_or_entry(data) if "_risk_levels_from_analysis_or_entry" in globals() else data.get("risk_levels")
+            price_for_risk = _risk_price_from_analysis(data) if "_risk_price_from_analysis" in globals() else data.get("price")
+            decision = build_trade_risk_decision(chat_id, ticker, iv, direction, price_for_risk, rl_for_risk, data)
+            if decision.get("allowed"):
+                kb_rows.append([{"text": f"📂 Открыть {direction.upper()} позицию", "callback_data": f"open_pos_{ticker}_{iv}_{direction}"}])
+            else:
+                msg += "\n\n" + format_trade_risk_decision(decision, compact=True)
+                kb_rows.append([{"text": "🎯 Проверить точку входа", "callback_data": "entry_point"}])
+        else:
+            kb_rows.append([{"text": "🎯 Проверить точку входа", "callback_data": "entry_point"}])
+        kb_rows.append([{"text": "◀️ Главное меню", "callback_data": "back_main"}])
+        send(chat_id, msg, {"inline_keyboard": kb_rows})
+    except Exception as e:
+        import traceback
+        print(f"  [signal] ОШИБКА: {traceback.format_exc()}")
+        send(chat_id, f"❌ Ошибка анализа: {e}", main_keyboard())
+
+
+async def async_handle_update(session, update, sem):
+    # v6.0: отдельная callback-кнопка для точки входа. Остальное отдаём v5.9 router.
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+            if data == "entry_point":
+                await async_answer_callback(session, callback_id, "Entry")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, fetch_and_send_entry_point, chat_id)
+                return
+        await _base_async_handle_update_v59(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v60] error: {e}")
+
+
+
+# ============================================================
+# v6.1 — ALIGNED AUTO SCHEDULER + PER-FUNCTION AUTO JOBS
+# ============================================================
+"""
+Что исправлено:
+  1. Авто-уведомления приходят только на ровной границе выбранного интервала:
+       5m  → HH:00, HH:05, HH:10, HH:15 ...
+       15m → HH:00, HH:15, HH:30, HH:45
+       30m → HH:00, HH:30
+       1h  → HH:00
+  2. Таймфрейм анализа отделён от интервала уведомлений.
+  3. У каждой важной функции теперь свой авто-режим:
+       signals, heatmap, fear_greed, backtest, wfo
+  4. Добавлены TF анализа: 45m, 4h, 1d.
+     45m собирается из трёх 15m свечей, потому что Binance не даёт 45m напрямую.
+"""
+
+# --- Расширяем доступные TF анализа. Не удаляем 1m/30m ради совместимости. ---
+INTERVALS.update({
+    "45m": {"label": "45 минут", "limit": 450},
+    "4h":  {"label": "4 часа",    "limit": 500},
+    "1d":  {"label": "1 день",    "limit": 500},
+})
+
+MTF_HIERARCHY.update({
+    "5m":  ["15m", "1h"],
+    "15m": ["45m", "1h"],
+    "30m": ["1h", "4h"],
+    "45m": ["1h", "4h"],
+    "1h":  ["4h", "1d"],
+    "4h":  ["1d"],
+    "1d":  [],
+})
+
+# Интервалы уведомлений. Это НЕ таймфреймы свечей.
+AUTO_SEND_INTERVALS.update({
+    "4h": {"label": "4 часа", "minutes": 240},
+    "1d": {"label": "1 день", "minutes": 1440},
+})
+
+# Основные TF, которые показываем пользователю в меню.
+AUTO_ANALYSIS_TFS = ["5m", "15m", "30m", "45m", "1h", "4h", "1d"]
+USER_VISIBLE_INTERVALS = ["5m", "15m", "30m", "45m", "1h", "4h", "1d"]
+
+AUTO_TASKS = {
+    "signals": {
+        "label": "🔄 Сигналы",
+        "needs_tf": True,
+        "default_enabled": True,
+        "default_interval": DEFAULT_AUTO_SEND_INTERVAL,
+        "default_tf": DEFAULT_AUTO_TF,
+    },
+    "heatmap": {
+        "label": "🔥 Heatmap",
+        "needs_tf": True,
+        "default_enabled": False,
+        "default_interval": "30m",
+        "default_tf": "30m",
+    },
+    "fear_greed": {
+        "label": "😱 Fear & Greed",
+        "needs_tf": False,
+        "default_enabled": False,
+        "default_interval": "1h",
+        "default_tf": None,
+    },
+    "backtest": {
+        "label": "🧪 Backtest",
+        "needs_tf": True,
+        "default_enabled": False,
+        "default_interval": "1h",
+        "default_tf": "1h",
+    },
+    "wfo": {
+        "label": "⚖️ Walk-Forward",
+        "needs_tf": True,
+        "default_enabled": False,
+        "default_interval": "4h",
+        "default_tf": "1h",
+    },
+}
+
+# chat_id -> task_key -> settings
+user_auto_tasks = {}
+_auto_task_last_slot = {}
+
+
+def _get_auto_task_settings(chat_id, task_key):
+    """Возвращает настройки задачи и создаёт дефолт, если их ещё нет."""
+    if task_key not in AUTO_TASKS:
+        raise KeyError(f"Unknown auto task: {task_key}")
+    user_auto_tasks.setdefault(chat_id, {})
+    if task_key not in user_auto_tasks[chat_id]:
+        meta = AUTO_TASKS[task_key]
+        user_auto_tasks[chat_id][task_key] = {
+            "enabled": bool(meta["default_enabled"]),
+            "send_interval": meta["default_interval"],
+            "tf": meta["default_tf"],
+        }
+    return user_auto_tasks[chat_id][task_key]
+
+
+def _ensure_auto_task_defaults(chat_id):
+    for task_key in AUTO_TASKS:
+        _get_auto_task_settings(chat_id, task_key)
+    # Синхронизация со старыми настройками, чтобы старые кнопки не ломались.
+    sig = _get_auto_task_settings(chat_id, "signals")
+    if chat_id in user_auto_send_interval:
+        sig["send_interval"] = user_auto_send_interval[chat_id]
+    else:
+        user_auto_send_interval[chat_id] = sig["send_interval"]
+    if chat_id in user_auto_tf:
+        sig["tf"] = user_auto_tf[chat_id]
+    else:
+        user_auto_tf[chat_id] = sig["tf"] or DEFAULT_AUTO_TF
+
+
+def _minutes_since_utc_midnight(dt):
+    return dt.hour * 60 + dt.minute
+
+
+def _slot_id(dt, interval_key):
+    minutes = AUTO_SEND_INTERVALS[interval_key]["minutes"]
+    return _minutes_since_utc_midnight(dt) // minutes
+
+
+def _is_aligned_time(dt, interval_key):
+    """True только на границе интервала: 10:05/10:10 для 5m, 10:30/11:00 для 30m."""
+    minutes = AUTO_SEND_INTERVALS[interval_key]["minutes"]
+    total = _minutes_since_utc_midnight(dt)
+    return (total % minutes) == 0
+
+
+def _seconds_until_next_minute():
+    now = datetime.now(timezone.utc)
+    return max(0.1, 60 - now.second - now.microsecond / 1_000_000 + 0.25)
+
+
+def _task_status_line(chat_id, task_key):
+    st = _get_auto_task_settings(chat_id, task_key)
+    meta = AUTO_TASKS[task_key]
+    enabled = "✅ ON" if st.get("enabled") else "⛔ OFF"
+    iv = AUTO_SEND_INTERVALS[st["send_interval"]]["label"]
+    if meta["needs_tf"]:
+        tf = INTERVALS.get(st.get("tf") or DEFAULT_AUTO_TF, INTERVALS[DEFAULT_AUTO_TF])["label"]
+        return f"{meta['label']}: <b>{enabled}</b> | ⏰ {iv} | 📊 TF {tf}"
+    return f"{meta['label']}: <b>{enabled}</b> | ⏰ {iv}"
+
+
+def auto_settings_keyboard(chat_id):
+    _ensure_auto_task_defaults(chat_id)
+    rows = []
+    for task_key, meta in AUTO_TASKS.items():
+        st = _get_auto_task_settings(chat_id, task_key)
+        state = "ON" if st.get("enabled") else "OFF"
+        iv = AUTO_SEND_INTERVALS[st["send_interval"]]["label"]
+        if meta["needs_tf"]:
+            tf = INTERVALS.get(st.get("tf") or DEFAULT_AUTO_TF, INTERVALS[DEFAULT_AUTO_TF])["label"]
+            text = f"{meta['label']} | {state} | {iv} | TF {tf}"
+        else:
+            text = f"{meta['label']} | {state} | {iv}"
+        rows.append([{"text": text, "callback_data": f"auto_task_{task_key}"}])
+    rows += [
+        [{"text": "◀️ Назад", "callback_data": "back_main"}],
+    ]
+    return {"inline_keyboard": rows}
+
+
+def auto_task_keyboard(chat_id, task_key):
+    st = _get_auto_task_settings(chat_id, task_key)
+    meta = AUTO_TASKS[task_key]
+    toggle_text = "⛔ Выключить" if st.get("enabled") else "✅ Включить"
+    rows = [[{"text": toggle_text, "callback_data": f"auto_tog_{task_key}"}]]
+    rows.append([{"text": f"⏰ Интервал: {AUTO_SEND_INTERVALS[st['send_interval']]['label']}",
+                  "callback_data": f"auto_choose_iv_{task_key}"}])
+    if meta["needs_tf"]:
+        tf_key = st.get("tf") or DEFAULT_AUTO_TF
+        rows.append([{"text": f"📊 TF анализа: {INTERVALS[tf_key]['label']}",
+                      "callback_data": f"auto_choose_tf_{task_key}"}])
+    rows.append([{"text": "◀️ Назад к авто-настройкам", "callback_data": "auto_settings"}])
+    return {"inline_keyboard": rows}
+
+
+def auto_task_interval_keyboard(task_key):
+    keys = ["5m", "15m", "30m", "1h", "4h", "1d"]
+    rows = []
+    for i in range(0, len(keys), 3):
+        rows.append([
+            {"text": AUTO_SEND_INTERVALS[k]["label"], "callback_data": f"auto_set_iv_{task_key}_{k}"}
+            for k in keys[i:i+3]
+        ])
+    rows.append([{"text": "◀️ Назад", "callback_data": f"auto_task_{task_key}"}])
+    return {"inline_keyboard": rows}
+
+
+def auto_task_tf_keyboard(task_key):
+    keys = USER_VISIBLE_INTERVALS
+    rows = []
+    for i in range(0, len(keys), 3):
+        rows.append([
+            {"text": INTERVALS[k]["label"], "callback_data": f"auto_set_tf_{task_key}_{k}"}
+            for k in keys[i:i+3]
+        ])
+    rows.append([{"text": "◀️ Назад", "callback_data": f"auto_task_{task_key}"}])
+    return {"inline_keyboard": rows}
+
+
+def auto_settings_text(chat_id):
+    _ensure_auto_task_defaults(chat_id)
+    status = "🔔 включены" if chat_id in auto_chat_ids else "🔕 выключены"
+    lines = [
+        "⚙️ <b>Авто-уведомления v6.1</b>",
+        "",
+        f"Общий статус: <b>{status}</b>",
+        "Время: <b>UTC, только ровные границы интервала</b>",
+        "",
+    ]
+    lines.extend(_task_status_line(chat_id, k) for k in AUTO_TASKS)
+    lines += [
+        "",
+        "Пример:",
+        "• 5 мин → 10:05, 10:10, 10:15",
+        "• 15 мин → 10:15, 10:30, 10:45",
+        "• 30 мин → 10:30, 11:00",
+        "• 1 час → 10:00, 11:00, 12:00",
+    ]
+    return "\n".join(lines)
+
+
+# --- 45m OHLCV support -----------------------------------------------------
+_base_binance_ohlcv_v61 = _binance_ohlcv
+
+
+def _aggregate_15m_to_45m(raw, limit):
+    """raw Binance klines without unfinished candle -> aggregated 45m candles."""
+    if len(raw) < 3:
+        raise ValueError("Not enough 15m candles for 45m aggregation")
+    remainder = len(raw) % 3
+    if remainder:
+        raw = raw[remainder:]
+    chunks = [raw[i:i+3] for i in range(0, len(raw), 3)]
+    chunks = chunks[-limit:]
+    opens, highs, lows, closes, volumes = [], [], [], [], []
+    for ch in chunks:
+        opens.append(float(ch[0][1]))
+        highs.append(max(float(x[2]) for x in ch))
+        lows.append(min(float(x[3]) for x in ch))
+        closes.append(float(ch[-1][4]))
+        volumes.append(sum(float(x[5]) for x in ch))
+    return opens, highs, lows, closes, volumes
+
+
+def _binance_ohlcv(symbol, interval):
+    if interval != "45m":
+        return _base_binance_ohlcv_v61(symbol, interval)
+    if symbol not in TICKERS:
+        raise ValueError(f"Unknown ticker: {symbol}")
+    limit = int(INTERVALS["45m"].get("limit", 450))
+    # Binance Futures max limit = 1500. 1500 x 15m gives up to 499 closed 45m candles.
+    req_limit = min(1500, limit * 3 + 3)
+    r = _session.get(
+        "https://fapi.binance.com/fapi/v1/klines",
+        params={"symbol": symbol, "interval": "15m", "limit": req_limit},
+        timeout=20,
+    )
+    r.raise_for_status()
+    raw = r.json()
+    if not isinstance(raw, list):
+        raise ValueError(f"Binance error: {raw}")
+    raw = raw[:-1]  # убираем незакрытую 15m свечу
+    return _aggregate_15m_to_45m(raw, min(limit, 333))
+
+
+def get_ohlcv(ticker, interval):
+    return _binance_ohlcv(ticker, interval)
+
+
+def interval_keyboard():
+    keys = USER_VISIBLE_INTERVALS
+    rows = []
+    for i in range(0, len(keys), 3):
+        rows.append([
+            {"text": INTERVALS[k]["label"], "callback_data": f"interval_{k}"}
+            for k in keys[i:i+3]
+        ])
+    rows.append([{"text": "◀️ Назад", "callback_data": "back_main"}])
+    return {"inline_keyboard": rows}
+
+
+def auto_tf_keyboard():
+    rows = []
+    for i in range(0, len(AUTO_ANALYSIS_TFS), 3):
+        rows.append([
+            {"text": INTERVALS[k]["label"], "callback_data": f"auto_tf_{k}"}
+            for k in AUTO_ANALYSIS_TFS[i:i+3]
+        ])
+    rows.append([{"text": "◀️ Назад", "callback_data": "auto_settings"}])
+    return {"inline_keyboard": rows}
+
+
+def auto_send_interval_keyboard():
+    keys = ["5m", "15m", "30m", "1h", "4h", "1d"]
+    rows = []
+    for i in range(0, len(keys), 3):
+        rows.append([
+            {"text": AUTO_SEND_INTERVALS[k]["label"], "callback_data": f"auto_send_iv_{k}"}
+            for k in keys[i:i+3]
+        ])
+    rows.append([{"text": "◀️ Назад", "callback_data": "auto_settings"}])
+    return {"inline_keyboard": rows}
+
+
+def build_auto_signals_message(chat_id):
+    """Единый дайджест сигналов для авто-уведомления signals."""
+    _ensure_auto_task_defaults(chat_id)
+    st = _get_auto_task_settings(chat_id, "signals")
+    tf = st.get("tf") or user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
+    si = st.get("send_interval") or user_auto_send_interval.get(chat_id, DEFAULT_AUTO_SEND_INTERVAL)
+    results = []
+    signals_cache = {}
+
+    for ticker in AUTO_CRYPTO_TICKERS:
+        try:
+            data = full_analyze(ticker, tf)
+            score = len(data.get("bull_args", [])) - len(data.get("bear_args", []))
+            signals_cache[ticker] = {"score": score, "signal": data.get("signal", "WAIT"), "data": data}
+        except Exception as e:
+            print(f"  [auto-v61] signal error {ticker} {tf}: {e}")
+            signals_cache[ticker] = None
+
+    suppressed = set()
+    for t1, t2 in CORR_PAIRS:
+        if signals_cache.get(t1) is None or signals_cache.get(t2) is None:
+            continue
+        try:
+            _, _, _, c1, _ = get_ohlcv(t1, tf)
+            _, _, _, c2, _ = get_ohlcv(t2, tf)
+            corr = calc_rolling_correlation(c1, c2)
+            if corr and abs(corr) > CORR_THRESHOLD:
+                sc1 = abs(signals_cache[t1]["score"])
+                sc2 = abs(signals_cache[t2]["score"])
+                suppressed.add(t2 if sc1 >= sc2 else t1)
+        except Exception:
+            pass
+
+    cooldown_seconds = AUTO_SEND_INTERVALS[si]["minutes"] * 60
+    group_id = f"auto_v61_{chat_id}_{si}_{tf}"
+    for ticker in AUTO_CRYPTO_TICKERS:
+        sc = signals_cache.get(ticker)
+        if sc is None:
+            results.append((ticker, "Ошибка"))
+            continue
+        d = sc["data"]
+        sig = str(sc["signal"])
+        # Не спамим одинаковым actionable сигналом внутри того же интервала.
+        if ("LONG" in sig or "SHORT" in sig) and not should_send_signal(ticker, tf, sig, cooldown_seconds, group_id):
+            d = d.copy()
+            d["signal"] = "⏸ дубль"
+            d["prob"] = 0
+        if ticker in suppressed:
+            d = d.copy()
+            d["signal"] = "⏸ подавлен корреляцией"
+            d["prob"] = 0
+        results.append((ticker, d))
+
+    def _sort_key(item):
+        _, r = item
+        if isinstance(r, str):
+            return 4
+        ep = r.get("entry_plan") or {}
+        if ep.get("status") == "ENTER_NOW":
+            return 0
+        s = str(r.get("signal", ""))
+        if "LONG" in s or "SHORT" in s:
+            return 1
+        if "Вероятный" in s:
+            return 2
+        return 3
+
+    results.sort(key=_sort_key)
+    return format_auto_digest(results, AUTO_SEND_INTERVALS[si]["label"], INTERVALS[tf]["label"])
+
+
+def build_auto_task_message(chat_id, task_key):
+    _ensure_auto_task_defaults(chat_id)
+    st = _get_auto_task_settings(chat_id, task_key)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    tf = st.get("tf") or user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    if task_key == "signals":
+        return build_auto_signals_message(chat_id)
+
+    if task_key == "heatmap":
+        return format_market_heatmap(chat_id)
+
+    if task_key == "fear_greed":
+        return "⏰ <b>Авто Fear & Greed</b> | " + now + "\n\n" + format_fear_greed_msg()
+
+    if task_key == "backtest":
+        stats, err = run_backtest(ticker, tf)
+        if err:
+            return f"❌ <b>Авто Backtest</b> | {now}\n{err}"
+        return "⏰ <b>Авто Backtest</b> | " + now + "\n\n" + format_backtest(stats, ticker, tf)
+
+    if task_key == "wfo":
+        weights, report = run_walk_forward_optimization(ticker, tf, 200)
+        if not weights:
+            return f"❌ <b>Авто Walk-Forward</b> | {now}\n{report}"
+        return "⏰ <b>Авто Walk-Forward</b> | " + now + "\n\n" + report
+
+    return f"❌ Неизвестная авто-функция: {task_key}"
+
+
+def format_main_status(chat_id):
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    iv = user_intervals.get(chat_id, "15m")
+    sub_status = "🔔 включены" if chat_id in auto_chat_ids else "🔕 отключены"
+    n_pos = len(get_user_positions(chat_id))
+    _ensure_auto_task_defaults(chat_id)
+    lines = [
+        "🏠 <b>Главное меню</b>",
+        "",
+        f"Ручной анализ: <b>{TICKERS[ticker]['label']}</b> | <b>{INTERVALS[iv]['label']}</b>",
+        f"Авто: <b>{sub_status}</b>",
+        f"Позиции: <b>{n_pos}</b>",
+        "",
+        "<b>Авто-задачи:</b>",
+    ]
+    lines.extend(_task_status_line(chat_id, k) for k in AUTO_TASKS)
+    return "\n".join(lines)
+
+
+# --- Sync fallback loop: выровнен по UTC и по задачам ----------------------
+def auto_loop():
+    print("  [thread] auto_loop v6.1 запущен: aligned UTC + per-task")
+    while True:
+        time.sleep(_seconds_until_next_minute())
+        now = datetime.now(timezone.utc)
+        if not auto_chat_ids:
+            continue
+        if now.second > 3:
+            continue
+        for chat_id in list(auto_chat_ids):
+            _ensure_auto_task_defaults(chat_id)
+            for task_key in AUTO_TASKS:
+                st = _get_auto_task_settings(chat_id, task_key)
+                if not st.get("enabled"):
+                    continue
+                send_iv = st.get("send_interval", DEFAULT_AUTO_SEND_INTERVAL)
+                if not _is_aligned_time(now, send_iv):
+                    continue
+                slot = _slot_id(now, send_iv)
+                last_key = f"{chat_id}:{task_key}:{send_iv}:{now.date().isoformat()}"
+                if _auto_task_last_slot.get(last_key) == slot:
+                    continue
+                _auto_task_last_slot[last_key] = slot
+                try:
+                    msg = build_auto_task_message(chat_id, task_key)
+                    send(chat_id, msg, main_keyboard())
+                except Exception as e:
+                    send(chat_id, f"❌ Ошибка авто-задачи {AUTO_TASKS[task_key]['label']}: {e}", main_keyboard())
+
+
+# --- Async loop: основной runtime, тоже выровнен по UTC --------------------
+async def async_auto_signal_loop(session):
+    print("  [async] auto loop v6.1 started: aligned UTC + per-task")
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next_minute())
+            now = datetime.now(timezone.utc)
+            if not auto_chat_ids:
+                continue
+            if now.second > 3:
+                continue
+
+            for chat_id in list(auto_chat_ids):
+                _ensure_auto_task_defaults(chat_id)
+                for task_key in AUTO_TASKS:
+                    st = _get_auto_task_settings(chat_id, task_key)
+                    if not st.get("enabled"):
+                        continue
+                    send_iv = st.get("send_interval", DEFAULT_AUTO_SEND_INTERVAL)
+                    if not _is_aligned_time(now, send_iv):
+                        continue
+                    slot = _slot_id(now, send_iv)
+                    last_key = f"{chat_id}:{task_key}:{send_iv}:{now.date().isoformat()}"
+                    if _auto_task_last_slot.get(last_key) == slot:
+                        continue
+                    _auto_task_last_slot[last_key] = slot
+                    try:
+                        msg = await asyncio.to_thread(build_auto_task_message, chat_id, task_key)
+                        await async_send(session, chat_id, msg, main_keyboard())
+                    except Exception as e:
+                        await async_send(session, chat_id, f"❌ Ошибка авто-задачи {AUTO_TASKS[task_key]['label']}: {e}", main_keyboard())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  [async_auto_v61] error: {e}")
+            await asyncio.sleep(10)
+
+
+_base_async_handle_update_v60_for_v61 = async_handle_update
+
+
+async def async_handle_update(session, update, sem):
+    """v6.1 router: настройки авто-задач + fallback на v6.0/v5.9."""
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+            seen_chat_ids.add(chat_id)
+            _ensure_auto_task_defaults(chat_id)
+
+            if data == "auto_settings":
+                await async_answer_callback(session, callback_id, "Авто")
+                await async_send(session, chat_id, auto_settings_text(chat_id), auto_settings_keyboard(chat_id))
+                return
+
+            if data.startswith("auto_task_"):
+                task_key = data.replace("auto_task_", "", 1)
+                if task_key in AUTO_TASKS:
+                    await async_answer_callback(session, callback_id, AUTO_TASKS[task_key]["label"])
+                    await async_send(session, chat_id,
+                                     f"⚙️ <b>{AUTO_TASKS[task_key]['label']}</b>\n\n" + _task_status_line(chat_id, task_key),
+                                     auto_task_keyboard(chat_id, task_key))
+                    return
+
+            if data.startswith("auto_tog_"):
+                task_key = data.replace("auto_tog_", "", 1)
+                if task_key in AUTO_TASKS:
+                    st = _get_auto_task_settings(chat_id, task_key)
+                    st["enabled"] = not bool(st.get("enabled"))
+                    await async_answer_callback(session, callback_id, "ON" if st["enabled"] else "OFF")
+                    await async_send(session, chat_id,
+                                     f"⚙️ <b>{AUTO_TASKS[task_key]['label']}</b>\n\n" + _task_status_line(chat_id, task_key),
+                                     auto_task_keyboard(chat_id, task_key))
+                    return
+
+            if data.startswith("auto_choose_iv_"):
+                task_key = data.replace("auto_choose_iv_", "", 1)
+                if task_key in AUTO_TASKS:
+                    await async_answer_callback(session, callback_id, "Интервал")
+                    await async_send(session, chat_id,
+                                     f"⏰ <b>Интервал уведомлений для {AUTO_TASKS[task_key]['label']}</b>\n\nЭто частота уведомлений, не таймфрейм свечей.",
+                                     auto_task_interval_keyboard(task_key))
+                    return
+
+            if data.startswith("auto_choose_tf_"):
+                task_key = data.replace("auto_choose_tf_", "", 1)
+                if task_key in AUTO_TASKS:
+                    await async_answer_callback(session, callback_id, "TF")
+                    await async_send(session, chat_id,
+                                     f"📊 <b>Таймфрейм анализа для {AUTO_TASKS[task_key]['label']}</b>",
+                                     auto_task_tf_keyboard(task_key))
+                    return
+
+            if data.startswith("auto_set_iv_"):
+                rest = data.replace("auto_set_iv_", "", 1)
+                task_key, iv_key = rest.rsplit("_", 1)
+                if task_key in AUTO_TASKS and iv_key in AUTO_SEND_INTERVALS:
+                    st = _get_auto_task_settings(chat_id, task_key)
+                    st["send_interval"] = iv_key
+                    if task_key == "signals":
+                        user_auto_send_interval[chat_id] = iv_key
+                    # Сброс слотов, чтобы после изменения не прилетело мгновенно в середине старого цикла.
+                    for k in list(_auto_task_last_slot.keys()):
+                        if k.startswith(f"{chat_id}:{task_key}:"):
+                            _auto_task_last_slot.pop(k, None)
+                    await async_answer_callback(session, callback_id, AUTO_SEND_INTERVALS[iv_key]["label"])
+                    await async_send(session, chat_id,
+                                     f"✅ Интервал обновлён.\n\n" + _task_status_line(chat_id, task_key),
+                                     auto_task_keyboard(chat_id, task_key))
+                    return
+
+            if data.startswith("auto_set_tf_"):
+                rest = data.replace("auto_set_tf_", "", 1)
+                task_key, tf_key = rest.rsplit("_", 1)
+                if task_key in AUTO_TASKS and tf_key in INTERVALS:
+                    st = _get_auto_task_settings(chat_id, task_key)
+                    st["tf"] = tf_key
+                    if task_key == "signals":
+                        user_auto_tf[chat_id] = tf_key
+                    await async_answer_callback(session, callback_id, INTERVALS[tf_key]["label"])
+                    await async_send(session, chat_id,
+                                     f"✅ TF анализа обновлён.\n\n" + _task_status_line(chat_id, task_key),
+                                     auto_task_keyboard(chat_id, task_key))
+                    return
+
+            # Старые callbacks оставляем рабочими, но синхронизируем с signals.
+            if data.startswith("auto_send_iv_"):
+                iv_key = data.replace("auto_send_iv_", "", 1)
+                if iv_key in AUTO_SEND_INTERVALS:
+                    user_auto_send_interval[chat_id] = iv_key
+                    _get_auto_task_settings(chat_id, "signals")["send_interval"] = iv_key
+                    await async_answer_callback(session, callback_id, f"✅ {AUTO_SEND_INTERVALS[iv_key]['label']}")
+                    await async_send(session, chat_id, auto_settings_text(chat_id), auto_settings_keyboard(chat_id))
+                    return
+
+            if data.startswith("auto_tf_"):
+                tf_key = data.replace("auto_tf_", "", 1)
+                if tf_key in INTERVALS:
+                    user_auto_tf[chat_id] = tf_key
+                    _get_auto_task_settings(chat_id, "signals")["tf"] = tf_key
+                    await async_answer_callback(session, callback_id, f"✅ {INTERVALS[tf_key]['label']}")
+                    await async_send(session, chat_id, auto_settings_text(chat_id), auto_settings_keyboard(chat_id))
+                    return
+
+            if data == "toggle_auto":
+                if chat_id in auto_chat_ids:
+                    auto_chat_ids.discard(chat_id)
+                    await async_answer_callback(session, callback_id, "Авто OFF")
+                    await async_send(session, chat_id, "🔕 <b>Авто-уведомления отключены.</b>", main_keyboard())
+                else:
+                    auto_chat_ids.add(chat_id)
+                    await async_answer_callback(session, callback_id, "Авто ON")
+                    await async_send(session, chat_id, "🔔 <b>Авто-уведомления включены.</b>\n\n" + auto_settings_text(chat_id), auto_settings_keyboard(chat_id))
+                return
+
+        await _base_async_handle_update_v60_for_v61(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v61] error: {e}")
+
+
+# ============================================================
+# v6.2 — FUTURES CONTEXT LAYER
+# ============================================================
+# This layer adds Binance USD-M futures-specific context. It is risk context,
+# not a standalone buy/sell signal.
+FUTURES_CONTEXT_TTL = int(os.getenv("FUTURES_CONTEXT_TTL", "60"))
+FUTURES_FUNDING_WARN_ABS = 0.0003      # 0.03% per 8h
+FUTURES_BASIS_WARN_ABS_PCT = 0.15      # mark vs index
+FUTURES_NEXT_FUNDING_WARN_MIN = 45
+_futures_context_cache = {}
+
+
+def _fapi_get(path, params=None, timeout=10):
+    base = globals().get("BINANCE_FUTURES_REST", "https://fapi.binance.com")
+    url = base.rstrip("/") + path
+    r = _session.get(url, params=params or {}, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and data.get("code") not in (None, 0):
+        raise ValueError(f"Binance Futures error: {data}")
+    return data
+
+
+def _fmt_pct(value, decimals=3):
+    try:
+        return f"{float(value):+.{decimals}f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_utc_from_ms(ms):
+    try:
+        if not ms:
+            return "—"
+        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return "—"
+
+
+def _minutes_until_ms(ms):
+    try:
+        return (int(ms) / 1000 - time.time()) / 60
+    except Exception:
+        return None
+
+
+def get_futures_mark_price(ticker):
+    data = _fapi_get("/fapi/v1/premiumIndex", {"symbol": ticker}, timeout=10)
+    return {
+        "mark_price": _safe_float(data.get("markPrice")),
+        "index_price": _safe_float(data.get("indexPrice")),
+        "estimated_settle_price": _safe_float(data.get("estimatedSettlePrice")),
+        "last_funding_rate": _safe_float(data.get("lastFundingRate")),
+        "interest_rate": _safe_float(data.get("interestRate")),
+        "next_funding_time": data.get("nextFundingTime"),
+        "time": data.get("time"),
+    }
+
+
+def get_futures_open_interest(ticker):
+    data = _fapi_get("/fapi/v1/openInterest", {"symbol": ticker}, timeout=10)
+    return {
+        "open_interest": _safe_float(data.get("openInterest")),
+        "time": data.get("time"),
+    }
+
+
+def get_futures_24h_stats(ticker):
+    data = _fapi_get("/fapi/v1/ticker/24hr", {"symbol": ticker}, timeout=10)
+    return {
+        "last_price": _safe_float(data.get("lastPrice")),
+        "price_change_pct_24h": _safe_float(data.get("priceChangePercent")),
+        "high_price_24h": _safe_float(data.get("highPrice")),
+        "low_price_24h": _safe_float(data.get("lowPrice")),
+        "volume_24h_base": _safe_float(data.get("volume")),
+        "quote_volume_24h": _safe_float(data.get("quoteVolume")),
+        "weighted_avg_price_24h": _safe_float(data.get("weightedAvgPrice")),
+    }
+
+
+def get_futures_funding_history(ticker, limit=8):
+    data = _fapi_get("/fapi/v1/fundingRate", {"symbol": ticker, "limit": int(limit)}, timeout=10)
+    if not isinstance(data, list):
+        return []
+    rows = []
+    for row in data:
+        rows.append({
+            "funding_time": row.get("fundingTime"),
+            "funding_rate": _safe_float(row.get("fundingRate")),
+            "mark_price": _safe_float(row.get("markPrice")),
+        })
+    return rows
+
+
+def build_futures_context(ticker, reference_price=None, force_refresh=False):
+    now_ts = time.time()
+    cached = _futures_context_cache.get(ticker)
+    if cached and not force_refresh and now_ts - cached.get("ts", 0) < FUTURES_CONTEXT_TTL:
+        return cached["data"]
+
+    ctx = {
+        "ticker": ticker,
+        "source": "binance_usdm_futures",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "warnings": [],
+        "errors": [],
+    }
+
+    try:
+        ctx.update(get_futures_mark_price(ticker))
+    except Exception as e:
+        ctx["errors"].append(f"mark/funding: {e}")
+
+    try:
+        ctx.update(get_futures_24h_stats(ticker))
+    except Exception as e:
+        ctx["errors"].append(f"24h stats: {e}")
+
+    try:
+        oi = get_futures_open_interest(ticker)
+        ctx.update(oi)
+    except Exception as e:
+        ctx["errors"].append(f"open interest: {e}")
+
+    try:
+        history = get_futures_funding_history(ticker, limit=8)
+        ctx["funding_history"] = history
+        rates = [x.get("funding_rate") for x in history if x.get("funding_rate") is not None]
+        if rates:
+            ctx["funding_avg_8"] = sum(rates) / len(rates)
+            ctx["funding_positive_count_8"] = sum(1 for x in rates if x > 0)
+            ctx["funding_negative_count_8"] = sum(1 for x in rates if x < 0)
+    except Exception as e:
+        ctx["errors"].append(f"funding history: {e}")
+
+    try:
+        if "ORDERFLOW" in globals() and ORDERFLOW is not None:
+            snap = ORDERFLOW.snapshot(ticker)
+            ctx["liquidation_window_sec"] = ORDERFLOW_WINDOW_SEC
+            # Binance forceOrder BUY means short liquidation; SELL means long liquidation.
+            ctx["short_liquidations_usdt_recent"] = _safe_float(snap.get("liquidation_buy_usd"), 0) or 0
+            ctx["long_liquidations_usdt_recent"] = _safe_float(snap.get("liquidation_sell_usd"), 0) or 0
+            ctx["liquidation_total_usdt_recent"] = _safe_float(snap.get("liquidation_total_usd"), 0) or 0
+    except Exception as e:
+        ctx["errors"].append(f"liquidations: {e}")
+
+    mark = _safe_float(ctx.get("mark_price"))
+    index = _safe_float(ctx.get("index_price"))
+    last_price = _safe_float(ctx.get("last_price"))
+    ref = _safe_float(reference_price)
+    oi_value = _safe_float(ctx.get("open_interest"))
+    funding = _safe_float(ctx.get("last_funding_rate"))
+
+    if mark and index:
+        ctx["basis_pct"] = (mark - index) / index * 100
+    if mark and ref:
+        ctx["mark_vs_signal_close_pct"] = (mark - ref) / ref * 100
+    if last_price and mark:
+        ctx["last_vs_mark_pct"] = (last_price - mark) / mark * 100
+    if oi_value and mark:
+        ctx["open_interest_usdt"] = oi_value * mark
+    if funding is not None:
+        ctx["funding_rate_pct"] = funding * 100
+        ctx["funding_annualized_pct"] = funding * 3 * 365 * 100
+        if abs(funding) >= FUTURES_FUNDING_WARN_ABS:
+            side = "longs pay shorts" if funding > 0 else "shorts pay longs"
+            ctx["warnings"].append(f"funding {funding*100:+.3f}%/8h: {side}")
+    basis_pct = _safe_float(ctx.get("basis_pct"))
+    if basis_pct is not None and abs(basis_pct) >= FUTURES_BASIS_WARN_ABS_PCT:
+        ctx["warnings"].append(f"mark/index basis {basis_pct:+.2f}%")
+    mins = _minutes_until_ms(ctx.get("next_funding_time"))
+    if mins is not None:
+        ctx["minutes_to_next_funding"] = round(mins, 1)
+        if 0 <= mins <= FUTURES_NEXT_FUNDING_WARN_MIN:
+            ctx["warnings"].append(f"next funding in {mins:.0f} min")
+
+    _futures_context_cache[ticker] = {"ts": now_ts, "data": ctx}
+    return ctx
+
+
+def _fmt_usdt_notional(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    av = abs(v)
+    if av >= 1_000_000_000:
+        return f"${v/1_000_000_000:.2f}B"
+    if av >= 1_000_000:
+        return f"${v/1_000_000:.2f}M"
+    if av >= 1_000:
+        return f"${v/1_000:.2f}K"
+    return f"${v:.2f}"
+
+
+def format_futures_context(ctx, ticker):
+    if not ctx:
+        return ""
+    funding_pct = ctx.get("funding_rate_pct")
+    funding_side = "—"
+    if funding_pct is not None:
+        funding_side = "longs pay shorts" if funding_pct > 0 else ("shorts pay longs" if funding_pct < 0 else "neutral")
+    lines = [
+        "📡 <b>Futures Context</b>",
+        f"Mark: <b>{fmt_price(ctx.get('mark_price'), ticker)}</b> | Index: <b>{fmt_price(ctx.get('index_price'), ticker)}</b> | Basis: <b>{_fmt_pct(ctx.get('basis_pct'), 2)}</b>",
+        f"Funding: <b>{_fmt_pct(funding_pct, 4)}</b> / 8h ({funding_side}) | Next: <b>{_fmt_utc_from_ms(ctx.get('next_funding_time'))}</b>",
+        f"Open Interest: <b>{_fmt_usdt_notional(ctx.get('open_interest_usdt'))}</b> | 24h futures volume: <b>{_fmt_usdt_notional(ctx.get('quote_volume_24h'))}</b>",
+        f"Recent liquidations ({int((ctx.get('liquidation_window_sec') or ORDERFLOW_WINDOW_SEC) / 60)}m): short-liq <b>{_fmt_usdt_notional(ctx.get('short_liquidations_usdt_recent'))}</b> | long-liq <b>{_fmt_usdt_notional(ctx.get('long_liquidations_usdt_recent'))}</b>",
+        f"24h futures change: <b>{_fmt_pct(ctx.get('price_change_pct_24h'), 2)}</b> | Last/Mark: <b>{_fmt_pct(ctx.get('last_vs_mark_pct'), 3)}</b>",
+    ]
+    if ctx.get("warnings"):
+        lines.append("⚠️ " + " | ".join(ctx.get("warnings")[:3]))
+    if ctx.get("errors"):
+        lines.append("ℹ️ Futures data partial: " + " | ".join(ctx.get("errors")[:2]))
+    lines.append("📌 Funding/OI are context, not a standalone entry signal.")
+    return "\n".join(lines)
+
+
+_base_full_analyze_v61 = full_analyze
+_base_format_msg_v61 = format_msg
+_base_format_auto_digest_v61 = format_auto_digest
+
+
+def full_analyze(ticker, interval):
+    data = _base_full_analyze_v61(ticker, interval)
+    try:
+        data["futures_context"] = build_futures_context(ticker, data.get("price"))
+    except Exception as e:
+        data["futures_context"] = {"ticker": ticker, "errors": [str(e)], "warnings": []}
+    return data
+
+
+def _insert_before_risk_footer(msg, block):
+    if not block:
+        return msg
+    marker = "\n━━━━━━━━━━━━━━━━━━━━\n⚠️"
+    if marker in msg:
+        return msg.replace(marker, "\n\n" + block + marker, 1)
+    return msg + "\n\n" + block
+
+
+def format_msg(data, ticker, interval):
+    msg = _base_format_msg_v61(data, ticker, interval)
+    try:
+        block = format_futures_context(data.get("futures_context"), ticker)
+        return _insert_before_risk_footer(msg, block)
+    except Exception as e:
+        return msg + f"\n\n📡 Futures Context: ошибка расчёта: {e}"
+
+
+def format_auto_digest(results, interval_label, analysis_tf_label):
+    msg = _base_format_auto_digest_v61(results, interval_label, analysis_tf_label)
+    rows = []
+    for ticker, result in results:
+        if isinstance(result, str):
+            continue
+        ctx = result.get("futures_context") or {}
+        warnings = ctx.get("warnings") or []
+        if warnings:
+            rows.append(f"{TICKERS.get(ticker, {}).get('label', ticker)}: {warnings[0]}")
+    if rows:
+        msg += "\n\n📡 <b>Futures risk notes:</b>\n" + "\n".join(rows[:4])
+    return msg
+
+# ============================================================
+# v6.5 — RISK MANAGER / DEPOSIT PROTECTION
+# ============================================================
+RISK_STATE_FILE = "risk_state.json"
+RISK_MAX_SINGLE_TRADE_PCT = 1.5
+RISK_WARN_SINGLE_TRADE_PCT = 1.0
+RISK_MAX_PORTFOLIO_RISK_PCT = 5.0
+RISK_WARN_PORTFOLIO_RISK_PCT = 3.5
+RISK_MAX_OPEN_POSITIONS = 4
+RISK_MAX_DAILY_NEW_POSITIONS = 5
+RISK_MAX_DAILY_REALIZED_LOSS_PCT = 3.0
+RISK_MAX_LEVERAGE = 20
+RISK_WARN_LEVERAGE = 10
+RISK_MAX_NOTIONAL_BALANCE_MULT = 3.0
+RISK_WARN_NOTIONAL_BALANCE_MULT = 2.0
+RISK_LIQ_BUFFER_MULT = 1.35
+RISK_CORR_BLOCK_PORTFOLIO_PCT = 3.5
+_risk_state_lock = threading.RLock()
+
+
+def _load_risk_state():
+    if not os.path.exists(RISK_STATE_FILE):
+        return {"events": []}
+    try:
+        with open(RISK_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"events": []}
+        data.setdefault("events", [])
+        return data
+    except Exception:
+        return {"events": []}
+
+
+def _save_risk_state(state):
+    try:
+        events = list(state.get("events", []))[-5000:]
+        with open(RISK_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"events": events}, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [risk] save error: {e}")
+
+
+def record_risk_event(chat_id, event_type, payload=None):
+    payload = payload or {}
+    with _risk_state_lock:
+        state = _load_risk_state()
+        event = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "chat_id": str(chat_id),
+            "type": event_type,
+            "payload": payload,
+        }
+        state.setdefault("events", []).append(event)
+        _save_risk_state(state)
+    return event
+
+
+def get_daily_risk_summary(chat_id, day=None):
+    day = day or datetime.now(timezone.utc).date().isoformat()
+    chat_key = str(chat_id)
+    state = _load_risk_state()
+    events = [e for e in state.get("events", []) if e.get("chat_id") == chat_key and e.get("date") == day]
+    opens = [e for e in events if e.get("type") == "position_open"]
+    closes = [e for e in events if e.get("type") == "position_close"]
+    realized_pnl = 0.0
+    for e in closes:
+        realized_pnl += _safe_float((e.get("payload") or {}).get("pnl_usd"), 0) or 0
+    bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+    realized_pnl_pct = realized_pnl / bal * 100 if bal else 0.0
+    return {
+        "date": day,
+        "opened_count": len(opens),
+        "closed_count": len(closes),
+        "realized_pnl": realized_pnl,
+        "realized_pnl_pct": realized_pnl_pct,
+        "events": len(events),
+    }
+
+
+def estimate_portfolio_risk(chat_id):
+    positions = get_user_positions(chat_id)
+    bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+    total_risk = 0.0
+    total_notional = 0.0
+    rows = []
+    for pos in positions:
+        ticker = pos.get("ticker")
+        direction = pos.get("direction")
+        entry = _safe_float(pos.get("entry_price"), 0) or 0
+        sl = _safe_float(pos.get("sl"), 0) or 0
+        lev = int(pos.get("leverage", user_leverage.get(chat_id, DEFAULT_LEVERAGE)) or DEFAULT_LEVERAGE)
+        margin = _safe_float(pos.get("margin"), None)
+        if margin is None:
+            margin = bal * float(pos.get("size_pct", user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)) or DEFAULT_SIZE_PCT) / 100
+        notional = max(0.0, margin * lev)
+        risk_usd = abs(entry - sl) / entry * notional if entry > 0 and sl > 0 else 0.0
+        total_risk += risk_usd
+        total_notional += notional
+        rows.append({
+            "ticker": ticker,
+            "direction": direction,
+            "risk_usd": risk_usd,
+            "risk_pct": risk_usd / bal * 100 if bal else 0.0,
+            "notional": notional,
+            "leverage": lev,
+            "pos_id": pos.get("pos_id"),
+        })
+    return {
+        "positions": rows,
+        "count": len(rows),
+        "total_risk_usd": total_risk,
+        "total_risk_pct": total_risk / bal * 100 if bal else 0.0,
+        "total_notional": total_notional,
+        "total_notional_mult": total_notional / bal if bal else 0.0,
+    }
+
+
+def _risk_correlated_tickers(ticker):
+    peers = set()
+    for a, b in CORR_PAIRS:
+        if ticker == a:
+            peers.add(b)
+        if ticker == b:
+            peers.add(a)
+    return peers
+
+
+def _risk_levels_from_analysis_or_entry(analysis):
+    ep = (analysis or {}).get("entry_plan") or {}
+    if ep.get("sl") and ep.get("tp1"):
+        return {"sl": ep.get("sl"), "tp1": ep.get("tp1"), "tp2": ep.get("tp2") or ep.get("tp1"), "rr_ratio": ep.get("rr_now", 0)}
+    return (analysis or {}).get("risk_levels") or {}
+
+
+def _risk_price_from_analysis(analysis):
+    ep = (analysis or {}).get("entry_plan") or {}
+    return _safe_float(ep.get("live_price"), None) or _safe_float((analysis or {}).get("price"), None)
+
+
+def build_trade_risk_decision(chat_id, ticker, interval, direction, price, risk_levels, analysis=None, leverage=None, size_pct=None):
+    analysis = analysis or {}
+    blockers = []
+    warnings = []
+    bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+    lev = int(leverage if leverage is not None else user_leverage.get(chat_id, DEFAULT_LEVERAGE))
+    pct = float(size_pct if size_pct is not None else user_size_pct.get(chat_id, DEFAULT_SIZE_PCT))
+    rl = risk_levels or {}
+    price = _safe_float(price, None)
+    sl = _safe_float(rl.get("sl"), None)
+    tp1 = _safe_float(rl.get("tp1"), None)
+    tp2 = _safe_float(rl.get("tp2"), tp1)
+    rr = _safe_float(rl.get("rr_ratio"), 0) or 0
+    analysis_direction = analysis.get("direction") or _signal_direction_from_text(analysis.get("signal"))
+    ep = analysis.get("entry_plan") or {}
+
+    if bal <= 0:
+        blockers.append("баланс должен быть больше 0")
+    if ticker not in TICKERS or interval not in INTERVALS:
+        blockers.append("неизвестный тикер или таймфрейм")
+    if direction not in ("long", "short"):
+        blockers.append("нет направления сделки")
+    if analysis_direction and analysis_direction != direction:
+        blockers.append(f"направление анализа {analysis_direction}, а открыть пытаемся {direction}")
+    if not price or not sl or not tp1:
+        blockers.append("не хватает entry/SL/TP для расчёта риска")
+
+    calc = None
+    single_risk_usd = 0.0
+    single_risk_pct = 0.0
+    notional_mult = 0.0
+    liq_distance_pct = None
+    stop_distance_pct = None
+    if not blockers:
+        calc = calc_position_details(bal, pct, lev, price, sl, tp1, tp2, direction)
+        single_risk_usd = abs(_safe_float(calc.get("pnl_sl"), 0) or 0)
+        single_risk_pct = single_risk_usd / bal * 100 if bal else 0.0
+        notional_mult = (_safe_float(calc.get("position_val"), 0) or 0) / bal if bal else 0.0
+        liq = _safe_float(calc.get("liq_price"), None)
+        if liq and price:
+            liq_distance_pct = abs(price - liq) / price * 100
+            stop_distance_pct = abs(price - sl) / price * 100 if sl else None
+
+    portfolio = estimate_portfolio_risk(chat_id)
+    projected_risk_pct = portfolio["total_risk_pct"] + single_risk_pct
+    daily = get_daily_risk_summary(chat_id)
+
+    if ep:
+        st = ep.get("status")
+        if st and st != "ENTER_NOW":
+            blockers.append(f"entry engine не разрешает вход сейчас: {st}")
+    if analysis.get("risk_blockers"):
+        blockers.extend([str(x) for x in analysis.get("risk_blockers", [])[:3]])
+    if analysis.get("risk_warnings"):
+        warnings.extend([str(x) for x in analysis.get("risk_warnings", [])[:3]])
+
+    if rr and rr < MIN_RR_TO_TRADE:
+        blockers.append(f"RR {rr:.1f}x ниже минимума {MIN_RR_TO_TRADE:.1f}x")
+    if single_risk_pct > RISK_MAX_SINGLE_TRADE_PCT:
+        blockers.append(f"риск сделки {single_risk_pct:.1f}% выше лимита {RISK_MAX_SINGLE_TRADE_PCT:.1f}%")
+    elif single_risk_pct > RISK_WARN_SINGLE_TRADE_PCT:
+        warnings.append(f"риск сделки {single_risk_pct:.1f}% выше осторожной зоны {RISK_WARN_SINGLE_TRADE_PCT:.1f}%")
+    if projected_risk_pct > RISK_MAX_PORTFOLIO_RISK_PCT:
+        blockers.append(f"суммарный риск портфеля станет {projected_risk_pct:.1f}% > {RISK_MAX_PORTFOLIO_RISK_PCT:.1f}%")
+    elif projected_risk_pct > RISK_WARN_PORTFOLIO_RISK_PCT:
+        warnings.append(f"суммарный риск портфеля станет {projected_risk_pct:.1f}%")
+    if portfolio["count"] >= RISK_MAX_OPEN_POSITIONS:
+        blockers.append(f"уже открыто {portfolio['count']} позиций, лимит {RISK_MAX_OPEN_POSITIONS}")
+    if any(p.get("ticker") == ticker for p in portfolio.get("positions", [])):
+        blockers.append(f"по {ticker} уже есть открытая позиция")
+    peers = _risk_correlated_tickers(ticker)
+    corr_open = [p for p in portfolio.get("positions", []) if p.get("ticker") in peers]
+    if corr_open and projected_risk_pct > RISK_CORR_BLOCK_PORTFOLIO_PCT:
+        blockers.append("коррелированная позиция уже открыта, портфельный риск слишком высокий")
+    elif corr_open:
+        warnings.append("есть открытая коррелированная позиция: " + ", ".join(p.get("ticker", "?") for p in corr_open))
+    if daily["opened_count"] >= RISK_MAX_DAILY_NEW_POSITIONS:
+        blockers.append(f"дневной лимит новых сделок исчерпан: {daily['opened_count']}/{RISK_MAX_DAILY_NEW_POSITIONS}")
+    if daily["realized_pnl_pct"] <= -RISK_MAX_DAILY_REALIZED_LOSS_PCT:
+        blockers.append(f"дневной лимит убытка достигнут: {daily['realized_pnl_pct']:.1f}%")
+    if lev > RISK_MAX_LEVERAGE:
+        blockers.append(f"плечо x{lev} выше лимита x{RISK_MAX_LEVERAGE}")
+    elif lev > RISK_WARN_LEVERAGE:
+        warnings.append(f"плечо x{lev} повышает риск ликвидации")
+    if notional_mult > RISK_MAX_NOTIONAL_BALANCE_MULT:
+        blockers.append(f"notional {notional_mult:.1f}x баланса выше лимита {RISK_MAX_NOTIONAL_BALANCE_MULT:.1f}x")
+    elif notional_mult > RISK_WARN_NOTIONAL_BALANCE_MULT:
+        warnings.append(f"notional {notional_mult:.1f}x баланса")
+    if liq_distance_pct is not None and stop_distance_pct is not None:
+        if liq_distance_pct <= stop_distance_pct:
+            blockers.append("ликвидация ближе или равна SL — стоп может не спасти")
+        elif liq_distance_pct < stop_distance_pct * RISK_LIQ_BUFFER_MULT:
+            warnings.append("ликвидация слишком близко к SL, снизь плечо")
+    conf = int(analysis.get("confidence", 0) or 0)
+    if analysis_direction and conf and conf < MIN_CONFIDENCE_FOR_ACTION:
+        blockers.append(f"confidence {conf} ниже минимума {MIN_CONFIDENCE_FOR_ACTION}")
+    ctx = analysis.get("futures_context") or {}
+    if ctx.get("warnings"):
+        warnings.extend(["futures: " + str(x) for x in ctx.get("warnings", [])[:2]])
+
+    # Deduplicate while preserving order.
+    blockers = list(dict.fromkeys([x for x in blockers if x]))
+    warnings = list(dict.fromkeys([x for x in warnings if x]))
+    score = max(0, 100 - len(blockers) * 22 - len(warnings) * 5)
+    allowed = not blockers
+    return {
+        "allowed": allowed,
+        "status": "ALLOW" if allowed else "BLOCK",
+        "score": score,
+        "blockers": blockers,
+        "warnings": warnings,
+        "calc": calc,
+        "balance": bal,
+        "leverage": lev,
+        "size_pct": pct,
+        "single_risk_usd": single_risk_usd,
+        "single_risk_pct": single_risk_pct,
+        "projected_portfolio_risk_pct": projected_risk_pct,
+        "projected_portfolio_risk_usd": portfolio["total_risk_usd"] + single_risk_usd,
+        "portfolio": portfolio,
+        "daily": daily,
+        "notional_mult": notional_mult,
+        "liq_distance_pct": liq_distance_pct,
+        "stop_distance_pct": stop_distance_pct,
+        "rr": rr,
+    }
+
+
+def format_trade_risk_decision(decision, compact=False):
+    if not decision:
+        return "🛡 <b>Risk Manager</b>\n\nНет данных для проверки риска."
+    icon = "✅" if decision.get("allowed") else "⛔"
+    title = "сделка разрешена" if decision.get("allowed") else "сделка заблокирована"
+    lines = [
+        f"🛡 <b>Risk Manager v6.5</b> — {icon} <b>{title}</b>",
+        f"RiskScore: <b>{int(decision.get('score', 0))}/100</b>",
+        f"Риск сделки: <b>{fmt_money(decision.get('single_risk_usd'))}</b> ({decision.get('single_risk_pct',0):.2f}% баланса)",
+        f"Риск портфеля после входа: <b>{decision.get('projected_portfolio_risk_pct',0):.2f}%</b>",
+        f"Плечо: <b>x{decision.get('leverage')}</b> | Размер: <b>{decision.get('size_pct'):.1f}%</b> | Notional: <b>{decision.get('notional_mult',0):.2f}x</b>",
+        f"Сегодня открытий: <b>{decision.get('daily',{}).get('opened_count',0)}/{RISK_MAX_DAILY_NEW_POSITIONS}</b> | Realized: <b>{decision.get('daily',{}).get('realized_pnl_pct',0):+.2f}%</b>",
+    ]
+    if decision.get("stop_distance_pct") is not None and decision.get("liq_distance_pct") is not None:
+        lines.append(f"SL distance: {decision['stop_distance_pct']:.2f}% | Liq distance: {decision['liq_distance_pct']:.2f}%")
+    if decision.get("blockers"):
+        lines += ["", "⛔ <b>Блокеры:</b>"] + [f"• {x}" for x in decision.get("blockers", [])[:6]]
+    if decision.get("warnings") and not compact:
+        lines += ["", "⚠️ <b>Предупреждения:</b>"] + [f"• {x}" for x in decision.get("warnings", [])[:5]]
+    lines.append("📌 Если Risk Manager блокирует вход — это защита депозита, не ошибка бота.")
+    return "\n".join(lines)
+
+
+def register_position_open_risk(chat_id, pos_id, ticker, interval, direction, decision):
+    return record_risk_event(chat_id, "position_open", {
+        "pos_id": pos_id,
+        "ticker": ticker,
+        "interval": interval,
+        "direction": direction,
+        "risk_usd": decision.get("single_risk_usd", 0),
+        "risk_pct": decision.get("single_risk_pct", 0),
+        "portfolio_risk_pct": decision.get("projected_portfolio_risk_pct", 0),
+        "leverage": decision.get("leverage"),
+        "size_pct": decision.get("size_pct"),
+        "notional_mult": decision.get("notional_mult"),
+    })
+
+
+def register_position_close_risk(chat_id, pos, current_price, pnl_pct):
+    pos_val = _safe_float(pos.get("pos_val"), None)
+    if pos_val is None:
+        bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+        lev = int(pos.get("leverage", user_leverage.get(chat_id, DEFAULT_LEVERAGE)) or DEFAULT_LEVERAGE)
+        margin = _safe_float(pos.get("margin"), None)
+        if margin is None:
+            margin = bal * float(pos.get("size_pct", user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)) or DEFAULT_SIZE_PCT) / 100
+        pos_val = margin * lev
+    pnl_usd = (pnl_pct / 100.0) * (pos_val or 0)
+    return record_risk_event(chat_id, "position_close", {
+        "pos_id": pos.get("pos_id"),
+        "ticker": pos.get("ticker"),
+        "direction": pos.get("direction"),
+        "pnl_pct": pnl_pct,
+        "pnl_usd": pnl_usd,
+        "exit_price": current_price,
+    })
+
+
+def format_portfolio_risk(chat_id):
+    bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+    summary = estimate_portfolio_risk(chat_id)
+    daily = get_daily_risk_summary(chat_id)
+    if not summary.get("positions"):
+        return "\n".join([
+            "🛡 <b>Portfolio Risk v6.5</b>",
+            "",
+            f"Баланс: <b>{fmt_money(bal)}</b>",
+            f"Сегодня открытий: <b>{daily['opened_count']}/{RISK_MAX_DAILY_NEW_POSITIONS}</b> | Realized: <b>{daily['realized_pnl_pct']:+.2f}%</b>",
+            "",
+            "Открытых позиций нет. Риск портфеля = 0.",
+        ])
+    lines = [
+        "🛡 <b>Portfolio Risk v6.5</b>",
+        "",
+        f"Баланс: <b>{fmt_money(bal)}</b>",
+        f"Сегодня открытий: <b>{daily['opened_count']}/{RISK_MAX_DAILY_NEW_POSITIONS}</b> | Realized: <b>{daily['realized_pnl_pct']:+.2f}%</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for row in summary.get("positions", []):
+        lines.append(
+            f"{TICKERS.get(row.get('ticker'), {}).get('label', row.get('ticker'))} {str(row.get('direction','')).upper()} | "
+            f"риск <b>{fmt_money(row.get('risk_usd'))}</b> ({row.get('risk_pct',0):.1f}%) | "
+            f"notional {fmt_money(row.get('notional'))} | x{row.get('leverage')}"
+        )
+    total = summary.get("total_risk_pct", 0)
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Суммарный риск до SL: <b>{fmt_money(summary.get('total_risk_usd'))}</b> ({total:.1f}% баланса)",
+        f"Суммарный notional: <b>{fmt_money(summary.get('total_notional'))}</b> ({summary.get('total_notional_mult',0):.2f}x баланса)",
+    ]
+    if total > RISK_MAX_PORTFOLIO_RISK_PCT:
+        lines.append("🚨 Риск портфеля выше лимита. Новые сделки лучше не открывать.")
+    elif total > RISK_WARN_PORTFOLIO_RISK_PCT:
+        lines.append("⚠️ Риск повышенный. Новые коррелированные позиции опасны.")
+    else:
+        lines.append("✅ Риск портфеля в допустимой зоне.")
+    return "\n".join(lines)
+
+
+
+# ============================================================
+# v6.6 — COMPACT SIGNAL UI / ON-DEMAND DETAIL PANELS
+# ============================================================
+# Goal: keep the main Telegram signal readable, then move heavy analysis,
+# entry reasoning and futures context behind explicit buttons.
+
+SIGNAL_DETAIL_CACHE_TTL_SEC = 600
+_SIGNAL_DETAIL_CACHE = {}
+
+_base_format_msg_v65 = format_msg
+_base_fetch_and_send_signal_v65 = fetch_and_send_signal
+_base_fetch_and_send_entry_point_v65 = fetch_and_send_entry_point
+_base_format_entry_plan_v65 = format_entry_plan
+_base_async_handle_update_v65 = async_handle_update
+_base_learn_keyboard_v65 = learn_keyboard
+_base_explain_keyboard_v65 = explain_keyboard
+
+
+def _now_ts_utc():
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _cache_signal_data(chat_id, ticker, interval, data):
+    _SIGNAL_DETAIL_CACHE[chat_id] = {
+        "ts": _now_ts_utc(),
+        "ticker": ticker,
+        "interval": interval,
+        "data": data,
+    }
+
+
+def _signal_data_for_chat(chat_id, force_refresh=False):
+    interval = user_intervals.get(chat_id, "15m")
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    cached = _SIGNAL_DETAIL_CACHE.get(chat_id)
+    if (
+        not force_refresh
+        and cached
+        and cached.get("ticker") == ticker
+        and cached.get("interval") == interval
+        and (_now_ts_utc() - cached.get("ts", 0)) <= SIGNAL_DETAIL_CACHE_TTL_SEC
+    ):
+        return cached.get("data"), ticker, interval
+    data = full_analyze(ticker, interval)
+    _cache_signal_data(chat_id, ticker, interval, data)
+    return data, ticker, interval
+
+
+def _status_label_entry(status):
+    return {
+        "ENTER_NOW": "✅ Вход сейчас допустим",
+        "WAIT_RETEST": "🟡 Ждать ретест / лучшую цену",
+        "WAIT_CONFIRMATION": "🟠 Ждать подтверждение",
+        "NO_ENTRY": "⛔ Не входить сейчас",
+        "NO_SETUP": "⏸ Нет сетапа для входа",
+    }.get(status, status or "WAIT")
+
+
+def _fmt_signal_regime(data):
+    regime_icons = {
+        "trend": "📈 ТРЕНД",
+        "flat": "↔️ БОКОВИК",
+        "volatile": "⚡ ВОЛАТИЛЬНОСТЬ",
+        "neutral": "⚪ НЕЙТРАЛЬНО",
+    }
+    label = regime_icons.get(data.get("regime", "neutral"), "⚪ НЕЙТРАЛЬНО")
+    adx = data.get("adx")
+    adx_str = f"  ADX={adx:.1f}" if isinstance(adx, (int, float)) else ""
+    return f"{label}{adx_str}"
+
+
+def _format_signal_score(data):
+    bull = _safe_float(data.get("bull_weight_sum"), 0) or 0
+    bear = _safe_float(data.get("bear_weight_sum"), 0) or 0
+    return f"🟢{bull:.1f} vs 🔴{bear:.1f}"
+
+
+def format_signal_summary(data, ticker, interval):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    tf = INTERVALS.get(interval, {}).get("label", interval)
+    tk = TICKERS.get(ticker, {}).get("label", ticker)
+    price = data.get("price")
+    min_votes = data.get("min_votes", MIN_SIGNAL_VOTES)
+
+    lines = [
+        f"📊 <b>QUANT SIGNAL — {tk}</b>",
+        f"🕐 {now}  |  ⏱ <b>{tf}</b>",
+        f"💰 Цена: <b>{fmt_price(price, ticker)}</b>",
+        f"🎯 Режим: <b>{_fmt_signal_regime(data)}</b>  |  Порог: <b>{min_votes}</b>",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⭐ Сигнал: <b>{data.get('signal', 'WAIT')}</b>",
+    ]
+
+    if data.get("anomaly_reason"):
+        lines += [
+            "",
+            f"⚠️ {data.get('anomaly_reason')}",
+            "",
+            "⚠️ Статистика, не гарантия. Paper Trading only!",
+        ]
+        return "\n".join(lines)
+
+    prob = _safe_float(data.get("prob"), 0) or 0
+    if prob > 0:
+        lines.append(f"📈 Вероятность: <b>{prob * 100:.1f}%</b>")
+    lines.append(f"⚖️ Счёт: <b>{_format_signal_score(data)}</b>")
+
+    kelly = _safe_float(data.get("kelly_pct"), 0) or 0
+    if kelly > 0:
+        prefix = "✅" if kelly >= 1 else "⚠️"
+        lines.append(f"{prefix} Келли*: <b>{kelly:.1f}%</b>")
+
+    risk = data.get("risk_levels") or {}
+    if risk:
+        direction = data.get("direction") or _signal_direction_from_text(data.get("signal"))
+        direction_label = _entry_side_label(direction)
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"🛡 <b>Риск-менеджмент ({direction_label})</b>",
+            f"🔴 SL: <b>{fmt_price(risk.get('sl'), ticker)}</b>  ({risk.get('risk_pct', 0):.1f}%)",
+            f"🎯 TP1: <b>{fmt_price(risk.get('tp1'), ticker)}</b>",
+            f"🎯 TP2: <b>{fmt_price(risk.get('tp2'), ticker)}</b>",
+            f"⚖️ RR: <b>{risk.get('rr_ratio', 0):.1f}x</b>",
+        ]
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "📌 Детали спрятаны в кнопках ниже.",
+        "⚠️ Статистика, не гарантия. Paper Trading only!",
+    ]
+    if kelly > 0:
+        lines.append("* Kelly — справка о математическом перевесе, не размер позиции.")
+    return "\n".join(lines)
+
+
+def _append_bullets(lines, title, items, limit=None):
+    items = list(items or [])
+    if not items:
+        return
+    shown = items if limit is None else items[:limit]
+    lines += ["", title]
+    lines += [f"• {x}" for x in shown]
+    if limit is not None and len(items) > limit:
+        lines.append(f"• ещё {len(items) - limit} пункт(ов)")
+
+
+def format_signal_analysis_details(data, ticker, interval):
+    tf = INTERVALS.get(interval, {}).get("label", interval)
+    tk = TICKERS.get(ticker, {}).get("label", ticker)
+    lines = [
+        f"📊 <b>Анализ / индикаторы — {tk}</b>",
+        f"⏱ TF: <b>{tf}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    mtf = data.get("mtf_details") or []
+    if mtf:
+        lines += ["📡 <b>MTF анализ:</b>"]
+        lines += [f"• {x}" for x in mtf]
+    else:
+        lines.append("📡 <b>MTF анализ:</b> данных нет")
+
+    _append_bullets(lines, f"🟢 <b>Факторы роста ({len(data.get('bull_args') or [])}):</b>", data.get("bull_args"))
+    _append_bullets(lines, f"🔴 <b>Факторы падения ({len(data.get('bear_args') or [])}):</b>", data.get("bear_args"))
+    _append_bullets(lines, "⚪ <b>Нейтральные:</b>", data.get("neutral"))
+
+    quality = []
+    if data.get("confidence") is not None:
+        quality.append(f"Confidence: {int(data.get('confidence', 0))}/95")
+    if data.get("micro_regime"):
+        chop = data.get("choppiness")
+        chop_s = f" | Chop={chop:.1f}" if isinstance(chop, (int, float)) else ""
+        quality.append(f"Micro-regime: {data.get('micro_regime')}{chop_s}")
+    if data.get("self_score_note"):
+        quality.append(str(data.get("self_score_note")))
+    if data.get("risk_warnings"):
+        quality.append("Warnings: " + " | ".join(data.get("risk_warnings")[:3]))
+    if data.get("risk_blockers"):
+        quality.append("Blockers: " + " | ".join(data.get("risk_blockers")[:3]))
+    if data.get("ensemble_score") is not None:
+        quality.append(f"Ensemble: {int(data.get('ensemble_score', 0))} — {data.get('ensemble_note', 'нейтрально')}")
+
+    if quality:
+        lines += ["", "🧠 <b>Фильтр качества:</b>"]
+        lines += [f"• {x}" for x in quality]
+
+    lines += [
+        "",
+        "📌 Это объясняет, почему бот пришёл к сигналу. Это не отдельное разрешение входить.",
+    ]
+    return "\n".join(lines)
+
+
+def format_entry_plan_core(plan, ticker):
+    status = plan.get("status", "NO_SETUP")
+    side = plan.get("side", "WAIT")
+    score = int(plan.get("score", 0) or 0)
+    live = plan.get("live_price")
+    low = plan.get("entry_zone_low")
+    high = plan.get("entry_zone_high")
+    preferred = plan.get("preferred_entry")
+    rr = _safe_float(plan.get("rr_now"), 0) or 0
+    progress = _safe_float(plan.get("progress_to_tp"), 0) or 0
+
+    lines = [
+        "🎯 <b>Точка входа / Entry Timing</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Направление: <b>{side}</b>",
+        f"Решение: <b>{_status_label_entry(status)}</b>",
+        f"EntryScore: <b>{score}/100</b>",
+        f"Текущая цена: <b>{fmt_price(live, ticker)}</b>",
+    ]
+    if low is not None and high is not None:
+        lines += [
+            f"Зона входа: <b>{fmt_price(low, ticker)} — {fmt_price(high, ticker)}</b>",
+            f"Оптимально ближе к: <b>{fmt_price(preferred, ticker)}</b>",
+        ]
+    if plan.get("sl") and plan.get("tp1"):
+        lines += [
+            "",
+            f"SL: <b>{fmt_price(plan.get('sl'), ticker)}</b>",
+            f"TP1: <b>{fmt_price(plan.get('tp1'), ticker)}</b>",
+            f"TP2: <b>{fmt_price(plan.get('tp2'), ticker)}</b>",
+            f"RR сейчас: <b>{rr:.2f}x</b>",
+            f"Движение уже прошло до TP1: <b>{progress * 100:.0f}%</b>",
+        ]
+    lines += [
+        "",
+        "📌 Подробную логику смотри через кнопку «Анализ точки входа».",
+        "⚠️ Маленький риск важнее красивой точки входа.",
+    ]
+    return "\n".join(lines)
+
+
+def format_entry_plan_analysis(plan, ticker):
+    lines = [
+        "🧠 <b>Анализ точки входа</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    _append_bullets(lines, "✅ <b>Почему вход может быть нормальным:</b>", plan.get("why") or ["Нет сильных подтверждений."])
+    _append_bullets(lines, "⚠️ <b>Почему вход может быть плохим:</b>", plan.get("warnings") or ["Явных предупреждений мало, но риск всё равно остаётся."])
+    lines += [
+        "",
+        "🧠 <b>Что делать осторожному трейдеру:</b>",
+        plan.get("action", "Ждать подтверждения и не увеличивать риск."),
+    ]
+    if plan.get("invalidation"):
+        lines += ["", "❌ <b>Invalidation:</b>", plan.get("invalidation")]
+    lines += [
+        "",
+        "⏳ <b>Актуальность:</b>",
+        plan.get("validity", "План требует обновления после новой сильной свечи."),
+        "",
+        "⚠️ Это не финансовая рекомендация. Если цена убежала, профессионал чаще пропускает сделку, а не догоняет её.",
+    ]
+    return "\n".join(lines)
+
+
+def format_entry_plan(plan, ticker, compact=False):
+    if compact:
+        return _base_format_entry_plan_v65(plan, ticker, compact=True)
+    return format_entry_plan_core(plan, ticker)
+
+
+def format_msg(data, ticker, interval):
+    return format_signal_summary(data, ticker, interval)
+
+
+def compact_signal_keyboard(open_callback=None):
+    rows = []
+    if open_callback:
+        rows.append([open_callback])
+    rows += [
+        [
+            {"text": "📊 Анализ / индикаторы", "callback_data": "sig_analysis"},
+            {"text": "🎯 Точка входа", "callback_data": "sig_entry"},
+        ],
+        [
+            {"text": "📡 Futures Context", "callback_data": "sig_futures"},
+            {"text": "🔄 Обновить сигнал", "callback_data": "get_signal"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]
+    return {"inline_keyboard": rows}
+
+
+def entry_detail_keyboard(open_callback=None):
+    rows = []
+    if open_callback:
+        rows.append([open_callback])
+    rows += [
+        [{"text": "🧠 Анализ точки входа", "callback_data": "sig_entry_why"}],
+        [
+            {"text": "📊 Анализ / индикаторы", "callback_data": "sig_analysis"},
+            {"text": "📡 Futures Context", "callback_data": "sig_futures"},
+        ],
+        [
+            {"text": "🔄 Обновить точку входа", "callback_data": "entry_point"},
+            {"text": "◀️ Главное меню", "callback_data": "back_main"},
+        ],
+    ]
+    return {"inline_keyboard": rows}
+
+
+def entry_analysis_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🎯 Назад к точке входа", "callback_data": "sig_entry"}],
+        [
+            {"text": "📊 Анализ / индикаторы", "callback_data": "sig_analysis"},
+            {"text": "📡 Futures Context", "callback_data": "sig_futures"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def _open_position_button_if_allowed(chat_id, ticker, interval, data, msg_parts):
+    ep = data.get("entry_plan") or {}
+    if ep.get("status") != "ENTER_NOW" or not data.get("direction") or not data.get("risk_levels"):
+        return None
+    direction = data["direction"]
+    rl_for_risk = _risk_levels_from_analysis_or_entry(data) if "_risk_levels_from_analysis_or_entry" in globals() else data.get("risk_levels")
+    price_for_risk = _risk_price_from_analysis(data) if "_risk_price_from_analysis" in globals() else data.get("price")
+    decision = build_trade_risk_decision(chat_id, ticker, interval, direction, price_for_risk, rl_for_risk, data)
+    if decision.get("allowed"):
+        return {"text": f"📂 Открыть {direction.upper()} позицию", "callback_data": f"open_pos_{ticker}_{interval}_{direction}"}
+    msg_parts.append(format_trade_risk_decision(decision, compact=True))
+    return None
+
+
+def fetch_and_send_signal(chat_id):
+    interval = user_intervals.get(chat_id, "15m")
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    send(chat_id, f"⏳ Анализирую {TICKERS[ticker]['label']} ({INTERVALS[interval]['label']})...")
+    try:
+        data = full_analyze(ticker, interval)
+        _cache_signal_data(chat_id, ticker, interval, data)
+        msg_parts = [format_msg(data, ticker, interval)]
+        open_button = _open_position_button_if_allowed(chat_id, ticker, interval, data, msg_parts)
+        send(chat_id, "\n\n".join(x for x in msg_parts if x), compact_signal_keyboard(open_button))
+    except Exception as e:
+        import traceback
+        print(f"  [signal_v66] ОШИБКА: {traceback.format_exc()}")
+        send(chat_id, f"❌ Ошибка анализа: {e}", main_keyboard())
+
+
+def fetch_and_send_entry_point(chat_id):
+    interval = user_intervals.get(chat_id, "15m")
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    send(chat_id, f"⏳ Ищу точку входа {TICKERS[ticker]['label']} ({INTERVALS[interval]['label']})...")
+    try:
+        data = full_analyze(ticker, interval)
+        _cache_signal_data(chat_id, ticker, interval, data)
+        plan = data.get("entry_plan") or build_entry_plan(data, ticker, interval)
+        msg_parts = [format_entry_plan(plan, ticker, compact=False)]
+        open_button = _open_position_button_if_allowed(chat_id, ticker, interval, data, msg_parts)
+        send(chat_id, "\n\n".join(x for x in msg_parts if x), entry_detail_keyboard(open_button))
+    except Exception as e:
+        import traceback
+        print(f"  [entry_v66] ОШИБКА: {traceback.format_exc()}")
+        send(chat_id, f"❌ Ошибка расчёта точки входа: {e}", main_keyboard())
+
+
+def fetch_and_send_signal_analysis(chat_id):
+    try:
+        data, ticker, interval = _signal_data_for_chat(chat_id)
+        send(chat_id, format_signal_analysis_details(data, ticker, interval), compact_signal_keyboard())
+    except Exception as e:
+        send(chat_id, f"❌ Ошибка анализа индикаторов: {e}", main_keyboard())
+
+
+def fetch_and_send_cached_entry(chat_id):
+    try:
+        data, ticker, interval = _signal_data_for_chat(chat_id)
+        plan = data.get("entry_plan") or build_entry_plan(data, ticker, interval)
+        msg_parts = [format_entry_plan(plan, ticker, compact=False)]
+        open_button = _open_position_button_if_allowed(chat_id, ticker, interval, data, msg_parts)
+        send(chat_id, "\n\n".join(x for x in msg_parts if x), entry_detail_keyboard(open_button))
+    except Exception as e:
+        send(chat_id, f"❌ Ошибка точки входа: {e}", main_keyboard())
+
+
+def fetch_and_send_entry_analysis(chat_id):
+    try:
+        data, ticker, interval = _signal_data_for_chat(chat_id)
+        plan = data.get("entry_plan") or build_entry_plan(data, ticker, interval)
+        send(chat_id, format_entry_plan_analysis(plan, ticker), entry_analysis_keyboard())
+    except Exception as e:
+        send(chat_id, f"❌ Ошибка анализа точки входа: {e}", main_keyboard())
+
+
+def fetch_and_send_futures_context(chat_id):
+    try:
+        data, ticker, interval = _signal_data_for_chat(chat_id)
+        ctx = data.get("futures_context") or build_futures_context(ticker, data.get("price"))
+        msg = format_futures_context(ctx, ticker) or "📡 Futures Context: данных пока нет."
+        send(chat_id, msg, compact_signal_keyboard())
+    except Exception as e:
+        send(chat_id, f"❌ Ошибка Futures Context: {e}", main_keyboard())
+
+
+def learn_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "🚦 Что нажимать новичку", "callback_data": "learn_start"},
+            {"text": "🧠 Как читать сигнал", "callback_data": "learn_signal"},
+        ],
+        [
+            {"text": "🧩 Новые термины", "callback_data": "learn_new_terms"},
+            {"text": "📚 Индикаторы", "callback_data": "explain_2"},
+        ],
+        [
+            {"text": "🌊 Market Flow", "callback_data": "learn_flow"},
+            {"text": "📊 Аналитика", "callback_data": "learn_analytics"},
+        ],
+        [
+            {"text": "🛡 Риск", "callback_data": "learn_risk"},
+            {"text": "🗄 Storage", "callback_data": "learn_storage"},
+        ],
+        [{"text": "⚠️ Опасные ошибки", "callback_data": "learn_traps"}],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def explain_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "🚦 Новичку", "callback_data": "learn_start"},
+            {"text": "🧠 Сигнал", "callback_data": "learn_signal"},
+        ],
+        [
+            {"text": "🧩 Новые термины", "callback_data": "learn_new_terms"},
+            {"text": "📚 Индикаторы", "callback_data": "explain_2"},
+        ],
+        [
+            {"text": "🌊 Flow", "callback_data": "learn_flow"},
+            {"text": "📊 Аналитика", "callback_data": "learn_analytics"},
+        ],
+        [
+            {"text": "🛡 Риск", "callback_data": "learn_risk"},
+            {"text": "⚠️ Ошибки", "callback_data": "learn_traps"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+LEARN_TEXTS["learn_new_terms"] = """🧩 <b>Новые термины в боте</b>
+━━━━━━━━━━━━━━━━━━━━
+
+<b>Confluence</b> — совпадение нескольких факторов. Например, тренд, MACD и объём смотрят в одну сторону. Ошибка новичка: думать, что confluence = гарантия.
+
+<b>Счёт 🟢 vs 🔴</b> — сумма голосов/весов за рост и падение. Это не прогноз на 100%, а баланс аргументов.
+
+<b>Келли</b> — математическая оценка размера ставки при преимуществе. В реальной торговле её часто сильно уменьшают, потому что рынок шумный, а оценки неточные.
+
+<b>MTF</b> — multi-timeframe анализ. Бот смотрит не только текущий TF, но и старшие. Если 15m за LONG, а 1h против, вход опаснее.
+
+<b>Entry Timing</b> — отдельная проверка: не только “куда”, но и “не поздно ли входить сейчас”.
+
+<b>EntryScore</b> — оценка качества точки входа от 0 до 100. Низкий score часто значит: цена убежала, RR слабый или нужен ретест.
+
+<b>Retest</b> — возврат цены к зоне после импульса. Часто лучше ждать ретест, чем догонять свечу.
+
+<b>Invalidation</b> — место, где идея сделки ломается. Если цена туда пришла, спорить с рынком нельзя.
+
+<b>Futures Context</b> — фьючерсный фон: mark/index, funding, open interest, объём и ликвидации. Это контекст, не самостоятельный сигнал.
+
+<b>Mark Price</b> — цена, по которой Binance считает ликвидации и PnL на фьючерсах.
+
+<b>Index Price</b> — справедливая индексная цена, собранная из нескольких рынков.
+
+<b>Basis</b> — разница между mark и index. Большой перекос может говорить о напряжении на фьючерсах.
+
+<b>Funding</b> — периодический платёж между long и short. Положительный funding: longs платят shorts.
+
+<b>Open Interest</b> — сколько денег/контрактов сейчас открыто во фьючерсах. Рост OI усиливает движение, но может повысить риск squeeze.
+
+<b>Liquidations</b> — принудительное закрытие позиций. Их всплеск часто даёт резкий импульс, но после него возможен откат.
+
+<b>Portfolio Risk</b> — общий риск всех открытых позиций до SL. Даже хорошие сделки опасны, если суммарный риск большой.
+
+<b>Notional</b> — полный размер позиции с учётом плеча. Баланс $100 и x10 могут дать notional $1000.
+
+Главное правило: каждая новая метрика помогает задать вопрос, но не отменяет stop loss и маленький риск."""
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+            if data == "sig_analysis":
+                await async_answer_callback(session, callback_id, "Анализ")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, fetch_and_send_signal_analysis, chat_id)
+                return
+            if data == "sig_entry":
+                await async_answer_callback(session, callback_id, "Точка входа")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, fetch_and_send_cached_entry, chat_id)
+                return
+            if data == "sig_entry_why":
+                await async_answer_callback(session, callback_id, "Логика входа")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, fetch_and_send_entry_analysis, chat_id)
+                return
+            if data == "sig_futures":
+                await async_answer_callback(session, callback_id, "Futures")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, fetch_and_send_futures_context, chat_id)
+                return
+        await _base_async_handle_update_v65(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v66] error: {e}")
+
+
+
+# ============================================================
+# v6.7 — SIGNAL MENU + ENTRY SCORE CLARITY
+# ============================================================
+# Signal is now a small hub: choose ticker, choose TF, then request the
+# compact signal. Entry timing separates setup strength from "enter now".
+
+_base_main_keyboard_v66 = main_keyboard
+_base_settings_keyboard_v66 = settings_keyboard_v59
+_base_send_v59_menu_v66 = send_v59_menu
+_base_async_handle_update_v66 = async_handle_update
+_base_build_entry_plan_v66 = build_entry_plan
+_base_format_entry_plan_v66 = format_entry_plan
+_base_format_entry_plan_analysis_v66 = format_entry_plan_analysis
+
+
+def signal_menu_keyboard(chat_id):
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    tk_label = TICKERS.get(ticker, {}).get("label", ticker)
+    tf_label = INTERVALS.get(interval, {}).get("label", interval)
+    return {"inline_keyboard": [
+        [{"text": f"📊 Сам сигнал: {tk_label} / {tf_label}", "callback_data": "get_signal"}],
+        [
+            {"text": f"🪙 Актив: {tk_label}", "callback_data": "sig_change_ticker"},
+            {"text": f"⏱ TF: {tf_label}", "callback_data": "sig_change_interval"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def signal_ticker_keyboard():
+    rows = []
+    keys = list(TICKERS.keys())
+    for i in range(0, len(keys), 2):
+        rows.append([
+            {"text": TICKERS[k]["label"], "callback_data": f"sig_ticker_{k}"}
+            for k in keys[i:i + 2]
+        ])
+    rows.append([{"text": "◀️ Назад к сигналу", "callback_data": "menu_signal"}])
+    return {"inline_keyboard": rows}
+
+
+def signal_interval_keyboard():
+    rows = []
+    keys = list(INTERVALS.keys())
+    for i in range(0, len(keys), 2):
+        rows.append([
+            {"text": INTERVALS[k]["label"], "callback_data": f"sig_interval_{k}"}
+            for k in keys[i:i + 2]
+        ])
+    rows.append([{"text": "◀️ Назад к сигналу", "callback_data": "menu_signal"}])
+    return {"inline_keyboard": rows}
+
+
+def format_signal_menu_text(chat_id):
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    tk_label = TICKERS.get(ticker, {}).get("label", ticker)
+    tf_label = INTERVALS.get(interval, {}).get("label", interval)
+    return "\n".join([
+        "🔄 <b>Сигнал</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Актив: <b>{tk_label}</b>",
+        f"Таймфрейм: <b>{tf_label}</b>",
+        "",
+        "Сначала выбери актив и TF, потом нажми «Сам сигнал».",
+    ])
+
+
+def main_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "🔄 Сигнал", "callback_data": "menu_signal"},
+            {"text": "🎯 Точка входа", "callback_data": "entry_point"},
+        ],
+        [
+            {"text": "💰 Цена", "callback_data": "get_price"},
+            {"text": "🌊 Market Flow", "callback_data": "menu_flow"},
+        ],
+        [
+            {"text": "📊 Аналитика", "callback_data": "menu_analytics"},
+            {"text": "📂 Позиции / Риск", "callback_data": "menu_positions"},
+        ],
+        [
+            {"text": "⚙️ Настройки", "callback_data": "menu_settings"},
+            {"text": "📖 Обучение", "callback_data": "menu_learn"},
+        ],
+        [{"text": "😱 Fear & Greed", "callback_data": "get_fg"}],
+    ]}
+
+
+def settings_keyboard_v59():
+    return {"inline_keyboard": [
+        [
+            {"text": "🔔 Авто ВКЛ/ВЫКЛ", "callback_data": "toggle_auto"},
+            {"text": "⚙️ Настройки авто", "callback_data": "auto_settings"},
+        ],
+        [
+            {"text": "🗄 Storage", "callback_data": "storage_status"},
+            {"text": "📖 Что такое Storage", "callback_data": "learn_storage"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def _clear_signal_cache(chat_id):
+    try:
+        _SIGNAL_DETAIL_CACHE.pop(chat_id, None)
+    except Exception:
+        pass
+
+
+async def send_signal_menu(session, chat_id):
+    await async_send(session, chat_id, format_signal_menu_text(chat_id), signal_menu_keyboard(chat_id))
+
+
+async def send_settings_menu_v67(session, chat_id):
+    await async_send(session, chat_id, format_menu_header(
+        "⚙️ <b>Настройки</b>",
+        "Авто-уведомления, параметры авто-анализа и storage status.\n\nАктив и таймфрейм теперь меняются внутри кнопки <b>Сигнал</b>."
+    ), settings_keyboard_v59())
+
+
+def _entry_gate_reason(plan):
+    status = plan.get("status", "NO_SETUP")
+    warnings = " | ".join(str(x) for x in (plan.get("warnings") or [])[:3])
+    if status == "ENTER_NOW":
+        return "score и защитные фильтры разрешают вход сейчас"
+    if status == "WAIT_RETEST":
+        if "EMA20" in warnings or "VWAP" in warnings or "прош" in warnings or "убеж" in warnings:
+            return "идея есть, но цена уже не в лучшей зоне; лучше ждать ретест"
+        return "идея есть, но точка входа ещё не достаточно чистая"
+    if status == "WAIT_CONFIRMATION":
+        return "идея есть, но нужен дополнительный импульс/подтверждение"
+    if status == "NO_ENTRY":
+        return "защитный фильтр запрещает вход: риск или RR плохие"
+    return "нет полноценного сетапа"
+
+
+def _entry_now_score_from_status(raw_score, status):
+    raw_score = int(_entry_clamp(raw_score, 0, 100))
+    if status == "ENTER_NOW":
+        return raw_score
+    if status == "WAIT_RETEST":
+        return min(raw_score, 69)
+    if status == "WAIT_CONFIRMATION":
+        return min(raw_score, 64)
+    if status == "NO_ENTRY":
+        return min(raw_score, 35)
+    return min(raw_score, 45)
+
+
+def build_entry_plan(data, ticker, interval):
+    plan = _base_build_entry_plan_v66(data, ticker, interval)
+    raw_score = int(_entry_clamp(plan.get("score", 0), 0, 100))
+    status = plan.get("status", "NO_SETUP")
+    now_score = _entry_now_score_from_status(raw_score, status)
+    plan["setup_score"] = raw_score
+    plan["entry_now_score"] = now_score
+    plan["entry_gate_reason"] = _entry_gate_reason(plan)
+    if status != "ENTER_NOW" and raw_score >= ENTRY_MIN_NOW_SCORE:
+        note = (
+            f"Сила идеи высокая ({raw_score}/100), но вход сейчас снижен до "
+            f"{now_score}/100 из-за защитного фильтра: {plan['entry_gate_reason']}."
+        )
+        existing = plan.get("warnings") or []
+        if note not in existing:
+            plan["warnings"] = [note] + existing
+    return plan
+
+
+def format_entry_plan(plan, ticker, compact=False):
+    if compact:
+        status = plan.get("status", "NO_SETUP")
+        raw = int(plan.get("setup_score", plan.get("score", 0)) or 0)
+        now_score = int(plan.get("entry_now_score", _entry_now_score_from_status(raw, status)) or 0)
+        rr = _safe_float(plan.get("rr_now"), 0) or 0
+        return f"{_status_label_entry(status)} | EntryNow {now_score}/100 | Setup {raw}/100 | RR {rr:.1f}x"
+    return format_entry_plan_core(plan, ticker)
+
+
+def format_entry_plan_core(plan, ticker):
+    status = plan.get("status", "NO_SETUP")
+    side = plan.get("side", "WAIT")
+    raw = int(plan.get("setup_score", plan.get("score", 0)) or 0)
+    now_score = int(plan.get("entry_now_score", _entry_now_score_from_status(raw, status)) or 0)
+    live = plan.get("live_price")
+    low = plan.get("entry_zone_low")
+    high = plan.get("entry_zone_high")
+    preferred = plan.get("preferred_entry")
+    rr = _safe_float(plan.get("rr_now"), 0) or 0
+    progress = _safe_float(plan.get("progress_to_tp"), 0) or 0
+
+    lines = [
+        "🎯 <b>Точка входа / Entry Timing</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Направление: <b>{side}</b>",
+        f"Решение: <b>{_status_label_entry(status)}</b>",
+        f"Готовность входа сейчас: <b>{now_score}/100</b>",
+        f"Сила идеи: <b>{raw}/100</b>",
+        f"Текущая цена: <b>{fmt_price(live, ticker)}</b>",
+    ]
+    if status != "ENTER_NOW":
+        lines.append(f"Gate: <b>{plan.get('entry_gate_reason', _entry_gate_reason(plan))}</b>")
+    if low is not None and high is not None:
+        lines += [
+            f"Зона входа: <b>{fmt_price(low, ticker)} — {fmt_price(high, ticker)}</b>",
+            f"Оптимально ближе к: <b>{fmt_price(preferred, ticker)}</b>",
+        ]
+    if plan.get("sl") and plan.get("tp1"):
+        lines += [
+            "",
+            f"SL: <b>{fmt_price(plan.get('sl'), ticker)}</b>",
+            f"TP1: <b>{fmt_price(plan.get('tp1'), ticker)}</b>",
+            f"TP2: <b>{fmt_price(plan.get('tp2'), ticker)}</b>",
+            f"RR сейчас: <b>{rr:.2f}x</b>",
+            f"Движение уже прошло до TP1: <b>{progress * 100:.0f}%</b>",
+        ]
+    lines += [
+        "",
+        "📌 Если сила идеи высокая, но готовность ниже 70 — идея может быть нормальной, а вход сейчас всё равно поздний.",
+        "⚠️ Лучше пропустить часть движения, чем входить в плохой зоне с большим риском.",
+    ]
+    return "\n".join(lines)
+
+
+def format_entry_plan_analysis(plan, ticker):
+    raw = int(plan.get("setup_score", plan.get("score", 0)) or 0)
+    now_score = int(plan.get("entry_now_score", _entry_now_score_from_status(raw, plan.get("status"))) or 0)
+    lines = [
+        "🧠 <b>Анализ точки входа</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Сила идеи: <b>{raw}/100</b>",
+        f"Готовность входа сейчас: <b>{now_score}/100</b>",
+        f"Gate: <b>{plan.get('entry_gate_reason', _entry_gate_reason(plan))}</b>",
+    ]
+    _append_bullets(lines, "✅ <b>Почему идея может быть нормальной:</b>", plan.get("why") or ["Нет сильных подтверждений."])
+    _append_bullets(lines, "⚠️ <b>Почему вход сейчас может быть плохим:</b>", plan.get("warnings") or ["Явных предупреждений мало, но риск всё равно остаётся."])
+    lines += [
+        "",
+        "🧠 <b>Что делать осторожному трейдеру:</b>",
+        plan.get("action", "Ждать подтверждения и не увеличивать риск."),
+    ]
+    if plan.get("invalidation"):
+        lines += ["", "❌ <b>Invalidation:</b>", plan.get("invalidation")]
+    lines += [
+        "",
+        "⏳ <b>Актуальность:</b>",
+        plan.get("validity", "План требует обновления после новой сильной свечи."),
+        "",
+        "Главная мысль: 80+ по силе идеи не означает автоматический вход. Вход разрешается только когда score и защитные фильтры совпали.",
+    ]
+    return "\n".join(lines)
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>SetupScore / Сила идеи</b> — насколько сама идея LONG/SHORT выглядит сильной по факторам.
+
+<b>EntryNowScore / Готовность входа сейчас</b> — можно ли входить именно сейчас. Он может быть ниже SetupScore, если цена уже убежала, нужен ретест или подтверждение.
+
+Пример: SetupScore 81 и EntryNowScore 69 значит: идея интересная, но вход сейчас неидеальный. Осторожный трейдер ждёт лучшую цену."""
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+
+            if data == "menu_signal":
+                await async_answer_callback(session, callback_id, "Сигнал")
+                await send_signal_menu(session, chat_id)
+                return
+
+            if data in {"sig_change_ticker", "change_ticker"}:
+                await async_answer_callback(session, callback_id, "Актив")
+                await async_send(session, chat_id, "🪙 <b>Выбери актив для сигнала:</b>", signal_ticker_keyboard())
+                return
+
+            if data in {"sig_change_interval", "change_interval"}:
+                await async_answer_callback(session, callback_id, "TF")
+                await async_send(session, chat_id, "⏱ <b>Выбери таймфрейм для сигнала:</b>", signal_interval_keyboard())
+                return
+
+            if data.startswith("sig_ticker_"):
+                ticker = data.replace("sig_ticker_", "", 1)
+                if ticker in TICKERS:
+                    user_tickers[chat_id] = ticker
+                    _clear_signal_cache(chat_id)
+                    await async_answer_callback(session, callback_id, TICKERS[ticker]["label"])
+                    await send_signal_menu(session, chat_id)
+                    return
+
+            if data.startswith("sig_interval_"):
+                interval = data.replace("sig_interval_", "", 1)
+                if interval in INTERVALS:
+                    user_intervals[chat_id] = interval
+                    _clear_signal_cache(chat_id)
+                    await async_answer_callback(session, callback_id, INTERVALS[interval]["label"])
+                    await send_signal_menu(session, chat_id)
+                    return
+
+            if data == "menu_settings":
+                await async_answer_callback(session, callback_id, "Настройки")
+                await send_settings_menu_v67(session, chat_id)
+                return
+
+        await _base_async_handle_update_v66(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v67] error: {e}")
+
+
+
+# ============================================================
+# v6.8 — FUTURES SYMBOL ALIASES
+# ============================================================
+# Binance Spot has SHIBUSDT, but Binance USD-M Futures uses 1000SHIBUSDT.
+# Keep the user's familiar internal ticker while sending the correct futures
+# contract symbol to REST/WS endpoints.
+
+FUTURES_SYMBOL_ALIASES = {
+    "SHIBUSDT": "1000SHIBUSDT",
+}
+FUTURES_SYMBOL_REVERSE_ALIASES = {v: k for k, v in FUTURES_SYMBOL_ALIASES.items()}
+
+if "SHIBUSDT" in TICKERS:
+    TICKERS["SHIBUSDT"]["label"] = "🐶 1000SHIB"
+
+
+def futures_api_symbol(ticker):
+    return FUTURES_SYMBOL_ALIASES.get(str(ticker).upper(), str(ticker).upper())
+
+
+def futures_display_symbol(symbol):
+    return FUTURES_SYMBOL_REVERSE_ALIASES.get(str(symbol).upper(), str(symbol).upper())
+
+
+def _validate_internal_ticker(ticker):
+    ticker = str(ticker).upper()
+    if ticker not in TICKERS:
+        reverse = futures_display_symbol(ticker)
+        if reverse in TICKERS:
+            return reverse
+        raise ValueError(f"Unknown ticker: {ticker}")
+    return ticker
+
+
+def _fetch_futures_klines(api_symbol, interval, limit):
+    r = _session.get(
+        "https://fapi.binance.com/fapi/v1/klines",
+        params={"symbol": api_symbol, "interval": interval, "limit": int(limit)},
+        timeout=20,
+    )
+    r.raise_for_status()
+    raw = r.json()
+    if not isinstance(raw, list):
+        raise ValueError(f"Binance Futures error: {raw}")
+    if len(raw) < 50:
+        raise ValueError(f"Not enough Binance Futures candles: {len(raw)}")
+    return raw
+
+
+def _binance_ohlcv(symbol, interval):
+    internal = _validate_internal_ticker(symbol)
+    if interval not in INTERVALS:
+        raise ValueError(f"Unknown interval: {interval}")
+    api_symbol = futures_api_symbol(internal)
+
+    if interval == "45m":
+        limit = int(INTERVALS["45m"].get("limit", 450))
+        req_limit = min(1500, limit * 3 + 3)
+        raw = _fetch_futures_klines(api_symbol, "15m", req_limit)[:-1]
+        return _aggregate_15m_to_45m(raw, min(limit, 333))
+
+    limit = INTERVALS[interval]["limit"]
+    raw = _fetch_futures_klines(api_symbol, interval, limit)[:-1]
+    opens = [float(x[1]) for x in raw]
+    highs = [float(x[2]) for x in raw]
+    lows = [float(x[3]) for x in raw]
+    closes = [float(x[4]) for x in raw]
+    volumes = [float(x[5]) for x in raw]
+    return opens, highs, lows, closes, volumes
+
+
+def get_ohlcv(ticker, interval):
+    return _binance_ohlcv(ticker, interval)
+
+
+def get_price(ticker):
+    internal = _validate_internal_ticker(ticker)
+    api_symbol = futures_api_symbol(internal)
+    r = _session.get(
+        "https://fapi.binance.com/fapi/v1/ticker/price",
+        params={"symbol": api_symbol},
+        timeout=10,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if "price" not in data:
+        raise ValueError(f"Binance price error: {data}")
+    return float(data["price"])
+
+
+def _wfo_raw_klines(symbol, interval, limit):
+    internal = _validate_internal_ticker(symbol)
+    api_symbol = futures_api_symbol(internal)
+    return _fetch_futures_klines(api_symbol, interval, int(limit))[:-1]
+
+
+_base_get_futures_mark_price_v67 = get_futures_mark_price
+_base_get_futures_open_interest_v67 = get_futures_open_interest
+_base_get_futures_24h_stats_v67 = get_futures_24h_stats
+_base_get_futures_funding_history_v67 = get_futures_funding_history
+
+
+def get_futures_mark_price(ticker):
+    return _base_get_futures_mark_price_v67(futures_api_symbol(_validate_internal_ticker(ticker)))
+
+
+def get_futures_open_interest(ticker):
+    return _base_get_futures_open_interest_v67(futures_api_symbol(_validate_internal_ticker(ticker)))
+
+
+def get_futures_24h_stats(ticker):
+    return _base_get_futures_24h_stats_v67(futures_api_symbol(_validate_internal_ticker(ticker)))
+
+
+def get_futures_funding_history(ticker, limit=8):
+    return _base_get_futures_funding_history_v67(futures_api_symbol(_validate_internal_ticker(ticker)), limit)
+
+
+WS_SYMBOLS = [futures_api_symbol(s).lower() for s in AUTO_CRYPTO_TICKERS]
+
+
+async def binance_ws_loop(session):
+    if aiohttp is None:
+        print("  [ws] aiohttp is not installed. Websocket disabled.")
+        return
+    streams = []
+    for sym in WS_SYMBOLS:
+        streams.extend([f"{sym}@aggTrade", f"{sym}@depth20@100ms", f"{sym}@forceOrder"])
+    url = BINANCE_FUTURES_WS + "?streams=" + "/".join(streams)
+    print(f"  [ws] Binance Futures streams: {len(streams)}")
+    backoff = 1
+    while True:
+        try:
+            async with session.ws_connect(url, heartbeat=20, timeout=30) as ws:
+                ORDERFLOW.connected = True
+                backoff = 1
+                print("  [ws] Binance connected")
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        packet = json.loads(msg.data)
+                        stream = packet.get("stream", "")
+                        data = packet.get("data", {})
+                        api_symbol = str(data.get("s") or stream.split("@")[0]).upper()
+                        symbol = futures_display_symbol(api_symbol)
+                        ORDERFLOW.last_ws_ts = time.time()
+                        if "aggTrade" in stream:
+                            await ORDERFLOW.on_agg_trade(symbol, data)
+                        elif "depth" in stream:
+                            await ORDERFLOW.on_depth(symbol, data)
+                        elif "forceOrder" in stream:
+                            await ORDERFLOW.on_force_order(symbol, data)
+                    elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            ORDERFLOW.connected = False
+            print(f"  [ws] disconnected/error: {e}; reconnect in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(60, backoff * 2)
+
+
+
+# ============================================================
+# v6.9 — BACKTEST SIGNAL DENSITY + NO-TRADE UX
+# ============================================================
+# The previous compact backtest engine could set a threshold higher than the
+# available vote count in flat/volatile regimes. That produced many "no_signal"
+# reports. Keep the test conservative, but make the threshold achievable and
+# make no-trade auto reports educational instead of red-error-like.
+
+BACKTEST_DEFAULT_LOOKBACK_CANDLES = 450
+BACKTEST_MIN_ACTIONABLE_TRADES_WARN = 5
+
+_base_run_backtest_v68 = run_backtest
+_base_build_auto_task_message_v68 = build_auto_task_message
+
+
+def _bt_score_signal(c_hist, h_hist, l_hist, v_hist):
+    """Leakage-safe compact signal engine for backtest only."""
+    rsi = calc_rsi(c_hist)
+    ema20 = calc_ema(c_hist, 20)
+    ema50 = calc_ema(c_hist, 50)
+    macd, msig = calc_macd(c_hist)
+    st_dir, _ = calc_supertrend(h_hist, l_hist, c_hist)
+    stk, _ = calc_stoch_rsi(c_hist)
+    _, ob_t = calc_obv(c_hist, v_hist)
+    atr = calc_atr(h_hist, l_hist, c_hist)
+
+    if atr is None or atr <= 0:
+        return None, None, None, "no_atr"
+
+    price = c_hist[-1]
+    votes = []
+    if rsi is not None:
+        votes.append(1 if rsi < 50 else -1)
+    if ema20 and ema50:
+        if price > ema20 > ema50:
+            votes.append(1)
+        elif price < ema20 < ema50:
+            votes.append(-1)
+        else:
+            votes.append(0)
+    if macd is not None and msig is not None:
+        votes.append(1 if macd > msig else -1)
+    if st_dir is not None:
+        votes.append(1 if st_dir == 1 else -1)
+    if stk is not None:
+        votes.append(1 if stk < 50 else -1)
+    if ob_t is not None:
+        votes.append(1 if ob_t > 0 else -1)
+
+    if len(votes) < 4:
+        return None, sum(votes) if votes else 0, atr, "neutral"
+
+    score = sum(votes)
+    if len(v_hist) >= 20:
+        avg_v = sum(v_hist[-20:-1]) / 19
+        vol_ratio = v_hist[-1] / avg_v if avg_v > 0 else 1.0
+        if vol_ratio < 0.5:
+            score = int(score * 0.7)
+
+    regime_bt, _, _, _ = detect_market_regime(
+        list(h_hist[-80:]), list(l_hist[-80:]), list(c_hist[-80:]), list(v_hist[-80:])
+    )
+
+    # Achievable threshold: with six votes, 5 is strict but possible.
+    max_abs_score = max(1, len(votes))
+    if regime_bt == "trend":
+        threshold = min(max_abs_score, 4)
+    elif regime_bt in ("flat", "volatile"):
+        threshold = min(max_abs_score, 5)
+    else:
+        threshold = min(max_abs_score, 4)
+    threshold = max(3, threshold)
+
+    direction = "long" if score >= threshold else ("short" if score <= -threshold else None)
+    return direction, score, atr, regime_bt
+
+
+def run_backtest(ticker, interval, lookback_candles=None):
+    lookback = int(lookback_candles or BACKTEST_DEFAULT_LOOKBACK_CANDLES)
+    return _base_run_backtest_v68(ticker, interval, lookback)
+
+
+def format_backtest_no_trades(err, ticker, interval, lookback):
+    tk = TICKERS.get(ticker, {}).get("label", ticker)
+    tf = INTERVALS.get(interval, {}).get("label", interval)
+    lines = [
+        f"⚪ <b>Авто Backtest — {tk}</b>",
+        f"⏱ TF: <b>{tf}</b> | Lookback: <b>{lookback}</b> свечей",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "Сделок не найдено.",
+        "",
+        "Что это значит:",
+        "• бот не нашёл сетапов, которые прошли фильтры бэктеста;",
+        "• это не ошибка и не сигнал входить вручную;",
+        "• на таком участке стратегия могла просто ничего не делать.",
+        "",
+        f"Технически: {err}",
+        "",
+        "📌 Профессиональный вывод: отсутствие сделок лучше, чем принудительные входы ради активности.",
+    ]
+    return "\n".join(lines)
+
+
+def build_auto_task_message(chat_id, task_key):
+    _ensure_auto_task_defaults(chat_id)
+    st = _get_auto_task_settings(chat_id, task_key)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    tf = st.get("tf") or user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    if task_key == "backtest":
+        lookback = BACKTEST_DEFAULT_LOOKBACK_CANDLES
+        stats, err = run_backtest(ticker, tf, lookback)
+        if err:
+            if "Сигналов не найдено" in err or "no_signal" in err:
+                return f"⏰ <b>Авто Backtest</b> | {now}\n\n" + format_backtest_no_trades(err, ticker, tf, lookback)
+            return f"❌ <b>Авто Backtest</b> | {now}\n{err}"
+        msg = "⏰ <b>Авто Backtest</b> | " + now + "\n\n" + format_backtest(stats, ticker, tf)
+        if stats.get("n_trades", 0) < BACKTEST_MIN_ACTIONABLE_TRADES_WARN:
+            msg += "\n\n⚠️ Сделок мало. Такой бэктест нельзя считать статистически сильным."
+        return msg
+
+    return _base_build_auto_task_message_v68(chat_id, task_key)
+
+
+
+# ============================================================
+# v7.0 — PAPER AUTO TRADER / SAFE EXECUTION LAYER
+# ============================================================
+# This is intentionally paper-only. It does not place real Binance orders.
+# The bot chooses a timeframe, tests a few conservative strategy gates,
+# opens/closes virtual trades, and writes a trade report.
+
+PAPER_TRADER_STATE_FILE = "paper_trader_state.json"
+PAPER_TRADER_TFS = ["5m", "15m", "30m", "45m", "1h"]
+PAPER_TRADER_MAX_POSITIONS = 1
+PAPER_TRADER_MAX_LEVERAGE = 5
+PAPER_TRADER_MAX_SIZE_PCT = 5.0
+PAPER_TRADER_MIN_ENTRY_NOW = 70
+PAPER_TRADER_MIN_RR = 1.35
+PAPER_TRADER_MAX_TRADES_PER_DAY = 3
+
+_paper_state = {"positions": {}, "trades": [], "events": []}
+_paper_state_loaded = False
+_paper_lock = threading.Lock()
+
+_base_build_auto_task_message_v69 = build_auto_task_message
+_base_positions_risk_keyboard_v69 = positions_risk_keyboard
+_base_async_handle_update_v69 = async_handle_update
+
+AUTO_TASKS.setdefault("paper_trader", {
+    "label": "🤖 Paper Trader",
+    "needs_tf": False,
+    "default_enabled": False,
+    "default_interval": "30m",
+    "default_tf": None,
+})
+
+
+def _paper_load_state():
+    global _paper_state_loaded, _paper_state
+    if _paper_state_loaded:
+        return
+    try:
+        if os.path.exists(PAPER_TRADER_STATE_FILE):
+            with open(PAPER_TRADER_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    _paper_state = {
+                        "positions": data.get("positions", {}) if isinstance(data.get("positions", {}), dict) else {},
+                        "trades": data.get("trades", []) if isinstance(data.get("trades", []), list) else [],
+                        "events": data.get("events", []) if isinstance(data.get("events", []), list) else [],
+                    }
+    except Exception as e:
+        print(f"  [paper] load error: {e}")
+    _paper_state_loaded = True
+
+
+def _paper_save_state():
+    try:
+        with open(PAPER_TRADER_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_paper_state, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [paper] save error: {e}")
+
+
+def _paper_chat_key(chat_id):
+    return str(chat_id)
+
+
+def _paper_positions(chat_id=None):
+    _paper_load_state()
+    rows = list((_paper_state.get("positions") or {}).values())
+    if chat_id is None:
+        return rows
+    key = _paper_chat_key(chat_id)
+    return [p for p in rows if str(p.get("chat_id")) == key]
+
+
+def _paper_closed_trades(chat_id=None):
+    _paper_load_state()
+    rows = list(_paper_state.get("trades") or [])
+    if chat_id is None:
+        return rows
+    key = _paper_chat_key(chat_id)
+    return [t for t in rows if str(t.get("chat_id")) == key]
+
+
+def _paper_today_open_count(chat_id):
+    today = datetime.now(timezone.utc).date().isoformat()
+    rows = _paper_closed_trades(chat_id)
+    opens = 0
+    for t in rows:
+        if str(t.get("opened_at", "")).startswith(today):
+            opens += 1
+    for p in _paper_positions(chat_id):
+        if str(p.get("opened_at", "")).startswith(today):
+            opens += 1
+    return opens
+
+
+def _paper_calc_pnl_pct(direction, entry, exit_price):
+    if not entry or not exit_price:
+        return 0.0
+    if direction == "long":
+        return (exit_price - entry) / entry * 100
+    return (entry - exit_price) / entry * 100
+
+
+def _paper_position_notional(chat_id):
+    bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+    size_pct = min(float(user_size_pct.get(chat_id, DEFAULT_SIZE_PCT) or DEFAULT_SIZE_PCT), PAPER_TRADER_MAX_SIZE_PCT)
+    lev = min(int(user_leverage.get(chat_id, DEFAULT_LEVERAGE) or DEFAULT_LEVERAGE), PAPER_TRADER_MAX_LEVERAGE)
+    margin = bal * size_pct / 100.0
+    return bal, size_pct, lev, margin, margin * lev
+
+
+def _paper_close_position(pos_id, exit_price, reason):
+    _paper_load_state()
+    with _paper_lock:
+        pos = (_paper_state.get("positions") or {}).pop(pos_id, None)
+        if not pos:
+            _paper_save_state()
+            return None
+        direction = pos.get("direction")
+        entry = _safe_float(pos.get("entry_price"), 0) or 0
+        notional = _safe_float(pos.get("notional"), 0) or 0
+        pnl_pct = _paper_calc_pnl_pct(direction, entry, exit_price)
+        pnl_usd = notional * pnl_pct / 100.0
+        fee_usd = notional * BACKTEST_FEE_RATE * 2
+        net_usd = pnl_usd - fee_usd
+        trade = dict(pos)
+        trade.update({
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "exit_price": exit_price,
+            "exit_reason": reason,
+            "pnl_pct": pnl_pct,
+            "pnl_usd": pnl_usd,
+            "fee_usd": fee_usd,
+            "net_usd": net_usd,
+            "net_pct_balance": net_usd / max(_safe_float(pos.get("balance"), DEFAULT_BALANCE) or DEFAULT_BALANCE, 0.0001) * 100,
+        })
+        _paper_state.setdefault("trades", []).append(trade)
+        _paper_state["trades"] = _paper_state["trades"][-1000:]
+        _paper_save_state()
+        return trade
+
+
+def _paper_manage_open_positions(chat_id):
+    closed = []
+    for pos in list(_paper_positions(chat_id)):
+        try:
+            ticker = pos.get("ticker")
+            price = get_price(ticker)
+            direction = pos.get("direction")
+            sl = _safe_float(pos.get("sl"), 0) or 0
+            tp1 = _safe_float(pos.get("tp1"), 0) or 0
+            hit = None
+            if direction == "long":
+                if price <= sl:
+                    hit = "SL"
+                elif price >= tp1:
+                    hit = "TP1"
+            else:
+                if price >= sl:
+                    hit = "SL"
+                elif price <= tp1:
+                    hit = "TP1"
+            if hit:
+                trade = _paper_close_position(pos.get("pos_id"), price, hit)
+                if trade:
+                    closed.append(trade)
+        except Exception as e:
+            print(f"  [paper] manage error: {e}")
+    return closed
+
+
+def _paper_strategy_candidates(chat_id, ticker, interval, data):
+    ep = data.get("entry_plan") or {}
+    status = ep.get("status")
+    direction = data.get("direction")
+    risk = data.get("risk_levels") or {}
+    rr = _safe_float(ep.get("rr_now"), 0) or _safe_float(risk.get("rr_ratio"), 0) or 0
+    now_score = int(ep.get("entry_now_score", ep.get("score", 0)) or 0)
+    setup_score = int(ep.get("setup_score", ep.get("score", 0)) or 0)
+    confidence = int(data.get("confidence", 0) or 0)
+    micro = data.get("micro_regime") or ""
+    mtf = _safe_float(data.get("mtf_score"), 0) or 0
+    warnings = data.get("risk_warnings") or []
+    blockers = data.get("risk_blockers") or []
+    rows = []
+
+    if status != "ENTER_NOW" or not direction or not risk:
+        return rows
+    if blockers:
+        return rows
+    if rr < PAPER_TRADER_MIN_RR or now_score < PAPER_TRADER_MIN_ENTRY_NOW:
+        return rows
+
+    base_score = now_score + min(15, max(0, confidence - 60) // 2) + min(10, max(0, rr - 1.2) * 5)
+
+    rows.append({
+        "strategy": "confluence_entry_v1",
+        "score": base_score,
+        "ticker": ticker,
+        "interval": interval,
+        "direction": direction,
+        "data": data,
+        "entry_plan": ep,
+        "reason": f"EntryNow {now_score}/100, Setup {setup_score}/100, RR {rr:.2f}x, confidence {confidence}/95",
+    })
+
+    trend_ok = (
+        direction == "long" and micro in ("TREND_UP", "BREAKOUT") and mtf >= 0
+    ) or (
+        direction == "short" and micro in ("TREND_DOWN", "BREAKOUT") and mtf <= 0
+    )
+    if trend_ok and now_score >= 72 and rr >= 1.45:
+        rows.append({
+            "strategy": "trend_follow_v1",
+            "score": base_score + 8,
+            "ticker": ticker,
+            "interval": interval,
+            "direction": direction,
+            "data": data,
+            "entry_plan": ep,
+            "reason": f"trend/micro подтверждает направление: {micro}, MTF={mtf:+.1f}, RR {rr:.2f}x",
+        })
+
+    if now_score >= 80 and rr >= 1.6 and not warnings:
+        rows.append({
+            "strategy": "strict_quality_v1",
+            "score": base_score + 12,
+            "ticker": ticker,
+            "interval": interval,
+            "direction": direction,
+            "data": data,
+            "entry_plan": ep,
+            "reason": f"строгий фильтр: EntryNow {now_score}/100, RR {rr:.2f}x, без warnings",
+        })
+
+    return rows
+
+
+def paper_select_trade_candidate(chat_id):
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    tried = []
+    candidates = []
+    for tf in PAPER_TRADER_TFS:
+        try:
+            data = full_analyze(ticker, tf)
+            ep = data.get("entry_plan") or {}
+            tried.append({
+                "tf": tf,
+                "signal": data.get("signal"),
+                "status": ep.get("status"),
+                "entry_now": int(ep.get("entry_now_score", ep.get("score", 0)) or 0),
+                "setup": int(ep.get("setup_score", ep.get("score", 0)) or 0),
+                "rr": _safe_float(ep.get("rr_now"), 0) or _safe_float((data.get("risk_levels") or {}).get("rr_ratio"), 0) or 0,
+                "gate": ep.get("entry_gate_reason", ""),
+            })
+            candidates.extend(_paper_strategy_candidates(chat_id, ticker, tf, data))
+        except Exception as e:
+            tried.append({"tf": tf, "error": str(e)})
+    candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return (candidates[0] if candidates else None), tried
+
+
+def _paper_open_candidate(chat_id, candidate):
+    data = candidate["data"]
+    ep = candidate["entry_plan"]
+    ticker = candidate["ticker"]
+    interval = candidate["interval"]
+    direction = candidate["direction"]
+    bal, size_pct, lev, margin, notional = _paper_position_notional(chat_id)
+    entry = get_price(ticker)
+    sl = _safe_float(ep.get("sl"), None) or _safe_float((data.get("risk_levels") or {}).get("sl"), None)
+    tp1 = _safe_float(ep.get("tp1"), None) or _safe_float((data.get("risk_levels") or {}).get("tp1"), None)
+    tp2 = _safe_float(ep.get("tp2"), None) or _safe_float((data.get("risk_levels") or {}).get("tp2"), tp1)
+    if not sl or not tp1:
+        return None, "Нет SL/TP для paper-сделки."
+    risk_usd = abs(entry - sl) / entry * notional if entry > 0 else 0
+    risk_pct = risk_usd / bal * 100 if bal > 0 else 0
+    if risk_pct > RISK_MAX_SINGLE_TRADE_PCT:
+        return None, f"Paper-сделка заблокирована: риск {risk_pct:.2f}% выше лимита {RISK_MAX_SINGLE_TRADE_PCT:.2f}%."
+    pos_id = f"paper_{ticker}_{interval}_{int(time.time())}"
+    pos = {
+        "pos_id": pos_id,
+        "chat_id": _paper_chat_key(chat_id),
+        "ticker": ticker,
+        "interval": interval,
+        "direction": direction,
+        "strategy": candidate.get("strategy"),
+        "entry_price": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "balance": bal,
+        "size_pct": size_pct,
+        "leverage": lev,
+        "margin": margin,
+        "notional": notional,
+        "risk_usd": risk_usd,
+        "risk_pct": risk_pct,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "reason": candidate.get("reason"),
+    }
+    _paper_load_state()
+    with _paper_lock:
+        _paper_state.setdefault("positions", {})[pos_id] = pos
+        _paper_save_state()
+    return pos, None
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _paper_load_state()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    closed = _paper_manage_open_positions(chat_id)
+    open_positions = _paper_positions(chat_id)
+
+    lines = [
+        f"🤖 <b>Paper Trader</b> | {now}",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if closed:
+        lines.append("Закрытые paper-сделки:")
+        for t in closed[-3:]:
+            lines.append(
+                f"• {TICKERS.get(t.get('ticker'), {}).get('label', t.get('ticker'))} {str(t.get('direction')).upper()} "
+                f"{t.get('exit_reason')} | net <b>{t.get('net_usd', 0):+.3f} USDT</b> ({t.get('net_pct_balance', 0):+.2f}%)"
+            )
+        lines.append("")
+
+    if open_positions:
+        lines.append("Новая сделка не открыта: уже есть открытая paper-позиция.")
+        for p in open_positions:
+            try:
+                price = get_price(p.get("ticker"))
+                pnl_pct = _paper_calc_pnl_pct(p.get("direction"), p.get("entry_price"), price)
+                lines.append(
+                    f"• {TICKERS.get(p.get('ticker'), {}).get('label', p.get('ticker'))} {str(p.get('direction')).upper()} "
+                    f"{INTERVALS.get(p.get('interval'), {}).get('label', p.get('interval'))} | PnL <b>{pnl_pct:+.2f}%</b>"
+                )
+            except Exception:
+                pass
+        lines += ["", "📌 Paper mode: реальных ордеров на Binance нет."]
+        return "\n".join(lines)
+
+    if _paper_today_open_count(chat_id) >= PAPER_TRADER_MAX_TRADES_PER_DAY:
+        lines += [
+            f"Дневной лимит paper-сделок достигнут: <b>{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>.",
+            "Это защита от overtrading.",
+        ]
+        return "\n".join(lines)
+
+    candidate, tried = paper_select_trade_candidate(chat_id)
+    if not candidate:
+        lines += [
+            "Сделка не открыта: подходящего сетапа нет.",
+            "",
+            "Что проверял бот:",
+        ]
+        for row in tried[:5]:
+            if row.get("error"):
+                lines.append(f"• {row['tf']}: ошибка {row['error']}")
+            else:
+                lines.append(
+                    f"• {row['tf']}: {row.get('status')} | EntryNow {row.get('entry_now')}/100 | "
+                    f"Setup {row.get('setup')}/100 | RR {row.get('rr'):.2f}x"
+                )
+        lines += [
+            "",
+            "📌 Это нормальный результат. Бот не обязан торговать каждый цикл.",
+        ]
+        return "\n".join(lines)
+
+    pos, err = _paper_open_candidate(chat_id, candidate)
+    if err:
+        lines += [
+            "Сделка не открыта.",
+            err,
+            "",
+            "📌 Защитный фильтр важнее активности.",
+        ]
+        return "\n".join(lines)
+
+    lines += [
+        "✅ <b>Открыта paper-сделка</b>",
+        f"Актив: <b>{TICKERS.get(pos['ticker'], {}).get('label', pos['ticker'])}</b>",
+        f"TF выбран ботом: <b>{INTERVALS.get(pos['interval'], {}).get('label', pos['interval'])}</b>",
+        f"Стратегия: <b>{pos['strategy']}</b>",
+        f"Направление: <b>{pos['direction'].upper()}</b>",
+        f"Entry: <b>{fmt_price(pos['entry_price'], pos['ticker'])}</b>",
+        f"SL: <b>{fmt_price(pos['sl'], pos['ticker'])}</b>",
+        f"TP1: <b>{fmt_price(pos['tp1'], pos['ticker'])}</b>",
+        f"Margin: <b>{pos['margin']:.2f} USDT</b> | x{pos['leverage']} | Notional {pos['notional']:.2f} USDT",
+        f"Риск до SL: <b>{pos['risk_usd']:.3f} USDT</b> ({pos['risk_pct']:.2f}% баланса)",
+        "",
+        f"Почему: {pos.get('reason')}",
+        "",
+        "📌 Paper mode: это виртуальная сделка, реальных ордеров на Binance нет.",
+    ]
+    return "\n".join(lines)
+
+
+def format_paper_trader_status(chat_id):
+    _ensure_auto_task_defaults(chat_id)
+    st = _get_auto_task_settings(chat_id, "paper_trader")
+    enabled = bool(st.get("enabled")) and chat_id in auto_chat_ids
+    iv = AUTO_SEND_INTERVALS.get(st.get("send_interval"), AUTO_SEND_INTERVALS["30m"])["label"]
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    lines = [
+        "🤖 <b>Paper Trader</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Статус: <b>{'ON' if enabled else 'OFF'}</b>",
+        f"Актив: <b>{TICKERS.get(ticker, {}).get('label', ticker)}</b>",
+        f"Частота проверки/сделок: <b>{iv}</b>",
+        f"TF: <b>бот выбирает сам</b> из {', '.join(PAPER_TRADER_TFS)}",
+        f"Режим: <b>paper only</b>",
+        "",
+        "Бот откроет максимум одну paper-позицию и только если EntryNow, RR и риск проходят фильтры.",
+    ]
+    positions = _paper_positions(chat_id)
+    if positions:
+        lines += ["", "Открытые paper-позиции:"]
+        for p in positions:
+            lines.append(f"• {TICKERS.get(p.get('ticker'), {}).get('label', p.get('ticker'))} {str(p.get('direction')).upper()} {p.get('interval')} | {p.get('strategy')}")
+    return "\n".join(lines)
+
+
+def paper_trader_keyboard(chat_id):
+    _ensure_auto_task_defaults(chat_id)
+    st = _get_auto_task_settings(chat_id, "paper_trader")
+    enabled = bool(st.get("enabled")) and chat_id in auto_chat_ids
+    toggle = "⛔ Выключить Paper Trader" if enabled else "✅ Включить Paper Trader"
+    iv = AUTO_SEND_INTERVALS.get(st.get("send_interval"), AUTO_SEND_INTERVALS["30m"])["label"]
+    return {"inline_keyboard": [
+        [{"text": toggle, "callback_data": "paper_toggle"}],
+        [{"text": "▶️ Прогнать цикл сейчас", "callback_data": "paper_run_now"}],
+        [{"text": f"⏰ Частота: {iv}", "callback_data": "auto_choose_iv_paper_trader"}],
+        [{"text": "📒 Paper отчёт", "callback_data": "paper_report"}],
+        [{"text": "◀️ Позиции / Риск", "callback_data": "menu_positions"}],
+    ]}
+
+
+def format_paper_report(chat_id):
+    trades = _paper_closed_trades(chat_id)
+    positions = _paper_positions(chat_id)
+    net = sum(_safe_float(t.get("net_usd"), 0) or 0 for t in trades)
+    wins = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) > 0]
+    wr = len(wins) / len(trades) * 100 if trades else 0
+    by_strategy = {}
+    for t in trades:
+        s = t.get("strategy", "unknown")
+        by_strategy.setdefault(s, {"n": 0, "net": 0.0, "w": 0})
+        by_strategy[s]["n"] += 1
+        by_strategy[s]["net"] += _safe_float(t.get("net_usd"), 0) or 0
+        by_strategy[s]["w"] += 1 if (_safe_float(t.get("net_usd"), 0) or 0) > 0 else 0
+    lines = [
+        "📒 <b>Paper Trader Report</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Закрытых сделок: <b>{len(trades)}</b>",
+        f"Winrate: <b>{wr:.1f}%</b>",
+        f"Net PnL: <b>{net:+.3f} USDT</b>",
+        f"Открытых paper-позиций: <b>{len(positions)}</b>",
+    ]
+    if by_strategy:
+        lines += ["", "По стратегиям:"]
+        for s, row in sorted(by_strategy.items()):
+            swr = row["w"] / row["n"] * 100 if row["n"] else 0
+            lines.append(f"• {s}: n={row['n']} | WR {swr:.1f}% | net {row['net']:+.3f} USDT")
+    if trades:
+        lines += ["", "Последние сделки:"]
+        for t in trades[-6:]:
+            lines.append(
+                f"• {TICKERS.get(t.get('ticker'), {}).get('label', t.get('ticker'))} {str(t.get('direction')).upper()} "
+                f"{t.get('interval')} {t.get('exit_reason')} | {t.get('net_usd', 0):+.3f} USDT"
+            )
+    lines += ["", "📌 Это paper-статистика. Для реальной торговли она ещё недостаточна без Testnet и длительного журнала."]
+    return "\n".join(lines)
+
+
+def positions_risk_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "📂 Мои позиции", "callback_data": "my_positions"},
+            {"text": "🛡 Portfolio Risk", "callback_data": "portfolio_risk"},
+        ],
+        [
+            {"text": "🤖 Paper Trader", "callback_data": "paper_trader"},
+            {"text": "📒 Paper отчёт", "callback_data": "paper_report"},
+        ],
+        [
+            {"text": "💼 Баланс / Плечо", "callback_data": "my_balance"},
+            {"text": "📖 Риск простыми словами", "callback_data": "learn_risk"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def build_auto_task_message(chat_id, task_key):
+    if task_key == "paper_trader":
+        return paper_trader_cycle(chat_id)
+    return _base_build_auto_task_message_v69(chat_id, task_key)
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Paper Trader</b> — режим виртуальной торговли. Бот сам выбирает TF, открывает/закрывает paper-сделки и ведёт отчёт, но не отправляет реальные ордера.
+
+<b>Частота торговли</b> — как часто бот проверяет рынок. Это не таймфрейм свечей. Например, частота 30m значит: бот думает раз в 30 минут, а TF он может выбрать 5m, 15m, 1h и т.д.
+
+<b>Testnet</b> — демо-среда биржи с API-ключами отдельно от реального аккаунта. После paper-режима можно подключать Binance Futures Testnet, но не mainnet."""
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+
+            if data == "paper_trader":
+                await async_answer_callback(session, callback_id, "Paper")
+                await async_send(session, chat_id, format_paper_trader_status(chat_id), paper_trader_keyboard(chat_id))
+                return
+
+            if data == "paper_toggle":
+                _ensure_auto_task_defaults(chat_id)
+                st = _get_auto_task_settings(chat_id, "paper_trader")
+                currently = bool(st.get("enabled")) and chat_id in auto_chat_ids
+                if currently:
+                    st["enabled"] = False
+                    await async_answer_callback(session, callback_id, "Paper OFF")
+                else:
+                    st["enabled"] = True
+                    auto_chat_ids.add(chat_id)
+                    await async_answer_callback(session, callback_id, "Paper ON")
+                await async_send(session, chat_id, format_paper_trader_status(chat_id), paper_trader_keyboard(chat_id))
+                return
+
+            if data == "paper_run_now":
+                await async_answer_callback(session, callback_id, "Paper cycle")
+                loop = asyncio.get_running_loop()
+                msg = await loop.run_in_executor(None, paper_trader_cycle, chat_id, True)
+                await async_send(session, chat_id, msg, paper_trader_keyboard(chat_id))
+                return
+
+            if data == "paper_report":
+                await async_answer_callback(session, callback_id, "Paper report")
+                await async_send(session, chat_id, format_paper_report(chat_id), paper_trader_keyboard(chat_id))
+                return
+
+        await _base_async_handle_update_v69(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v70] error: {e}")
+
+
+
+# ============================================================
+# v7.1 — CONTEXT NAVIGATION + PAPER JOURNAL DETAILS
+# ============================================================
+# Reports should not dump the main menu immediately. They return to their
+# parent section. Paper report is journal-first: entries, reasons, gates.
+
+_base_async_handle_update_v70 = async_handle_update
+_base_compact_signal_keyboard_v70 = compact_signal_keyboard
+_base_entry_detail_keyboard_v70 = entry_detail_keyboard
+_base_entry_analysis_keyboard_v70 = entry_analysis_keyboard
+_base_balance_keyboard_v70 = balance_keyboard
+_base_positions_risk_keyboard_v70 = positions_risk_keyboard
+_base_paper_open_candidate_v70 = _paper_open_candidate
+
+
+def back_to_positions_keyboard():
+    return {"inline_keyboard": [[{"text": "◀️ Назад: Позиции / Риск", "callback_data": "menu_positions"}]]}
+
+
+def back_to_analytics_keyboard():
+    return {"inline_keyboard": [[{"text": "◀️ Назад: Аналитика", "callback_data": "menu_analytics"}]]}
+
+
+def back_to_signal_keyboard():
+    return {"inline_keyboard": [[{"text": "◀️ Назад: Сигнал", "callback_data": "menu_signal"}]]}
+
+
+def back_to_main_keyboard():
+    return {"inline_keyboard": [[{"text": "◀️ Назад: Главное меню", "callback_data": "back_main"}]]}
+
+
+def paper_report_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🤖 Paper Trader", "callback_data": "paper_trader"}],
+        [{"text": "◀️ Назад: Позиции / Риск", "callback_data": "menu_positions"}],
+    ]}
+
+
+def compact_signal_keyboard(open_callback=None):
+    rows = []
+    if open_callback:
+        rows.append([open_callback])
+    rows += [
+        [
+            {"text": "📊 Анализ / индикаторы", "callback_data": "sig_analysis"},
+            {"text": "🎯 Точка входа", "callback_data": "sig_entry"},
+        ],
+        [
+            {"text": "📡 Futures Context", "callback_data": "sig_futures"},
+            {"text": "🔄 Обновить сигнал", "callback_data": "get_signal"},
+        ],
+        [{"text": "◀️ Назад: Сигнал", "callback_data": "menu_signal"}],
+    ]
+    return {"inline_keyboard": rows}
+
+
+def entry_detail_keyboard(open_callback=None):
+    rows = []
+    if open_callback:
+        rows.append([open_callback])
+    rows += [
+        [{"text": "🧠 Анализ точки входа", "callback_data": "sig_entry_why"}],
+        [
+            {"text": "📊 Анализ / индикаторы", "callback_data": "sig_analysis"},
+            {"text": "📡 Futures Context", "callback_data": "sig_futures"},
+        ],
+        [
+            {"text": "🔄 Обновить точку входа", "callback_data": "entry_point"},
+            {"text": "◀️ Назад: Сигнал", "callback_data": "menu_signal"},
+        ],
+    ]
+    return {"inline_keyboard": rows}
+
+
+def entry_analysis_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🎯 Назад к точке входа", "callback_data": "sig_entry"}],
+        [
+            {"text": "📊 Анализ / индикаторы", "callback_data": "sig_analysis"},
+            {"text": "📡 Futures Context", "callback_data": "sig_futures"},
+        ],
+        [{"text": "◀️ Назад: Сигнал", "callback_data": "menu_signal"}],
+    ]}
+
+
+def balance_keyboard(chat_id):
+    bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+    lev = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
+    pct = user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)
+    return {"inline_keyboard": [
+        [{"text": f"💵 Баланс: ${bal:.2f}", "callback_data": "set_balance_menu"}],
+        [{"text": f"⚡ Плечо: x{lev}", "callback_data": "set_leverage_menu"}],
+        [{"text": f"🎲 Размер: {pct}%", "callback_data": "set_size_menu"}],
+        [{"text": "◀️ Назад: Позиции / Риск", "callback_data": "menu_positions"}],
+    ]}
+
+
+def positions_risk_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "📂 Мои позиции", "callback_data": "my_positions"},
+            {"text": "🛡 Portfolio Risk", "callback_data": "portfolio_risk"},
+        ],
+        [
+            {"text": "🤖 Paper Trader", "callback_data": "paper_trader"},
+            {"text": "📒 Paper отчёт", "callback_data": "paper_report"},
+        ],
+        [
+            {"text": "💼 Баланс / Плечо", "callback_data": "my_balance"},
+            {"text": "📖 Риск простыми словами", "callback_data": "positions_learn_risk"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def _positions_list_keyboard(chat_id):
+    positions = get_user_positions(chat_id)
+    rows = []
+    for pos in positions:
+        tk_label = TICKERS.get(pos.get("ticker"), {}).get("label", pos.get("ticker"))
+        dir_label = str(pos.get("direction", "")).upper()
+        rows.append([
+            {"text": f"❌ Закрыть {tk_label} {dir_label}", "callback_data": f"close_pos_{pos['pos_id']}"},
+            {"text": "✏️ Ред.", "callback_data": f"edit_pos_{pos['pos_id']}"},
+        ])
+    rows.append([{"text": "◀️ Назад: Позиции / Риск", "callback_data": "menu_positions"}])
+    return {"inline_keyboard": rows}
+
+
+def _paper_decision_snapshot(candidate):
+    data = candidate.get("data") or {}
+    ep = candidate.get("entry_plan") or {}
+    ctx = data.get("futures_context") or {}
+    return {
+        "strategy_score": candidate.get("score"),
+        "reason": candidate.get("reason"),
+        "signal": data.get("signal"),
+        "confidence": data.get("confidence"),
+        "micro_regime": data.get("micro_regime"),
+        "mtf_score": data.get("mtf_score"),
+        "entry_status": ep.get("status"),
+        "entry_now_score": ep.get("entry_now_score", ep.get("score")),
+        "setup_score": ep.get("setup_score", ep.get("score")),
+        "rr_now": ep.get("rr_now") or (data.get("risk_levels") or {}).get("rr_ratio"),
+        "gate": ep.get("entry_gate_reason"),
+        "why": list(ep.get("why") or [])[:4],
+        "warnings": list(ep.get("warnings") or [])[:4],
+        "bull_factors": list(data.get("bull_args") or [])[:4],
+        "bear_factors": list(data.get("bear_args") or [])[:4],
+        "futures_warnings": list(ctx.get("warnings") or [])[:3],
+        "funding_rate_pct": ctx.get("funding_rate_pct"),
+        "open_interest_usdt": ctx.get("open_interest_usdt"),
+    }
+
+
+def _paper_journal_note(snapshot):
+    return (
+        f"{snapshot.get('reason') or 'сетап прошёл фильтры'} | "
+        f"EntryNow {snapshot.get('entry_now_score')}/100, "
+        f"Setup {snapshot.get('setup_score')}/100, "
+        f"RR {snapshot.get('rr_now')}"
+    )
+
+
+def _paper_open_candidate(chat_id, candidate):
+    pos, err = _base_paper_open_candidate_v70(chat_id, candidate)
+    if err or not pos:
+        return pos, err
+    snapshot = _paper_decision_snapshot(candidate)
+    pos_id = pos.get("pos_id")
+    with _paper_lock:
+        live_pos = (_paper_state.get("positions") or {}).get(pos_id)
+        if live_pos is not None:
+            live_pos["decision"] = snapshot
+            live_pos["journal_note"] = _paper_journal_note(snapshot)
+            live_pos["selection_score"] = candidate.get("score")
+            _paper_state.setdefault("events", []).append({
+                "type": "paper_open",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "chat_id": _paper_chat_key(chat_id),
+                "pos_id": pos_id,
+                "ticker": pos.get("ticker"),
+                "interval": pos.get("interval"),
+                "direction": pos.get("direction"),
+                "strategy": pos.get("strategy"),
+                "decision": snapshot,
+            })
+            _paper_state["events"] = _paper_state["events"][-1000:]
+            pos.update(live_pos)
+            _paper_save_state()
+    return pos, None
+
+
+def _fmt_dt_short(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(value or "—")
+
+
+def _fmt_num(value, digits=2):
+    try:
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return "—"
+
+
+def _paper_journal_lines(item, is_open=False):
+    d = item.get("decision") or {}
+    ticker = item.get("ticker")
+    label = TICKERS.get(ticker, {}).get("label", ticker)
+    tf = INTERVALS.get(item.get("interval"), {}).get("label", item.get("interval"))
+    status = "ОТКРЫТА" if is_open else f"ЗАКРЫТА: {item.get('exit_reason', '—')}"
+    lines = [
+        f"• <b>{_fmt_dt_short(item.get('opened_at'))}</b> | {label} {str(item.get('direction')).upper()} | {tf}",
+        f"  Статус: <b>{status}</b> | стратегия: <b>{item.get('strategy', '—')}</b>",
+        f"  Entry {fmt_price(item.get('entry_price'), ticker)} | SL {fmt_price(item.get('sl'), ticker)} | TP1 {fmt_price(item.get('tp1'), ticker)}",
+    ]
+    if not is_open:
+        lines.append(
+            f"  Exit {fmt_price(item.get('exit_price'), ticker)} | net <b>{_fmt_num(item.get('net_usd'), 3)} USDT</b> ({_fmt_num(item.get('net_pct_balance'), 2)}%)"
+        )
+    lines += [
+        f"  Почему открыл: {d.get('reason') or item.get('reason') or item.get('journal_note') or 'причина не записана в старой версии'}",
+        f"  Метрики: signal={d.get('signal', '—')} | EntryNow={d.get('entry_now_score', '—')}/100 | Setup={d.get('setup_score', '—')}/100 | RR={_fmt_num(d.get('rr_now'), 2)} | Conf={d.get('confidence', '—')}",
+    ]
+    if d.get("gate"):
+        lines.append(f"  Gate: {d.get('gate')}")
+    if d.get("bull_factors"):
+        lines.append("  За: " + " | ".join(str(x) for x in d.get("bull_factors")[:2]))
+    if d.get("bear_factors"):
+        lines.append("  Против: " + " | ".join(str(x) for x in d.get("bear_factors")[:2]))
+    if d.get("warnings"):
+        lines.append("  Риски входа: " + " | ".join(str(x) for x in d.get("warnings")[:2]))
+    return lines
+
+
+def format_paper_report(chat_id):
+    trades = _paper_closed_trades(chat_id)
+    positions = _paper_positions(chat_id)
+    net = sum(_safe_float(t.get("net_usd"), 0) or 0 for t in trades)
+    wins = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) > 0]
+    wr = len(wins) / len(trades) * 100 if trades else 0
+    by_strategy = {}
+    for t in trades:
+        s = t.get("strategy", "unknown")
+        by_strategy.setdefault(s, {"n": 0, "net": 0.0, "w": 0})
+        by_strategy[s]["n"] += 1
+        by_strategy[s]["net"] += _safe_float(t.get("net_usd"), 0) or 0
+        by_strategy[s]["w"] += 1 if (_safe_float(t.get("net_usd"), 0) or 0) > 0 else 0
+
+    lines = [
+        "📒 <b>Paper Trader Report</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Закрытых сделок: <b>{len(trades)}</b>",
+        f"Открытых paper-позиций: <b>{len(positions)}</b>",
+        f"Winrate: <b>{wr:.1f}%</b>",
+        f"Net PnL: <b>{net:+.3f} USDT</b>",
+    ]
+    if by_strategy:
+        lines += ["", "Статистика по стратегиям:"]
+        for s, row in sorted(by_strategy.items()):
+            swr = row["w"] / row["n"] * 100 if row["n"] else 0
+            lines.append(f"• {s}: n={row['n']} | WR {swr:.1f}% | net {row['net']:+.3f} USDT")
+
+    lines += ["", "📓 <b>Журнал решений</b>"]
+    if not positions and not trades:
+        lines += [
+            "Пока нет открытых или закрытых paper-сделок.",
+            "Когда бот откроет позицию, здесь будет: время, тикер, TF, стратегия, причина входа, EntryNow/Setup/RR, gate и факторы за/против.",
+        ]
+    else:
+        if positions:
+            lines += ["", "<b>Открытые:</b>"]
+            for p in positions[-5:]:
+                lines.extend(_paper_journal_lines(p, is_open=True))
+        if trades:
+            lines += ["", "<b>Последние закрытые:</b>"]
+            for t in trades[-8:]:
+                lines.extend(_paper_journal_lines(t, is_open=False))
+    lines += [
+        "",
+        "📌 Это paper-журнал. Для реальной торговли нужен отдельный этап Testnet и лимиты риска.",
+    ]
+    return "\n".join(lines)
+
+
+async def _send_balance_panel_v71(session, chat_id):
+    bal = user_balance.get(chat_id, DEFAULT_BALANCE)
+    lev = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
+    pct = user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)
+    margin = bal * pct / 100
+    pos_val = margin * lev
+    await async_send(session, chat_id,
+        f"💼 <b>Мой баланс и параметры сделки</b>\n\n"
+        f"💵 Баланс: <b>${bal:.2f}</b>\n"
+        f"⚡ Плечо: <b>x{lev}</b>\n"
+        f"🎲 Размер позиции: <b>{pct}%</b>\n\n"
+        f"При открытии сделки:\n"
+        f"Маржа: <b>${margin:.2f}</b>\n"
+        f"Объём: <b>${pos_val:.2f}</b>\n\n"
+        f"⚠️ Для Paper Trader сверху стоят дополнительные лимиты: max x{PAPER_TRADER_MAX_LEVERAGE}, max {PAPER_TRADER_MAX_SIZE_PCT}% маржи.",
+        balance_keyboard(chat_id)
+    )
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+
+            if data == "portfolio_risk":
+                await async_answer_callback(session, callback_id, "Риск")
+                await async_send(session, chat_id, format_portfolio_risk(chat_id), back_to_positions_keyboard())
+                return
+
+            if data == "my_positions":
+                await async_answer_callback(session, callback_id, "Позиции")
+                await async_send(session, chat_id, format_positions_list(get_user_positions(chat_id)), _positions_list_keyboard(chat_id))
+                return
+
+            if data == "my_balance":
+                await async_answer_callback(session, callback_id, "Баланс")
+                await _send_balance_panel_v71(session, chat_id)
+                return
+
+            if data == "positions_learn_risk":
+                await async_answer_callback(session, callback_id, "Риск")
+                await async_send(session, chat_id, LEARN_TEXTS["learn_risk"], back_to_positions_keyboard())
+                return
+
+            if data == "paper_report":
+                await async_answer_callback(session, callback_id, "Paper report")
+                await async_send(session, chat_id, format_paper_report(chat_id), paper_report_keyboard())
+                return
+
+            if data == "signal_stats":
+                await async_answer_callback(session, callback_id, "Статистика")
+                await async_send(session, chat_id, format_signal_stats(chat_id), back_to_analytics_keyboard())
+                return
+            if data == "market_heatmap":
+                await async_answer_callback(session, callback_id, "Heatmap")
+                await async_send(session, chat_id, format_market_heatmap(chat_id), back_to_analytics_keyboard())
+                return
+            if data == "monte_carlo":
+                await async_answer_callback(session, callback_id, "Monte Carlo")
+                await async_send(session, chat_id, format_monte_carlo_report(chat_id), back_to_analytics_keyboard())
+                return
+            if data == "signal_clusters":
+                await async_answer_callback(session, callback_id, "Кластеры")
+                await async_send(session, chat_id, format_signal_clusters(chat_id), back_to_analytics_keyboard())
+                return
+            if data == "oos_report":
+                await async_answer_callback(session, callback_id, "OOS")
+                await async_send(session, chat_id, format_oos_report(chat_id), back_to_analytics_keyboard())
+                return
+
+            if data == "get_price":
+                await async_answer_callback(session, callback_id, "Цена")
+                ticker = user_tickers.get(chat_id, "BTCUSDT")
+                price = get_price(ticker)
+                await async_send(session, chat_id, f"💰 <b>{TICKERS[ticker]['label']}</b>: {fmt_price(price, ticker)}", back_to_main_keyboard())
+                return
+
+            if data == "get_fg":
+                await async_answer_callback(session, callback_id, "Fear & Greed")
+                await async_send(session, chat_id, format_fear_greed_msg(), back_to_main_keyboard())
+                return
+
+        await _base_async_handle_update_v70(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v71] error: {e}")
+        try:
+            await async_send(session, update["callback_query"]["message"]["chat"]["id"], f"❌ Ошибка: {e}", back_to_main_keyboard())
+        except Exception:
+            pass
+
+
+
+# ============================================================
+# v7.2 — PAPER MARKET SCANNER
+# ============================================================
+# Paper Trader now scans all configured futures symbols and opens only the
+# best candidate, with portfolio and same-side/correlation guards.
+
+PAPER_TRADER_SCAN_TICKERS = list(AUTO_CRYPTO_TICKERS)
+PAPER_TRADER_MAX_POSITIONS = 2
+PAPER_TRADER_MAX_SAME_DIRECTION = 1
+PAPER_TRADER_MAX_CANDIDATES_SHOWN = 8
+PAPER_TRADER_CORR_GROUPS = [
+    {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"},
+    {"DOGEUSDT", "SHIBUSDT"},
+]
+
+_base_paper_select_trade_candidate_v71 = paper_select_trade_candidate
+_base_format_paper_trader_status_v71 = format_paper_trader_status
+_base_paper_trader_cycle_v71 = paper_trader_cycle
+
+
+def _paper_corr_group(ticker):
+    for group in PAPER_TRADER_CORR_GROUPS:
+        if ticker in group:
+            return group
+    return {ticker}
+
+
+def _paper_candidate_block_reason(chat_id, candidate):
+    ticker = candidate.get("ticker")
+    direction = candidate.get("direction")
+    open_positions = _paper_positions(chat_id)
+    if len(open_positions) >= PAPER_TRADER_MAX_POSITIONS:
+        return f"достигнут лимит открытых paper-позиций: {PAPER_TRADER_MAX_POSITIONS}"
+    same_dir = [p for p in open_positions if p.get("direction") == direction]
+    if len(same_dir) >= PAPER_TRADER_MAX_SAME_DIRECTION:
+        return f"уже есть paper-позиция в сторону {str(direction).upper()}"
+    group = _paper_corr_group(ticker)
+    for p in open_positions:
+        if p.get("ticker") in group and p.get("direction") == direction:
+            return f"коррелированный актив уже открыт: {p.get('ticker')} {str(direction).upper()}"
+    return None
+
+
+def paper_select_trade_candidate(chat_id):
+    tried = []
+    candidates = []
+    blocked = []
+
+    for ticker in PAPER_TRADER_SCAN_TICKERS:
+        for tf in PAPER_TRADER_TFS:
+            try:
+                data = full_analyze(ticker, tf)
+                ep = data.get("entry_plan") or {}
+                row = {
+                    "ticker": ticker,
+                    "tf": tf,
+                    "signal": data.get("signal"),
+                    "status": ep.get("status"),
+                    "entry_now": int(ep.get("entry_now_score", ep.get("score", 0)) or 0),
+                    "setup": int(ep.get("setup_score", ep.get("score", 0)) or 0),
+                    "rr": _safe_float(ep.get("rr_now"), 0) or _safe_float((data.get("risk_levels") or {}).get("rr_ratio"), 0) or 0,
+                    "gate": ep.get("entry_gate_reason", ""),
+                }
+                tried.append(row)
+                candidates.extend(_paper_strategy_candidates(chat_id, ticker, tf, data))
+            except Exception as e:
+                tried.append({"ticker": ticker, "tf": tf, "error": str(e)})
+
+    candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+    for cand in candidates:
+        reason = _paper_candidate_block_reason(chat_id, cand)
+        if reason:
+            blocked.append({
+                "ticker": cand.get("ticker"),
+                "tf": cand.get("interval"),
+                "strategy": cand.get("strategy"),
+                "score": cand.get("score"),
+                "reason": reason,
+            })
+            continue
+        cand["scan_total_candidates"] = len(candidates)
+        cand["scan_blocked"] = blocked[:PAPER_TRADER_MAX_CANDIDATES_SHOWN]
+        cand["scan_tried"] = tried
+        return cand, tried
+
+    return None, tried
+
+
+def _format_scan_rows(tried):
+    ranked = sorted(
+        [x for x in tried if not x.get("error")],
+        key=lambda x: (x.get("entry_now", 0), x.get("setup", 0), x.get("rr", 0)),
+        reverse=True,
+    )
+    lines = []
+    for row in ranked[:PAPER_TRADER_MAX_CANDIDATES_SHOWN]:
+        label = TICKERS.get(row.get("ticker"), {}).get("label", row.get("ticker"))
+        lines.append(
+            f"• {label} {row.get('tf')}: {row.get('status')} | "
+            f"EntryNow {row.get('entry_now')}/100 | Setup {row.get('setup')}/100 | RR {row.get('rr'):.2f}x"
+        )
+    errors = [x for x in tried if x.get("error")]
+    if errors:
+        lines.append(f"• ошибок данных: {len(errors)}")
+    return lines
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _paper_load_state()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    closed = _paper_manage_open_positions(chat_id)
+    open_positions = _paper_positions(chat_id)
+
+    lines = [
+        f"🤖 <b>Paper Trader Market Scan</b> | {now}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Скан: <b>{len(PAPER_TRADER_SCAN_TICKERS)}</b> активов × <b>{len(PAPER_TRADER_TFS)}</b> TF",
+        f"Лимит позиций: <b>{len(open_positions)}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+    ]
+    if closed:
+        lines += ["", "Закрытые paper-сделки:"]
+        for t in closed[-3:]:
+            lines.append(
+                f"• {TICKERS.get(t.get('ticker'), {}).get('label', t.get('ticker'))} {str(t.get('direction')).upper()} "
+                f"{t.get('exit_reason')} | net <b>{t.get('net_usd', 0):+.3f} USDT</b> ({t.get('net_pct_balance', 0):+.2f}%)"
+            )
+
+    if _paper_today_open_count(chat_id) >= PAPER_TRADER_MAX_TRADES_PER_DAY:
+        lines += [
+            "",
+            f"Дневной лимит paper-сделок достигнут: <b>{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>.",
+            "Это защита от overtrading.",
+        ]
+        return "\n".join(lines)
+
+    candidate, tried = paper_select_trade_candidate(chat_id)
+    if not candidate:
+        lines += [
+            "",
+            "Сделка не открыта: среди всех активов нет сетапа, который прошёл фильтры.",
+            "",
+            "Лучшие проверки:",
+        ]
+        lines.extend(_format_scan_rows(tried) or ["• данных для сравнения нет"])
+        lines += [
+            "",
+            "📌 Бот сканирует рынок, но не обязан открывать сделку каждый цикл.",
+        ]
+        return "\n".join(lines)
+
+    pos, err = _paper_open_candidate(chat_id, candidate)
+    if err:
+        lines += [
+            "",
+            "Лучший сетап найден, но сделка не открыта.",
+            err,
+            "",
+            "Лучшие проверки:",
+        ]
+        lines.extend(_format_scan_rows(tried) or ["• данных для сравнения нет"])
+        return "\n".join(lines)
+
+    blocked = candidate.get("scan_blocked") or []
+    lines += [
+        "",
+        "✅ <b>Открыта лучшая paper-сделка по рынку</b>",
+        f"Актив: <b>{TICKERS.get(pos['ticker'], {}).get('label', pos['ticker'])}</b>",
+        f"TF выбран ботом: <b>{INTERVALS.get(pos['interval'], {}).get('label', pos['interval'])}</b>",
+        f"Стратегия: <b>{pos['strategy']}</b>",
+        f"Score выбора: <b>{candidate.get('score', 0):.1f}</b>",
+        f"Направление: <b>{pos['direction'].upper()}</b>",
+        f"Entry: <b>{fmt_price(pos['entry_price'], pos['ticker'])}</b>",
+        f"SL: <b>{fmt_price(pos['sl'], pos['ticker'])}</b>",
+        f"TP1: <b>{fmt_price(pos['tp1'], pos['ticker'])}</b>",
+        f"Margin: <b>{pos['margin']:.2f} USDT</b> | x{pos['leverage']} | Notional {pos['notional']:.2f} USDT",
+        f"Риск до SL: <b>{pos['risk_usd']:.3f} USDT</b> ({pos['risk_pct']:.2f}% баланса)",
+        "",
+        f"Почему выбрал: {pos.get('reason')}",
+    ]
+    if blocked:
+        lines += ["", "Заблокированные кандидаты:"]
+        for b in blocked[:3]:
+            lines.append(f"• {b.get('ticker')} {b.get('tf')} {b.get('strategy')}: {b.get('reason')}")
+    lines += [
+        "",
+        "📌 Paper mode: виртуальная сделка. Реальных ордеров на Binance нет.",
+    ]
+    return "\n".join(lines)
+
+
+def format_paper_trader_status(chat_id):
+    _ensure_auto_task_defaults(chat_id)
+    st = _get_auto_task_settings(chat_id, "paper_trader")
+    enabled = bool(st.get("enabled")) and chat_id in auto_chat_ids
+    iv = AUTO_SEND_INTERVALS.get(st.get("send_interval"), AUTO_SEND_INTERVALS["30m"])["label"]
+    lines = [
+        "🤖 <b>Paper Trader</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Статус: <b>{'ON' if enabled else 'OFF'}</b>",
+        f"Режим: <b>market scan</b>",
+        f"Скан активов: <b>{', '.join(TICKERS.get(t, {}).get('label', t) for t in PAPER_TRADER_SCAN_TICKERS)}</b>",
+        f"Частота проверки/сделок: <b>{iv}</b>",
+        f"TF: <b>бот выбирает сам</b> из {', '.join(PAPER_TRADER_TFS)}",
+        f"Лимит открытых paper-позиций: <b>{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"Лимит сделок в день: <b>{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+        "",
+        "Бот выбирает лучший сетап по всем активам, но блокирует overtrading и коррелированные входы.",
+    ]
+    positions = _paper_positions(chat_id)
+    if positions:
+        lines += ["", "Открытые paper-позиции:"]
+        for p in positions:
+            lines.append(f"• {TICKERS.get(p.get('ticker'), {}).get('label', p.get('ticker'))} {str(p.get('direction')).upper()} {p.get('interval')} | {p.get('strategy')}")
+    return "\n".join(lines)
+
+
+
+
+def paper_trader_scan_tickers():
+    return list(PAPER_TRADER_SCAN_TICKERS)
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Market Scan</b> — Paper Trader проверяет все активы и несколько TF, затем выбирает лучший сетап. Это снижает зависимость от одной монеты, но требует лимитов, чтобы не открыть слишком много похожих сделок."""
+
+
+
+# ============================================================
+# v7.3 — AUTOBOT MAIN MENU ENTRY
+# ============================================================
+# Paper Market Scanner gets its own top-level button so it is not hidden under
+# Positions / Risk.
+
+_base_main_keyboard_v72 = main_keyboard
+_base_paper_trader_keyboard_v72 = paper_trader_keyboard
+_base_async_handle_update_v72 = async_handle_update
+
+
+def autobot_keyboard(chat_id):
+    _ensure_auto_task_defaults(chat_id)
+    st = _get_auto_task_settings(chat_id, "paper_trader")
+    enabled = bool(st.get("enabled")) and chat_id in auto_chat_ids
+    toggle = "⛔ Выключить автобота" if enabled else "✅ Включить автобота"
+    iv = AUTO_SEND_INTERVALS.get(st.get("send_interval"), AUTO_SEND_INTERVALS["30m"])["label"]
+    return {"inline_keyboard": [
+        [{"text": toggle, "callback_data": "paper_toggle"}],
+        [{"text": "▶️ Прогнать market scan сейчас", "callback_data": "paper_run_now"}],
+        [{"text": f"⏰ Частота торговли: {iv}", "callback_data": "auto_choose_iv_paper_trader"}],
+        [{"text": "📒 Журнал / отчёт", "callback_data": "paper_report"}],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+def format_autobot_menu(chat_id):
+    return format_paper_trader_status(chat_id).replace(
+        "🤖 <b>Paper Trader</b>",
+        "🤖 <b>Автобот / Paper Market Scanner</b>",
+        1,
+    )
+
+
+def main_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "🔄 Сигнал", "callback_data": "menu_signal"},
+            {"text": "🤖 Автобот", "callback_data": "menu_autobot"},
+        ],
+        [
+            {"text": "🎯 Точка входа", "callback_data": "entry_point"},
+            {"text": "💰 Цена", "callback_data": "get_price"},
+        ],
+        [
+            {"text": "🌊 Market Flow", "callback_data": "menu_flow"},
+            {"text": "📊 Аналитика", "callback_data": "menu_analytics"},
+        ],
+        [
+            {"text": "📂 Позиции / Риск", "callback_data": "menu_positions"},
+            {"text": "⚙️ Настройки", "callback_data": "menu_settings"},
+        ],
+        [
+            {"text": "📖 Обучение", "callback_data": "menu_learn"},
+            {"text": "😱 Fear & Greed", "callback_data": "get_fg"},
+        ],
+    ]}
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Автобот</b> — отдельная кнопка главного меню для Paper Market Scanner. Это всё ещё paper-режим: он сканирует рынок и ведёт журнал, но не отправляет реальные ордера."""
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+
+            if data in {"menu_autobot", "paper_trader"}:
+                await async_answer_callback(session, callback_id, "Автобот")
+                await async_send(session, chat_id, format_autobot_menu(chat_id), autobot_keyboard(chat_id))
+                return
+
+        await _base_async_handle_update_v72(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v73] error: {e}")
+
+
+
+# ============================================================
+# v7.4 — RESPONSIVE RUNTIME
+# ============================================================
+# The bot must answer Telegram buttons quickly even while heavy market scans
+# are running. This layer restores candle caching after the futures override,
+# adds small price/analysis caches, makes Telegram polling fire-and-forget, and
+# uses a lighter parallel paper-market scan.
+
+import copy as _copy_v74
+import concurrent.futures as _futures_v74
+
+_base_get_ohlcv_v74 = get_ohlcv
+_base_get_price_v74 = get_price
+_base_full_analyze_v74 = full_analyze
+_base_paper_select_trade_candidate_v74 = paper_select_trade_candidate
+_base_async_handle_update_v73 = async_handle_update
+
+RESPONSIVE_PRICE_CACHE_TTL_SEC = int(os.getenv("RESPONSIVE_PRICE_CACHE_TTL_SEC", "5"))
+RESPONSIVE_ANALYSIS_CACHE_TTL_SEC = int(os.getenv("RESPONSIVE_ANALYSIS_CACHE_TTL_SEC", "90"))
+PAPER_SCAN_WORKERS = max(1, int(os.getenv("PAPER_SCAN_WORKERS", "5")))
+
+_price_cache_v74 = {}
+_analysis_cache_v74 = {}
+_scan_analysis_cache_v74 = {}
+_runtime_cache_lock_v74 = threading.RLock()
+_background_update_tasks_v74 = set()
+
+
+def _cache_key_ticker_interval_v74(ticker, interval):
+    try:
+        ticker = _validate_internal_ticker(ticker)
+    except Exception:
+        ticker = str(ticker).upper()
+    return ticker, interval
+
+
+def _ttl_for_interval_v74(interval, fallback):
+    try:
+        return int(CANDLE_CACHE_TTL.get(interval, fallback))
+    except Exception:
+        return int(fallback)
+
+
+def _analysis_ttl_v74(interval):
+    # Keep 1m/5m fresh, but still avoid repeated identical Binance calls.
+    candle_ttl = _ttl_for_interval_v74(interval, 60)
+    return max(10, min(RESPONSIVE_ANALYSIS_CACHE_TTL_SEC, candle_ttl))
+
+
+def get_ohlcv(ticker, interval):
+    key = _cache_key_ticker_interval_v74(ticker, interval)
+    ttl = _ttl_for_interval_v74(interval, 60)
+    now_ts = time.time()
+    with _runtime_cache_lock_v74:
+        cached = _ohlcv_cache.get(key)
+        if cached and now_ts - cached.get("ts", 0) < ttl:
+            return cached.get("data")
+    data = _base_get_ohlcv_v74(key[0], interval)
+    with _runtime_cache_lock_v74:
+        _ohlcv_cache[key] = {"ts": now_ts, "data": data}
+    return data
+
+
+def get_price(ticker):
+    key = _cache_key_ticker_interval_v74(ticker, "price")[0]
+    now_ts = time.time()
+    with _runtime_cache_lock_v74:
+        cached = _price_cache_v74.get(key)
+        if cached and now_ts - cached.get("ts", 0) < RESPONSIVE_PRICE_CACHE_TTL_SEC:
+            return cached.get("data")
+    price = _base_get_price_v74(key)
+    with _runtime_cache_lock_v74:
+        _price_cache_v74[key] = {"ts": now_ts, "data": price}
+    return price
+
+
+def full_analyze(ticker, interval, force_refresh=False):
+    key = _cache_key_ticker_interval_v74(ticker, interval)
+    ttl = _analysis_ttl_v74(interval)
+    now_ts = time.time()
+    if not force_refresh:
+        with _runtime_cache_lock_v74:
+            cached = _analysis_cache_v74.get(key)
+            if cached and now_ts - cached.get("ts", 0) < ttl:
+                return _copy_v74.deepcopy(cached.get("data"))
+    data = _base_full_analyze_v74(key[0], interval)
+    with _runtime_cache_lock_v74:
+        _analysis_cache_v74[key] = {"ts": now_ts, "data": _copy_v74.deepcopy(data)}
+    return data
+
+
+def _full_analyze_for_scan_v74(ticker, interval):
+    """Fast paper-scan analysis: skip per-candidate futures context."""
+    key = _cache_key_ticker_interval_v74(ticker, interval)
+    ttl = _analysis_ttl_v74(interval)
+    now_ts = time.time()
+    with _runtime_cache_lock_v74:
+        cached = _scan_analysis_cache_v74.get(key)
+        if cached and now_ts - cached.get("ts", 0) < ttl:
+            return _copy_v74.deepcopy(cached.get("data"))
+    analyzer = globals().get("_base_full_analyze_v61") or _base_full_analyze_v74
+    data = analyzer(key[0], interval)
+    # A scan compares many candidates. Futures context is useful, but doing it
+    # for every ticker/TF makes one button press painfully slow. Enrich only the
+    # selected candidate later.
+    if isinstance(data, dict):
+        data = _copy_v74.deepcopy(data)
+        data.pop("futures_context", None)
+    with _runtime_cache_lock_v74:
+        _scan_analysis_cache_v74[key] = {"ts": now_ts, "data": _copy_v74.deepcopy(data)}
+    return data
+
+
+def _paper_scan_one_v74(chat_id, ticker, tf):
+    data = _full_analyze_for_scan_v74(ticker, tf)
+    ep = data.get("entry_plan") or {}
+    row = {
+        "ticker": ticker,
+        "tf": tf,
+        "signal": data.get("signal"),
+        "status": ep.get("status"),
+        "entry_now": int(ep.get("entry_now_score", ep.get("score", 0)) or 0),
+        "setup": int(ep.get("setup_score", ep.get("score", 0)) or 0),
+        "rr": _safe_float(ep.get("rr_now"), 0) or _safe_float((data.get("risk_levels") or {}).get("rr_ratio"), 0) or 0,
+        "gate": ep.get("entry_gate_reason", ""),
+    }
+    return row, _paper_strategy_candidates(chat_id, ticker, tf, data)
+
+
+def paper_select_trade_candidate(chat_id):
+    tried = []
+    candidates = []
+    blocked = []
+    pairs = [(ticker, tf) for ticker in PAPER_TRADER_SCAN_TICKERS for tf in PAPER_TRADER_TFS]
+    workers = min(PAPER_SCAN_WORKERS, len(pairs)) or 1
+
+    with _futures_v74.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="paper-scan") as pool:
+        fut_to_pair = {
+            pool.submit(_paper_scan_one_v74, chat_id, ticker, tf): (ticker, tf)
+            for ticker, tf in pairs
+        }
+        for fut in _futures_v74.as_completed(fut_to_pair):
+            ticker, tf = fut_to_pair[fut]
+            try:
+                row, found = fut.result()
+                tried.append(row)
+                candidates.extend(found)
+            except Exception as e:
+                tried.append({"ticker": ticker, "tf": tf, "error": str(e)})
+
+    candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+    for cand in candidates:
+        reason = _paper_candidate_block_reason(chat_id, cand)
+        if reason:
+            blocked.append({
+                "ticker": cand.get("ticker"),
+                "tf": cand.get("interval"),
+                "strategy": cand.get("strategy"),
+                "score": cand.get("score"),
+                "reason": reason,
+            })
+            continue
+        cand["scan_total_candidates"] = len(candidates)
+        cand["scan_blocked"] = blocked[:PAPER_TRADER_MAX_CANDIDATES_SHOWN]
+        cand["scan_tried"] = tried
+        try:
+            data = cand.get("data") or {}
+            data["futures_context"] = build_futures_context(cand.get("ticker"), data.get("price"))
+        except Exception:
+            pass
+        return cand, tried
+
+    return None, tried
+
+
+async def _send_paper_run_now_v74(session, chat_id):
+    try:
+        msg = await asyncio.to_thread(paper_trader_cycle, chat_id, True)
+        await async_send(session, chat_id, msg, paper_trader_keyboard(chat_id))
+    except Exception as e:
+        await async_send(session, chat_id, f"❌ Ошибка market scan: {e}", paper_trader_keyboard(chat_id))
+
+
+def _track_update_task_v74(task):
+    _background_update_tasks_v74.add(task)
+
+    def _done(t):
+        _background_update_tasks_v74.discard(t)
+        try:
+            exc = t.exception()
+            if exc:
+                print(f"  [async_update_task_v74] error: {exc}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"  [async_update_task_v74] done callback error: {e}")
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+
+            if data == "paper_run_now":
+                await async_answer_callback(session, callback_id, "Скан запущен")
+                await async_send(
+                    session,
+                    chat_id,
+                    "⏳ <b>Market scan запущен.</b>\n\nЯ проверяю все активы и TF в фоне. Кнопки бота уже можно нажимать дальше.",
+                    paper_trader_keyboard(chat_id),
+                )
+                _track_update_task_v74(asyncio.create_task(_send_paper_run_now_v74(session, chat_id)))
+                return
+
+            if data == "get_price":
+                await async_answer_callback(session, callback_id, "Цена")
+                ticker = user_tickers.get(chat_id, "BTCUSDT")
+                price = await asyncio.to_thread(get_price, ticker)
+                await async_send(session, chat_id, f"💰 <b>{TICKERS[ticker]['label']}</b>: {fmt_price(price, ticker)}", back_to_main_keyboard())
+                return
+
+            if data == "get_fg":
+                await async_answer_callback(session, callback_id, "Fear & Greed")
+                msg = await asyncio.to_thread(format_fear_greed_msg)
+                await async_send(session, chat_id, msg, back_to_main_keyboard())
+                return
+
+            if data == "portfolio_risk":
+                await async_answer_callback(session, callback_id, "Риск")
+                msg = await asyncio.to_thread(format_portfolio_risk, chat_id)
+                await async_send(session, chat_id, msg, back_to_positions_keyboard())
+                return
+
+            if data == "signal_stats":
+                await async_answer_callback(session, callback_id, "Статистика")
+                msg = await asyncio.to_thread(format_signal_stats, chat_id)
+                await async_send(session, chat_id, msg, back_to_analytics_keyboard())
+                return
+
+            if data == "market_heatmap":
+                await async_answer_callback(session, callback_id, "Heatmap")
+                msg = await asyncio.to_thread(format_market_heatmap, chat_id)
+                await async_send(session, chat_id, msg, back_to_analytics_keyboard())
+                return
+
+            if data == "monte_carlo":
+                await async_answer_callback(session, callback_id, "Monte Carlo")
+                msg = await asyncio.to_thread(format_monte_carlo_report, chat_id)
+                await async_send(session, chat_id, msg, back_to_analytics_keyboard())
+                return
+
+            if data == "signal_clusters":
+                await async_answer_callback(session, callback_id, "Кластеры")
+                msg = await asyncio.to_thread(format_signal_clusters, chat_id)
+                await async_send(session, chat_id, msg, back_to_analytics_keyboard())
+                return
+
+            if data == "oos_report":
+                await async_answer_callback(session, callback_id, "OOS")
+                msg = await asyncio.to_thread(format_oos_report, chat_id)
+                await async_send(session, chat_id, msg, back_to_analytics_keyboard())
+                return
+
+        await _base_async_handle_update_v73(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v74] error: {e}")
+
+
+async def telegram_polling_loop(session):
+    print("  [async] Telegram polling started (responsive v7.4)")
+    sem = asyncio.Semaphore(ASYNC_UPDATE_CONCURRENCY)
+    offset = None
+    try:
+        res = await async_telegram_api(session, "getUpdates", {"offset": -1, "timeout": 1})
+        if res.get("ok") and res.get("result"):
+            offset = res["result"][-1]["update_id"] + 1
+    except Exception:
+        pass
+
+    while True:
+        try:
+            payload = {"timeout": ASYNC_POLL_TIMEOUT, "allowed_updates": ["message", "callback_query"]}
+            if offset is not None:
+                payload["offset"] = offset
+            res = await async_telegram_api(session, "getUpdates", payload)
+            if not res.get("ok"):
+                print(f"  [async_poll] Telegram error: {res}")
+                await asyncio.sleep(3)
+                continue
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                _track_update_task_v74(asyncio.create_task(async_handle_update(session, upd, sem)))
+            # Do not await update handlers here. Heavy work continues in the
+            # background, while polling immediately returns to listening.
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  [async_poll_v74] error: {e}")
+            await asyncio.sleep(3)
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Responsive Runtime</b> — режим, где тяжёлый анализ не должен блокировать кнопки Telegram. Бот отвечает на нажатие сразу, а долгие расчёты делает в фоне.
+
+<b>Cache / кеш</b> — временное хранение уже полученных свечей, цены и анализа. Это не меняет логику сигнала, но убирает лишние одинаковые запросы к Binance.
+"""
+
+
+
+# ============================================================
+# v7.5 — AUTOBOT REPORT + LIMITS
+# ============================================================
+# Fix the Autobot Journal/Report button, split long journal messages under
+# Telegram limits, and raise paper-trading limits requested by the user.
+
+_base_autobot_keyboard_v74 = autobot_keyboard
+_base_paper_report_keyboard_v74 = paper_report_keyboard
+_base_async_handle_update_v74 = async_handle_update
+
+PAPER_TRADER_MAX_POSITIONS = 3
+PAPER_TRADER_MAX_TRADES_PER_DAY = 15
+TELEGRAM_SAFE_MESSAGE_LIMIT = 3600
+
+
+def autobot_keyboard(chat_id):
+    _ensure_auto_task_defaults(chat_id)
+    st = _get_auto_task_settings(chat_id, "paper_trader")
+    enabled = bool(st.get("enabled")) and chat_id in auto_chat_ids
+    toggle = "⛔ Выключить автобота" if enabled else "✅ Включить автобота"
+    iv = AUTO_SEND_INTERVALS.get(st.get("send_interval"), AUTO_SEND_INTERVALS["30m"])["label"]
+    return {"inline_keyboard": [
+        [{"text": toggle, "callback_data": "paper_toggle"}],
+        [{"text": "▶️ Прогнать market scan сейчас", "callback_data": "paper_run_now"}],
+        [{"text": f"⏰ Частота торговли: {iv}", "callback_data": "auto_choose_iv_paper_trader"}],
+        [{"text": "📒 Журнал / отчёт", "callback_data": "paper_report_autobot"}],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+def autobot_report_keyboard(chat_id):
+    return {"inline_keyboard": [
+        [{"text": "🤖 Назад: Автобот", "callback_data": "menu_autobot"}],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def paper_report_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🤖 Автобот", "callback_data": "menu_autobot"}],
+        [{"text": "◀️ Назад: Позиции / Риск", "callback_data": "menu_positions"}],
+    ]}
+
+
+def _split_telegram_text_v75(text, limit=TELEGRAM_SAFE_MESSAGE_LIMIT):
+    text = str(text or "")
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    current = []
+    current_len = 0
+    for line in text.splitlines():
+        add_len = len(line) + 1
+        if current and current_len + add_len > limit:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        if add_len > limit:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            for i in range(0, len(line), limit):
+                chunks.append(line[i:i + limit])
+            continue
+        current.append(line)
+        current_len += add_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
+async def async_send_long_v75(session, chat_id, text, reply_markup=None):
+    chunks = _split_telegram_text_v75(text)
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, 1):
+        suffix = f"\n\n<i>Часть {i}/{total}</i>" if total > 1 else ""
+        markup = reply_markup if i == total else None
+        await async_send(session, chat_id, chunk + suffix, markup)
+
+
+async def _send_paper_report_v75(session, chat_id, keyboard):
+    try:
+        msg = await asyncio.to_thread(format_paper_report, chat_id)
+        await async_send_long_v75(session, chat_id, msg, keyboard)
+    except Exception as e:
+        await async_send(session, chat_id, f"❌ Ошибка paper-журнала: {e}", keyboard)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+
+            if data == "paper_report_autobot":
+                await async_answer_callback(session, callback_id, "Журнал")
+                await _send_paper_report_v75(session, chat_id, autobot_report_keyboard(chat_id))
+                return
+
+            if data == "paper_report":
+                await async_answer_callback(session, callback_id, "Paper report")
+                await _send_paper_report_v75(session, chat_id, paper_report_keyboard())
+                return
+
+        await _base_async_handle_update_v74(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v75] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Лимит сделок Автобота</b> — защитное ограничение, сколько paper-сделок бот может открыть за день. Сейчас лимит: 15. Это не цель набрать 15 сделок, а верхняя граница против overtrading.
+
+<b>Лимит открытых позиций</b> — сколько paper-позиций может быть открыто одновременно. Сейчас лимит: 3. Даже в paper-режиме это нужно, чтобы бот не набирал слишком много похожего риска.
+"""
+
+
+
+# ============================================================
+# v7.6 — RELIABLE REPORT DELIVERY
+# ============================================================
+# Telegram can reject long HTML messages when journal factors contain raw
+# comparison signs like "price < EMA200". Reports now have a plain-text
+# delivery path that omits parse_mode completely, so the button never appears
+# dead because of HTML entity parsing.
+
+import re as _re_v76
+
+_base_async_send_v75 = async_send
+_base_async_handle_update_v75 = async_handle_update
+
+
+def _plain_report_text_v76(text):
+    text = str(text or "")
+    text = _re_v76.sub(r"</?(b|i|u|s|code|pre)>", "", text, flags=_re_v76.IGNORECASE)
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    return text
+
+
+async def async_send_plain_v76(session, chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": _plain_report_text_v76(text)}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    res = await async_telegram_api(session, "sendMessage", payload)
+    if not res.get("ok"):
+        print(f"  [telegram_plain_v76] send failed: {res}")
+    return res
+
+
+async def async_send(session, chat_id, text, reply_markup=None):
+    res = await _base_async_send_v75(session, chat_id, text, reply_markup)
+    if not res.get("ok"):
+        # Last-resort fallback for any message, not only reports.
+        return await async_send_plain_v76(session, chat_id, text, reply_markup)
+    return res
+
+
+async def async_send_long_v76(session, chat_id, text, reply_markup=None):
+    chunks = _split_telegram_text_v75(_plain_report_text_v76(text), TELEGRAM_SAFE_MESSAGE_LIMIT)
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, 1):
+        suffix = f"\n\nЧасть {i}/{total}" if total > 1 else ""
+        markup = reply_markup if i == total else None
+        await async_send_plain_v76(session, chat_id, chunk + suffix, markup)
+
+
+async def _send_paper_report_v76(session, chat_id, keyboard):
+    try:
+        msg = await asyncio.to_thread(format_paper_report, chat_id)
+        await async_send_long_v76(session, chat_id, msg, keyboard)
+    except Exception as e:
+        print(f"  [paper_report_v76] error: {e}")
+        await async_send_plain_v76(
+            session,
+            chat_id,
+            "Ошибка paper-журнала: " + str(e) + "\n\nЖурнал не потерян, это ошибка формирования/отправки отчёта.",
+            keyboard,
+        )
+
+
+async def _start_paper_report_task_v76(session, chat_id, keyboard):
+    await async_send_plain_v76(session, chat_id, "Готовлю журнал / отчёт Paper Trader...", keyboard)
+    await _send_paper_report_v76(session, chat_id, keyboard)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = cb["message"]["chat"]["id"]
+            callback_id = cb.get("id")
+
+            if data == "paper_report_autobot":
+                await async_answer_callback(session, callback_id, "Журнал")
+                _track_update_task_v74(asyncio.create_task(
+                    _start_paper_report_task_v76(session, chat_id, autobot_report_keyboard(chat_id))
+                ))
+                return
+
+            if data == "paper_report":
+                await async_answer_callback(session, callback_id, "Paper report")
+                _track_update_task_v74(asyncio.create_task(
+                    _start_paper_report_task_v76(session, chat_id, paper_report_keyboard())
+                ))
+                return
+
+        await _base_async_handle_update_v75(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v76] error: {e}")
+
+
+
+
+# ============================================================
+# v7.7 — CLEAN PAPER JOURNAL
+# ============================================================
+# The report is now a readable trading journal, not a raw technical log. It
+# also fixes directional factor labels: for SHORT, bearish factors support the
+# trade and bullish factors are risks.
+
+_base_format_paper_report_v76 = format_paper_report
+
+
+def _short_text_v77(value, limit=115):
+    value = _plain_report_text_v76(str(value or "")).replace("\n", " ").strip()
+    return value if len(value) <= limit else value[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _trade_time_v77(item):
+    return _fmt_dt_short(item.get("opened_at"))
+
+
+def _sort_key_v77(item):
+    return str(item.get("closed_at") or item.get("opened_at") or "")
+
+
+def _pnl_label_v77(item):
+    net = _safe_float(item.get("net_usd"), 0) or 0
+    pct = _safe_float(item.get("net_pct_balance"), 0) or 0
+    icon = "✅" if net > 0 else ("❌" if net < 0 else "⚪")
+    return f"{icon} {net:+.3f} USDT ({pct:+.2f}%)"
+
+
+def _exit_badge_v77(item):
+    reason = str(item.get("exit_reason") or "closed").upper()
+    if "TP" in reason:
+        return "✅ TP1"
+    if "SL" in reason:
+        return "❌ SL"
+    return f"⚪ {reason}"
+
+
+def _strategy_lines_v77(trades):
+    by_strategy = {}
+    for t in trades:
+        name = str(t.get("strategy") or "unknown")
+        row = by_strategy.setdefault(name, {"n": 0, "w": 0, "net": 0.0})
+        row["n"] += 1
+        net = _safe_float(t.get("net_usd"), 0) or 0
+        row["net"] += net
+        row["w"] += 1 if net > 0 else 0
+    lines = []
+    for name, row in sorted(by_strategy.items(), key=lambda kv: kv[1]["net"], reverse=True)[:4]:
+        wr = row["w"] / row["n"] * 100 if row["n"] else 0
+        lines.append(f"• {name}: {row['n']} сдел. | WR {wr:.0f}% | {row['net']:+.3f} USDT")
+    return lines
+
+
+def _directional_factors_v77(item):
+    d = item.get("decision") or {}
+    direction = str(item.get("direction") or "").lower()
+    bull = [_short_text_v77(x, 95) for x in (d.get("bull_factors") or []) if x]
+    bear = [_short_text_v77(x, 95) for x in (d.get("bear_factors") or []) if x]
+    warnings = [_short_text_v77(x, 95) for x in (d.get("warnings") or []) if x]
+    if direction == "short":
+        support = bear
+        risks = bull + warnings
+    elif direction == "long":
+        support = bull
+        risks = bear + warnings
+    else:
+        support = bull + bear
+        risks = warnings
+    return support[:2], risks[:2]
+
+
+def _paper_card_v77(item, idx, is_open=False):
+    d = item.get("decision") or {}
+    ticker = item.get("ticker")
+    label = TICKERS.get(ticker, {}).get("label", ticker)
+    tf = INTERVALS.get(item.get("interval"), {}).get("label", item.get("interval"))
+    direction = str(item.get("direction") or "").upper()
+    strategy = item.get("strategy") or "unknown"
+    support, risks = _directional_factors_v77(item)
+
+    if is_open:
+        title = f"{idx}. 🟢 ОТКРЫТА · {label} {direction} · {tf}"
+        result = f"Стратегия: {strategy}"
+    else:
+        title = f"{idx}. {_exit_badge_v77(item)} · {label} {direction} · {tf}"
+        result = f"Результат: {_pnl_label_v77(item)} | стратегия: {strategy}"
+
+    lines = [
+        title,
+        f"Время входа: {_trade_time_v77(item)}",
+        result,
+        f"План: Entry {fmt_price(item.get('entry_price'), ticker)} | SL {fmt_price(item.get('sl'), ticker)} | TP1 {fmt_price(item.get('tp1'), ticker)}",
+    ]
+    if not is_open:
+        lines.append(f"Выход: {fmt_price(item.get('exit_price'), ticker)} | причина: {item.get('exit_reason', '—')}")
+
+    rr = _fmt_num(d.get("rr_now"), 2)
+    entry_now = d.get("entry_now_score", "—")
+    setup = d.get("setup_score", "—")
+    conf = d.get("confidence", "—")
+    lines.append(f"Оценка: EntryNow {entry_now}/100 | Setup {setup}/100 | RR {rr} | Conf {conf}")
+
+    reason = d.get("reason") or item.get("reason") or item.get("journal_note") or "причина не записана в старой версии"
+    lines.append(f"Почему открыл: {_short_text_v77(reason, 135)}")
+
+    gate = d.get("gate")
+    if gate and "разрешают вход сейчас" not in str(gate).lower():
+        lines.append(f"Фильтр: {_short_text_v77(gate, 120)}")
+    if support:
+        lines.append("За сделку: " + " | ".join(support))
+    if risks:
+        lines.append("Риски: " + " | ".join(risks))
+    return lines
+
+
+def format_paper_report(chat_id):
+    trades = sorted(_paper_closed_trades(chat_id), key=_sort_key_v77)
+    positions = sorted(_paper_positions(chat_id), key=_sort_key_v77)
+    net = sum(_safe_float(t.get("net_usd"), 0) or 0 for t in trades)
+    wins = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) > 0]
+    losses = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) < 0]
+    wr = len(wins) / len(trades) * 100 if trades else 0
+    today = _paper_today_open_count(chat_id)
+
+    lines = [
+        "📒 <b>Paper Trader Journal</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "<b>Сводка</b>",
+        f"• Закрыто: <b>{len(trades)}</b> | Win/Loss: <b>{len(wins)}/{len(losses)}</b> | WR: <b>{wr:.1f}%</b>",
+        f"• Открыто сейчас: <b>{len(positions)}/{PAPER_TRADER_MAX_POSITIONS}</b> | сделок сегодня: <b>{today}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+        f"• Net PnL: <b>{net:+.3f} USDT</b>",
+    ]
+    if trades and len(trades) < 20:
+        lines.append("• Статистика ещё маленькая: выводы по стратегии пока предварительные.")
+
+    strategy_lines = _strategy_lines_v77(trades)
+    if strategy_lines:
+        lines += ["", "<b>Стратегии</b>"] + strategy_lines
+
+    lines += ["", "🟢 <b>Сейчас в рынке</b>"]
+    if positions:
+        for idx, pos in enumerate(positions[-PAPER_TRADER_MAX_POSITIONS:], 1):
+            lines += [""] + _paper_card_v77(pos, idx, is_open=True)
+    else:
+        lines.append("Открытых paper-позиций нет.")
+
+    lines += ["", "📕 <b>Последние закрытые сделки</b>"]
+    recent = list(reversed(trades[-6:]))
+    if recent:
+        for idx, trade in enumerate(recent, 1):
+            lines += [""] + _paper_card_v77(trade, idx, is_open=False)
+    else:
+        lines.append("Закрытых paper-сделок пока нет.")
+
+    lines += [
+        "",
+        "Подсказка: «За сделку» уже учитывает направление. Для SHORT медвежьи факторы = за, бычьи = риск.",
+        "📌 Paper mode: реальных ордеров на Binance нет. Для реальной торговли нужен отдельный этап Testnet и строгие лимиты риска.",
+    ]
+    return "\n".join(lines)
+
+
+
+
+# ============================================================
+# v7.8 — AUTOSTART + SORTED AUTOBOT JOURNAL
+# ============================================================
+# Autobot now starts enabled with the user's default schedule. The paper
+# journal is split into open positions, closed winners, closed losers, and
+# per-trade detail pages.
+
+_base_async_bootstrap_v77 = async_bootstrap
+_base_async_handle_update_v77 = async_handle_update
+_base_auto_settings_keyboard_v77 = auto_settings_keyboard
+_base_auto_task_interval_keyboard_v77 = auto_task_interval_keyboard
+_base_format_market_heatmap_v77 = format_market_heatmap
+
+AUTO_SEND_INTERVALS["45m"] = {"label": "45 минут", "minutes": 45}
+DEFAULT_AUTO_SEND_INTERVAL = "30m"
+DEFAULT_AUTO_TF = "30m"
+
+AUTO_DEFAULT_PLAN_V78 = {
+    "signals": {"enabled": True, "send_interval": "30m", "tf": "30m"},
+    "heatmap": {"enabled": True, "send_interval": "45m", "tf": "45m"},
+    "fear_greed": {"enabled": True, "send_interval": "1h", "tf": None},
+    "backtest": {"enabled": True, "send_interval": "1h", "tf": "1h"},
+    "wfo": {"enabled": True, "send_interval": "4h", "tf": "4h"},
+    "paper_trader": {"enabled": True, "send_interval": "15m", "tf": None},
+}
+
+for _task_key_v78, _defaults_v78 in AUTO_DEFAULT_PLAN_V78.items():
+    if _task_key_v78 in AUTO_TASKS:
+        AUTO_TASKS[_task_key_v78]["default_enabled"] = _defaults_v78["enabled"]
+        AUTO_TASKS[_task_key_v78]["default_interval"] = _defaults_v78["send_interval"]
+        AUTO_TASKS[_task_key_v78]["default_tf"] = _defaults_v78["tf"]
+
+_auto_defaults_applied_v78 = set()
+
+
+def _normalize_chat_id_v78(value):
+    try:
+        value = str(value).strip()
+        return int(value) if value.lstrip("-").isdigit() else value
+    except Exception:
+        return value
+
+
+def _known_autostart_chat_ids_v78():
+    ids = set()
+    env_ids = os.getenv("AUTOSTART_CHAT_IDS", "")
+    for raw in env_ids.replace(";", ",").split(","):
+        raw = raw.strip()
+        if raw:
+            ids.add(_normalize_chat_id_v78(raw))
+
+    def add_id(raw):
+        if raw is not None and str(raw).strip():
+            ids.add(_normalize_chat_id_v78(raw))
+
+    try:
+        if os.path.exists(PAPER_TRADER_STATE_FILE):
+            with open(PAPER_TRADER_STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            for item in list((state.get("positions") or {}).values()) + list(state.get("trades") or []) + list(state.get("events") or []):
+                if isinstance(item, dict):
+                    add_id(item.get("chat_id"))
+    except Exception as e:
+        print(f"  [autostart_v78] paper state scan error: {e}")
+
+    try:
+        if os.path.exists(POSITIONS_FILE):
+            with open(POSITIONS_FILE, "r", encoding="utf-8") as f:
+                positions = json.load(f)
+            for item in (positions or {}).values():
+                if isinstance(item, dict):
+                    add_id(item.get("chat_id"))
+    except Exception as e:
+        print(f"  [autostart_v78] positions scan error: {e}")
+
+    for cid in list(seen_chat_ids):
+        add_id(cid)
+    return sorted(ids, key=lambda x: str(x))
+
+
+def _apply_auto_defaults_v78(chat_id, force=False, enable_global=True):
+    chat_id = _normalize_chat_id_v78(chat_id)
+    if not force and chat_id in _auto_defaults_applied_v78:
+        return
+    _ensure_auto_task_defaults(chat_id)
+    for task_key, defaults in AUTO_DEFAULT_PLAN_V78.items():
+        if task_key not in AUTO_TASKS:
+            continue
+        st = _get_auto_task_settings(chat_id, task_key)
+        st["enabled"] = bool(defaults["enabled"])
+        st["send_interval"] = defaults["send_interval"]
+        st["tf"] = defaults["tf"]
+    user_auto_send_interval[chat_id] = "30m"
+    user_auto_tf[chat_id] = "30m"
+    if enable_global:
+        auto_chat_ids.add(chat_id)
+    seen_chat_ids.add(chat_id)
+    _auto_defaults_applied_v78.add(chat_id)
+
+
+def _autostart_all_known_chats_v78():
+    ids = _known_autostart_chat_ids_v78()
+    for chat_id in ids:
+        _apply_auto_defaults_v78(chat_id, force=True, enable_global=True)
+    if ids:
+        print("  [autostart_v78] auto enabled for chats: " + ", ".join(str(x) for x in ids))
+    else:
+        print("  [autostart_v78] no known chats yet; first Telegram interaction will enable defaults")
+
+
+def format_market_heatmap(chat_id=None, interval=None):
+    if interval is None and chat_id is not None:
+        try:
+            interval = (_get_auto_task_settings(chat_id, "heatmap").get("tf") or "45m")
+        except Exception:
+            interval = None
+    interval = interval or "45m"
+    old_tf = user_auto_tf.get(chat_id) if chat_id is not None else None
+    changed = False
+    try:
+        if chat_id is not None:
+            user_auto_tf[chat_id] = interval
+            changed = True
+        return _base_format_market_heatmap_v77(chat_id)
+    finally:
+        if changed:
+            if old_tf is None:
+                user_auto_tf.pop(chat_id, None)
+            else:
+                user_auto_tf[chat_id] = old_tf
+
+
+def build_auto_task_message(chat_id, task_key):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+    st = _get_auto_task_settings(chat_id, task_key)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    tf = st.get("tf") or user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    if task_key == "signals":
+        return build_auto_signals_message(chat_id)
+    if task_key == "heatmap":
+        return format_market_heatmap(chat_id, interval=tf or "45m")
+    if task_key == "fear_greed":
+        return "⏰ <b>Авто Fear & Greed</b> | " + now + "\n\n" + format_fear_greed_msg()
+    if task_key == "backtest":
+        lookback = globals().get("BACKTEST_DEFAULT_LOOKBACK_CANDLES", None)
+        stats, err = run_backtest(ticker, tf, lookback) if lookback else run_backtest(ticker, tf)
+        if err:
+            if "no_signal" in str(err) and "format_backtest_no_trades" in globals():
+                return f"⏰ <b>Авто Backtest</b> | {now}\n\n" + format_backtest_no_trades(err, ticker, tf, lookback or 0)
+            return f"❌ <b>Авто Backtest</b> | {now}\n{err}"
+        return "⏰ <b>Авто Backtest</b> | " + now + "\n\n" + format_backtest(stats, ticker, tf)
+    if task_key == "wfo":
+        weights, report = run_walk_forward_optimization(ticker, tf, 200)
+        if not weights:
+            return f"❌ <b>Авто Walk-Forward</b> | {now}\n{report}"
+        return "⏰ <b>Авто Walk-Forward</b> | " + now + "\n\n" + report
+    if task_key == "paper_trader":
+        return paper_trader_cycle(chat_id)
+    return f"❌ Неизвестная авто-функция: {task_key}"
+
+
+def _status_word_v78(value):
+    return "ON" if value else "OFF"
+
+
+def format_autobot_menu(chat_id):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+    st = _get_auto_task_settings(chat_id, "paper_trader")
+    enabled = chat_id in auto_chat_ids
+    lines = [
+        "🤖 <b>Автобот</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Общий статус: <b>{_status_word_v78(enabled)}</b>",
+        f"PaperTrader: <b>{_status_word_v78(st.get('enabled'))}</b> | каждые <b>{AUTO_SEND_INTERVALS[st.get('send_interval', '15m')]['label']}</b>",
+        f"Открыто paper-позиций: <b>{len(_paper_positions(chat_id))}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"Сделок сегодня: <b>{_paper_today_open_count(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+        "",
+        "<b>Расписание авто-задач:</b>",
+    ]
+    for key in ("signals", "heatmap", "fear_greed", "backtest", "wfo", "paper_trader"):
+        if key in AUTO_TASKS:
+            lines.append(_plain_report_text_v76(_task_status_line(chat_id, key)))
+    lines += [
+        "",
+        "Paper mode: реальных ордеров на Binance нет.",
+    ]
+    return "\n".join(lines)
+
+
+def autobot_keyboard(chat_id):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+    enabled = chat_id in auto_chat_ids
+    toggle = "⛔ Отключить все авто" if enabled else "✅ Включить все авто"
+    return {"inline_keyboard": [
+        [{"text": toggle, "callback_data": "toggle_auto"}],
+        [{"text": "▶️ Market scan сейчас", "callback_data": "paper_run_now"}],
+        [
+            {"text": "🟢 Открытые позиции", "callback_data": "paper_open_positions"},
+            {"text": "📕 Закрытые позиции", "callback_data": "paper_closed_menu"},
+        ],
+        [
+            {"text": "📒 Журнал / сводка", "callback_data": "paper_report_autobot"},
+            {"text": "⚙️ Авто-настройки", "callback_data": "auto_settings"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+def auto_settings_keyboard(chat_id):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=False)
+    rows = []
+    for task_key, meta in AUTO_TASKS.items():
+        st = _get_auto_task_settings(chat_id, task_key)
+        state = "ON" if st.get("enabled") else "OFF"
+        iv = AUTO_SEND_INTERVALS[st["send_interval"]]["label"]
+        if meta["needs_tf"]:
+            tf = INTERVALS.get(st.get("tf") or DEFAULT_AUTO_TF, INTERVALS[DEFAULT_AUTO_TF])["label"]
+            text = f"{meta['label']} | {state} | {iv} | TF {tf}"
+        else:
+            text = f"{meta['label']} | {state} | {iv}"
+        rows.append([{"text": text, "callback_data": f"auto_task_{task_key}"}])
+    rows += [
+        [{"text": "◀️ Назад: Автобот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]
+    return {"inline_keyboard": rows}
+
+
+def auto_task_interval_keyboard(task_key):
+    keys = ["5m", "15m", "30m", "45m", "1h", "4h", "1d"]
+    rows = []
+    for i in range(0, len(keys), 3):
+        rows.append([
+            {"text": AUTO_SEND_INTERVALS[k]["label"], "callback_data": f"auto_set_iv_{task_key}_{k}"}
+            for k in keys[i:i + 3] if k in AUTO_SEND_INTERVALS
+        ])
+    rows.append([{"text": "◀️ Назад", "callback_data": f"auto_task_{task_key}"}])
+    return {"inline_keyboard": rows}
+
+
+def _paper_sorted_positions_v78(chat_id):
+    return sorted(_paper_positions(chat_id), key=_sort_key_v77, reverse=True)
+
+
+def _paper_sorted_trades_v78(chat_id, kind=None):
+    trades = sorted(_paper_closed_trades(chat_id), key=_sort_key_v77, reverse=True)
+    if kind == "win":
+        trades = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) > 0]
+    elif kind == "loss":
+        trades = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) < 0]
+    return trades
+
+
+def _paper_brief_line_v78(item, idx, is_open=False):
+    ticker = item.get("ticker")
+    label = TICKERS.get(ticker, {}).get("label", ticker)
+    tf = INTERVALS.get(item.get("interval"), {}).get("label", item.get("interval"))
+    direction = str(item.get("direction") or "").upper()
+    entry = fmt_price(item.get("entry_price"), ticker)
+    opened = _trade_time_v77(item)
+    if is_open:
+        return f"{idx}. {label} {direction} | {tf}\n   Вход: {entry} | время: {opened}"
+    result = _pnl_label_v77(item)
+    return f"{idx}. {label} {direction} | {tf}\n   Вход: {entry} | время: {opened}\n   Итог: {result}"
+
+
+def _paper_detail_keyboard_v78(mode, idx=None):
+    if mode == "open":
+        back = "paper_open_positions"
+    elif mode == "win":
+        back = "paper_closed_win"
+    elif mode == "loss":
+        back = "paper_closed_loss"
+    else:
+        back = "paper_closed_menu"
+    return {"inline_keyboard": [
+        [{"text": "◀️ Назад", "callback_data": back}],
+        [{"text": "🤖 Автобот", "callback_data": "menu_autobot"}],
+    ]}
+
+
+def _paper_list_keyboard_v78(mode, items):
+    rows = []
+    for idx, _ in enumerate(items[:8], 1):
+        rows.append([{"text": f"🔎 Дополнительный анализ #{idx}", "callback_data": f"paper_detail_{mode}_{idx}"}])
+    if mode in {"win", "loss"}:
+        rows.append([{"text": "◀️ Назад: закрытые позиции", "callback_data": "paper_closed_menu"}])
+    rows.append([{"text": "🤖 Назад: Автобот", "callback_data": "menu_autobot"}])
+    return {"inline_keyboard": rows}
+
+
+def format_paper_journal_home_v78(chat_id):
+    trades = _paper_closed_trades(chat_id)
+    positions = _paper_positions(chat_id)
+    wins = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) > 0]
+    losses = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) < 0]
+    net = sum(_safe_float(t.get("net_usd"), 0) or 0 for t in trades)
+    wr = len(wins) / len(trades) * 100 if trades else 0
+    return "\n".join([
+        "📒 Paper Trader Journal",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Открытые позиции: {len(positions)}/{PAPER_TRADER_MAX_POSITIONS}",
+        f"Закрытые: {len(trades)} | плюс: {len(wins)} | минус: {len(losses)}",
+        f"Winrate: {wr:.1f}% | Net: {net:+.3f} USDT",
+        f"Сегодня сделок: {_paper_today_open_count(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}",
+        "",
+        "Выбери раздел ниже. В списках показываю только главное, а причины и риски вынесены в «Дополнительный анализ».",
+    ])
+
+
+def paper_journal_home_keyboard_v78():
+    return {"inline_keyboard": [
+        [{"text": "🟢 Открытые позиции", "callback_data": "paper_open_positions"}],
+        [{"text": "📕 Закрытые позиции", "callback_data": "paper_closed_menu"}],
+        [{"text": "🤖 Назад: Автобот", "callback_data": "menu_autobot"}],
+    ]}
+
+
+def format_paper_open_positions_v78(chat_id):
+    items = _paper_sorted_positions_v78(chat_id)
+    lines = ["🟢 Открытые paper-позиции", "━━━━━━━━━━━━━━━━━━━━"]
+    if not items:
+        lines.append("Открытых paper-позиций сейчас нет.")
+    else:
+        for idx, item in enumerate(items[:8], 1):
+            lines.append(_paper_brief_line_v78(item, idx, is_open=True))
+    return "\n\n".join(lines)
+
+
+def format_paper_closed_menu_v78(chat_id):
+    wins = _paper_sorted_trades_v78(chat_id, "win")
+    losses = _paper_sorted_trades_v78(chat_id, "loss")
+    return "\n".join([
+        "📕 Закрытые paper-позиции",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"В плюс: {len(wins)}",
+        f"В минус: {len(losses)}",
+        "",
+        "Выбери, какие сделки показать.",
+    ])
+
+
+def paper_closed_menu_keyboard_v78():
+    return {"inline_keyboard": [
+        [{"text": "✅ Закрылись в плюс", "callback_data": "paper_closed_win"}],
+        [{"text": "❌ Закрылись в минус", "callback_data": "paper_closed_loss"}],
+        [{"text": "🤖 Назад: Автобот", "callback_data": "menu_autobot"}],
+    ]}
+
+
+def format_paper_closed_positions_v78(chat_id, kind):
+    items = _paper_sorted_trades_v78(chat_id, kind)
+    title = "✅ Закрытые в плюс" if kind == "win" else "❌ Закрытые в минус"
+    lines = [title, "━━━━━━━━━━━━━━━━━━━━"]
+    if not items:
+        lines.append("Таких закрытых paper-сделок пока нет.")
+    else:
+        for idx, item in enumerate(items[:8], 1):
+            lines.append(_paper_brief_line_v78(item, idx, is_open=False))
+    return "\n\n".join(lines)
+
+
+def _paper_item_for_detail_v78(chat_id, mode, idx):
+    idx = int(idx) - 1
+    if mode == "open":
+        items = _paper_sorted_positions_v78(chat_id)
+    elif mode in {"win", "loss"}:
+        items = _paper_sorted_trades_v78(chat_id, mode)
+    else:
+        items = []
+    if idx < 0 or idx >= len(items):
+        return None
+    return items[idx]
+
+
+def format_paper_trade_detail_v78(chat_id, mode, idx):
+    item = _paper_item_for_detail_v78(chat_id, mode, idx)
+    if not item:
+        return "Сделка не найдена. Возможно, журнал уже обновился."
+    d = item.get("decision") or {}
+    is_open = mode == "open"
+    base = _paper_card_v77(item, int(idx), is_open=is_open)
+    support, risks = _directional_factors_v77(item)
+    lines = [
+        "🔎 Дополнительный анализ paper-сделки",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ] + [_plain_report_text_v76(x) for x in base]
+    why = d.get("why") or []
+    warnings = d.get("warnings") or []
+    if why:
+        lines += ["", "Почему вход мог быть нормальным:"]
+        lines.extend("• " + _short_text_v77(x, 140) for x in why[:4])
+    if warnings:
+        lines += ["", "Что было опасным:"]
+        lines.extend("• " + _short_text_v77(x, 140) for x in warnings[:4])
+    if support:
+        lines += ["", "Факторы за направление:"]
+        lines.extend("• " + x for x in support[:4])
+    if risks:
+        lines += ["", "Риски / факторы против:"]
+        lines.extend("• " + x for x in risks[:4])
+    if d.get("gate"):
+        lines += ["", "Gate:", _short_text_v77(d.get("gate"), 180)]
+    lines += [
+        "",
+        "Вывод: это не доказательство, что вход был правильным. Это запись причины, которую потом нужно сравнивать со статистикой.",
+    ]
+    return "\n".join(lines)
+
+
+async def async_bootstrap():
+    _autostart_all_known_chats_v78()
+    await _base_async_bootstrap_v77()
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        chat_id = None
+        callback_id = None
+        data = ""
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+        elif "message" in update:
+            chat_id = _normalize_chat_id_v78(update["message"]["chat"]["id"])
+        if chat_id is not None:
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+
+        if "callback_query" in update:
+            if data == "menu_autobot":
+                await async_answer_callback(session, callback_id, "Автобот")
+                await async_send(session, chat_id, format_autobot_menu(chat_id), autobot_keyboard(chat_id))
+                return
+            if data == "auto_settings":
+                await async_answer_callback(session, callback_id, "Авто")
+                await async_send(session, chat_id, auto_settings_text(chat_id), auto_settings_keyboard(chat_id))
+                return
+            if data == "toggle_auto":
+                if chat_id in auto_chat_ids:
+                    auto_chat_ids.discard(chat_id)
+                    text = "⛔ Авто-уведомления отключены.\n\n" + auto_settings_text(chat_id)
+                else:
+                    auto_chat_ids.add(chat_id)
+                    text = "✅ Авто-уведомления включены.\n\n" + auto_settings_text(chat_id)
+                await async_answer_callback(session, callback_id, "OK")
+                await async_send(session, chat_id, text, auto_settings_keyboard(chat_id))
+                return
+            if data == "paper_report_autobot":
+                await async_answer_callback(session, callback_id, "Журнал")
+                await async_send_plain_v76(session, chat_id, format_paper_journal_home_v78(chat_id), paper_journal_home_keyboard_v78())
+                return
+            if data == "paper_open_positions":
+                await async_answer_callback(session, callback_id, "Открытые")
+                items = _paper_sorted_positions_v78(chat_id)
+                await async_send_plain_v76(session, chat_id, format_paper_open_positions_v78(chat_id), _paper_list_keyboard_v78("open", items))
+                return
+            if data == "paper_closed_menu":
+                await async_answer_callback(session, callback_id, "Закрытые")
+                await async_send_plain_v76(session, chat_id, format_paper_closed_menu_v78(chat_id), paper_closed_menu_keyboard_v78())
+                return
+            if data in {"paper_closed_win", "paper_closed_loss"}:
+                kind = "win" if data.endswith("_win") else "loss"
+                await async_answer_callback(session, callback_id, "Плюс" if kind == "win" else "Минус")
+                items = _paper_sorted_trades_v78(chat_id, kind)
+                await async_send_plain_v76(session, chat_id, format_paper_closed_positions_v78(chat_id, kind), _paper_list_keyboard_v78(kind, items))
+                return
+            if data.startswith("paper_detail_"):
+                _, _, mode, idx = data.split("_", 3)
+                await async_answer_callback(session, callback_id, "Анализ")
+                await async_send_plain_v76(session, chat_id, format_paper_trade_detail_v78(chat_id, mode, idx), _paper_detail_keyboard_v78(mode, idx))
+                return
+
+        await _base_async_handle_update_v77(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v78] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Автостарт Автобота</b> — при запуске бот сам включает авто-задачи для известных chat_id из журнала и state-файлов. Это не реальные ордера, а автоматические уведомления и paper-торговля.
+
+<b>Журнал по разделам</b> — открытые сделки, закрытые в плюс и закрытые в минус разделены. Короткий список показывает только главное, а причины входа и риски открываются через «Дополнительный анализ».
+"""
+
+
+
+# ============================================================
+# v7.8.1 — PAPER REPORT ROUTE
+# ============================================================
+# Old "paper_report" buttons now open the same sorted journal home as the new
+# Autobot report button, so the user never sees two different report formats.
+
+_base_async_handle_update_v78 = async_handle_update
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data in {"paper_report", "paper_report_autobot"}:
+                await async_answer_callback(session, callback_id, "Журнал")
+                await async_send_plain_v76(session, chat_id, format_paper_journal_home_v78(chat_id), paper_journal_home_keyboard_v78())
+                return
+        await _base_async_handle_update_v78(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v781] error: {e}")
+
+
+
+
+# ============================================================
+# v7.8.2 — AUTO SETTINGS BACK BUTTON
+# ============================================================
+# In auto-notification settings the back button should be short and return to
+# the Settings menu, not to Autobot. Long button text is also clipped by
+# Telegram on mobile.
+
+_base_auto_settings_keyboard_v781 = auto_settings_keyboard
+
+
+def auto_settings_keyboard(chat_id):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=False)
+    rows = []
+    for task_key, meta in AUTO_TASKS.items():
+        st = _get_auto_task_settings(chat_id, task_key)
+        state = "ON" if st.get("enabled") else "OFF"
+        iv = AUTO_SEND_INTERVALS[st["send_interval"]]["label"]
+        if meta["needs_tf"]:
+            tf = INTERVALS.get(st.get("tf") or DEFAULT_AUTO_TF, INTERVALS[DEFAULT_AUTO_TF])["label"]
+            text = f"{meta['label']} | {state} | {iv} | TF {tf}"
+        else:
+            text = f"{meta['label']} | {state} | {iv}"
+        rows.append([{"text": text, "callback_data": f"auto_task_{task_key}"}])
+    rows += [
+        [{"text": "◀️ Назад", "callback_data": "menu_settings"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]
+    return {"inline_keyboard": rows}
+
+
+
+
+# ============================================================
+# v7.8.3 — CLEAN AUTOBOT VS AUTO SETTINGS
+# ============================================================
+# Autobot is now only the PaperTrader working screen. Schedules and global
+# auto ON/OFF live only inside Auto Settings.
+
+_base_format_autobot_menu_v782 = format_autobot_menu
+_base_autobot_keyboard_v782 = autobot_keyboard
+_base_auto_settings_keyboard_v782 = auto_settings_keyboard
+_base_settings_keyboard_v782 = settings_keyboard_v59
+
+
+def format_autobot_menu(chat_id):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+    positions = _paper_positions(chat_id)
+    trades = _paper_closed_trades(chat_id)
+    wins = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) > 0]
+    losses = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) < 0]
+    net = sum(_safe_float(t.get("net_usd"), 0) or 0 for t in trades)
+    lines = [
+        "🤖 <b>Автобот / PaperTrader</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Открытые paper-позиции: <b>{len(positions)}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"Сделок сегодня: <b>{_paper_today_open_count(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+        f"Закрытые: <b>{len(trades)}</b> | плюс: <b>{len(wins)}</b> | минус: <b>{len(losses)}</b>",
+        f"Net PnL: <b>{net:+.3f} USDT</b>",
+        "",
+        "Здесь только управление paper-сделками и журналом.",
+        "Параметры авто-задач находятся в разделе <b>Настройки авто</b>.",
+        "",
+        "Paper mode: реальных ордеров на Binance нет.",
+    ]
+    return "\n".join(lines)
+
+
+def autobot_keyboard(chat_id):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+    return {"inline_keyboard": [
+        [{"text": "▶️ Market scan сейчас", "callback_data": "paper_run_now"}],
+        [
+            {"text": "🟢 Открытые позиции", "callback_data": "paper_open_positions"},
+            {"text": "📕 Закрытые позиции", "callback_data": "paper_closed_menu"},
+        ],
+        [{"text": "📒 Журнал / сводка", "callback_data": "paper_report_autobot"}],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+def auto_settings_keyboard(chat_id):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=False)
+    rows = []
+    global_on = chat_id in auto_chat_ids
+    rows.append([{
+        "text": "⛔ Отключить все авто" if global_on else "✅ Включить все авто",
+        "callback_data": "toggle_auto",
+    }])
+    for task_key, meta in AUTO_TASKS.items():
+        st = _get_auto_task_settings(chat_id, task_key)
+        state = "ON" if st.get("enabled") else "OFF"
+        iv = AUTO_SEND_INTERVALS[st["send_interval"]]["label"]
+        if meta["needs_tf"]:
+            tf = INTERVALS.get(st.get("tf") or DEFAULT_AUTO_TF, INTERVALS[DEFAULT_AUTO_TF])["label"]
+            text = f"{meta['label']} | {state} | {iv} | TF {tf}"
+        else:
+            text = f"{meta['label']} | {state} | {iv}"
+        rows.append([{"text": text, "callback_data": f"auto_task_{task_key}"}])
+    rows += [
+        [{"text": "◀️ Назад", "callback_data": "menu_settings"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]
+    return {"inline_keyboard": rows}
+
+
+def settings_keyboard_v59():
+    return {"inline_keyboard": [
+        [{"text": "⚙️ Настройки авто", "callback_data": "auto_settings"}],
+        [
+            {"text": "🗄 Storage", "callback_data": "storage_status"},
+            {"text": "📖 Что такое Storage", "callback_data": "learn_storage"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+
+
+# ============================================================
+# v7.8.4 — AUTOBOT NO SCHEDULE TEXT
+# ============================================================
+# Remove schedule wording from the Autobot screen. Scheduling belongs only to
+# Auto Settings.
+
+# ============================================================
+# v6.1 — RUNTIME ARCHITECTURE REGISTRY
+# ============================================================
+BOT_VERSION_LABEL = "v7.8.4 Autobot No Schedule Text"
+
+# Compatibility alias: older async layers used this name. Keep it explicit
+# so future edits fail less silently.
+evaluate_signal_journal = update_signal_journal_evaluations
+
+RUNTIME_LAYERS = [
+    ("base", "core indicators, signal voting, sync Telegram fallback"),
+    ("v5.6", "signal journal, self-score, quality/risk blockers"),
+    ("v5.7", "SQLite state, candle cache, ensemble, portfolio analytics"),
+    ("v5.8", "async Telegram runtime, futures websocket, orderflow storage"),
+    ("v5.9", "organized Telegram UI and learning menus"),
+    ("v6.0", "entry timing / entry point engine"),
+    ("v6.1", "aligned auto scheduler, per-task auto jobs, 45m support"),
+    ("v6.2", "mark price, funding, open interest, futures volume context"),
+    ("v6.3", "event backtest metrics, R-multiples, fees, exposure and trade log"),
+    ("v6.4", "timestamped walk-forward train/test validation and MTF alignment"),
+    ("v6.5", "portfolio risk gate, daily limits, leverage and liquidation checks"),
+    ("v6.6", "compact signal card and on-demand Telegram detail panels"),
+    ("v6.7", "signal submenu, ticker/TF selection flow, EntryNow vs Setup score"),
+    ("v6.8", "Binance USD-M futures symbol aliases, including SHIBUSDT -> 1000SHIBUSDT"),
+    ("v6.9", "achievable backtest thresholds, larger default lookback, clearer no-trade auto reports"),
+    ("v7.0", "paper auto trader with self-selected timeframe, strategy gates, journal and reports"),
+    ("v7.1", "context back-buttons for reports and detailed paper trade journal"),
+    ("v7.2", "paper trader scans all assets and selects the best risk-gated setup"),
+    ("v7.3", "top-level Autobot menu for paper market scanner"),
+    ("v7.4", "responsive polling, restored caches and lighter parallel paper market scan"),
+    ("v7.5", "Autobot report button fix, Telegram-safe journal chunks and higher paper limits"),
+    ("v7.6", "plain-text fallback and background delivery for Paper Trader journal/report"),
+    ("v7.7", "clean readable Paper Trader journal with direction-aware factors"),
+    ("v7.8", "autostart all auto tasks with user schedule and sorted Autobot journal sections"),
+    ("v7.8.1", "route every Paper report button to the sorted journal home"),
+    ("v7.8.2", "short auto-settings Back button returning to Settings menu"),
+    ("v7.8.3", "Autobot screen cleaned; schedules and global auto toggle moved into Auto Settings"),
+    ("v7.8.4", "remove schedule wording from Autobot screen"),
+]
+
+ACTIVE_RUNTIME_FUNCTIONS = {
+    "get_ohlcv": get_ohlcv,
+    "get_price": get_price,
+    "futures_api_symbol": futures_api_symbol,
+    "_binance_ohlcv": _binance_ohlcv,
+    "full_analyze": full_analyze,
+    "format_msg": format_msg,
+    "format_signal_summary": format_signal_summary,
+    "format_signal_analysis_details": format_signal_analysis_details,
+    "format_entry_plan_analysis": format_entry_plan_analysis,
+    "format_auto_digest": format_auto_digest,
+    "get_futures_context": build_futures_context,
+    "format_futures_context": format_futures_context,
+    "build_trade_risk_decision": build_trade_risk_decision,
+    "build_entry_plan": build_entry_plan,
+    "signal_menu_keyboard": signal_menu_keyboard,
+    "format_trade_risk_decision": format_trade_risk_decision,
+    "format_portfolio_risk": format_portfolio_risk,
+    "main_keyboard": main_keyboard,
+    "autobot_keyboard": autobot_keyboard,
+    "format_autobot_menu": format_autobot_menu,
+    "auto_settings_keyboard": auto_settings_keyboard,
+    "async_handle_update": async_handle_update,
+    "async_auto_signal_loop": async_auto_signal_loop,
+    "run_backtest": run_backtest,
+    "_bt_score_signal": _bt_score_signal,
+    "build_auto_task_message": build_auto_task_message,
+    "paper_trader_cycle": paper_trader_cycle,
+    "paper_select_trade_candidate": paper_select_trade_candidate,
+    "paper_trader_scan_tickers": paper_trader_scan_tickers,
+    "format_paper_report": format_paper_report,
+    "positions_risk_keyboard": positions_risk_keyboard,
+    "back_to_positions_keyboard": back_to_positions_keyboard,
+    "run_walk_forward_optimization": run_walk_forward_optimization,
+    "get_ohlcv_with_times": get_ohlcv_with_times,
+}
+
+
+def _callable_line(fn):
+    code = getattr(fn, "__code__", None)
+    return getattr(code, "co_firstlineno", None)
+
+
+def runtime_architecture_report():
+    """Human-readable map of the active runtime after all wrapper layers."""
+    lines = [
+        f"Runtime: {BOT_VERSION_LABEL}",
+        "Layers: " + " -> ".join(name for name, _ in RUNTIME_LAYERS),
+        "Active callables:",
+    ]
+    for name, fn in ACTIVE_RUNTIME_FUNCTIONS.items():
+        line = _callable_line(fn)
+        lines.append(f"  {name}: line {line if line is not None else 'n/a'}")
+    return "\n".join(lines)
+
+
+def validate_runtime_architecture():
+    """Fail fast if a future edit breaks the expected wrapper chain."""
+    errors = []
+    required_intervals = ("5m", "15m", "30m", "45m", "1h", "4h", "1d")
+    for iv in required_intervals:
+        if iv not in INTERVALS:
+            errors.append(f"missing interval: {iv}")
+    required_auto_intervals = ("5m", "15m", "30m", "1h", "4h", "1d")
+    for iv in required_auto_intervals:
+        if iv not in AUTO_SEND_INTERVALS:
+            errors.append(f"missing auto interval: {iv}")
+    for name, fn in ACTIVE_RUNTIME_FUNCTIONS.items():
+        if not callable(fn):
+            errors.append(f"{name} is not callable")
+    if not callable(globals().get("_base_async_handle_update_v60_for_v61")):
+        errors.append("v6.1 async fallback is missing")
+    if not callable(globals().get("_base_binance_ohlcv_v61")):
+        errors.append("45m OHLCV fallback is missing")
+    if not callable(globals().get("_base_full_analyze_v61")):
+        errors.append("futures context wrapper base is missing")
+    if not callable(globals().get("build_futures_context")):
+        errors.append("futures context builder is missing")
+    if evaluate_signal_journal is not update_signal_journal_evaluations:
+        errors.append("signal journal compatibility alias is not wired")
+    if not callable(globals().get("get_ohlcv_with_times")):
+        errors.append("timestamp OHLCV helper is missing")
+    if not callable(globals().get("build_trade_risk_decision")):
+        errors.append("risk manager decision helper is missing")
+    if errors:
+        raise RuntimeError("Runtime architecture validation failed: " + "; ".join(errors))
+    return True
+
+
+def run_async():
+    try:
+        validate_runtime_architecture()
+        print(runtime_architecture_report())
+        asyncio.run(async_bootstrap())
+    except KeyboardInterrupt:
+        print("\n  [async] stopped by user")
+
+
+if __name__ == "__main__":
+    run_async()
