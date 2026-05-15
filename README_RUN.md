@@ -109,6 +109,10 @@ Optional forced observe-only mode:
 $env:BOT_OBSERVE_ONLY="1"
 ```
 
+Smart Opportunity Ranking v7.17 adds a best-setups report in Autobot. It ranks
+candidate trades by EntryNow, setup strength, probability, RR, expected R,
+confidence, warnings and timeframe quality, while still respecting Safety gate.
+
 ## Trading note
 
 A working bot is not the same as a safe strategy. Before trading live, test on paper trading and check risk per trade, max drawdown, fees, slippage, and liquidation distance.

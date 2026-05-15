@@ -39,7 +39,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.16 Safety Kill Switch`.
+Current active runtime is `v7.17 Smart Opportunity Ranking`.
 
 Layer summary:
 
@@ -57,6 +57,7 @@ Layer summary:
 12. v7.14: Paper Trader slippage, partial TP1, break-even SL and max-hold exits
 13. v7.15: dry-run execution gateway with order plans and live trading blocked
 14. v7.16: safety kill switch, observe-only mode and SL-series cooldown
+15. v7.17: smart opportunity ranking and best-setups report
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

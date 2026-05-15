@@ -24,3 +24,11 @@ def format_probability_calibration_report(*args: Any, **kwargs: Any) -> Any:
 
 def tf_quality_summary(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("tf_quality_summary_v713", *args, **kwargs)
+
+
+def market_opportunity_scan(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("market_opportunity_scan", *args, **kwargs)
+
+
+def format_market_opportunities(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("format_market_opportunities", *args, **kwargs)

@@ -14676,7 +14676,258 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.16 Safety Kill Switch"
+# ============================================================
+# v7.17 — SMART OPPORTUNITY RANKING
+# ============================================================
+# The scanner already checks many assets and timeframes. This layer makes the
+# ranking more explainable: score is adjusted by expected R, probability,
+# confidence, TF quality and warning load. It also adds a separate "best setups"
+# report that does not open a trade.
+
+_base_paper_strategy_candidates_v716 = _paper_strategy_candidates
+_base_autobot_keyboard_v716 = autobot_keyboard
+_base_async_handle_update_v716 = async_handle_update
+
+OPPORTUNITY_REPORT_LIMIT = 8
+
+
+def _candidate_opportunity_metrics_v717(candidate):
+    data = candidate.get("data") or {}
+    ep = candidate.get("entry_plan") or {}
+    prob = _safe_float(data.get("prob"), 0) or 0
+    rr = _safe_float(ep.get("rr_now"), 0) or _safe_float((data.get("risk_levels") or {}).get("rr_ratio"), 0) or 0
+    entry_now = int(ep.get("entry_now_score", ep.get("score", 0)) or 0)
+    setup = int(ep.get("setup_score", ep.get("score", 0)) or 0)
+    confidence = int(data.get("confidence", 0) or 0)
+    warnings = list(data.get("risk_warnings") or []) + list(ep.get("warnings") or [])
+    tf_quality = candidate.get("tf_quality") or _tf_quality_for_interval_v713(candidate.get("interval"))
+    tf_adjust = int(tf_quality.get("score_adjust") or 0)
+
+    expected_r = None
+    if prob > 0 and rr > 0:
+        expected_r = prob * rr - (1.0 - prob)
+
+    adjust = 0.0
+    reasons = []
+    if expected_r is not None:
+        er_adj = max(-10.0, min(12.0, expected_r * 6.0))
+        adjust += er_adj
+        reasons.append(f"expR {expected_r:+.2f} ({er_adj:+.1f})")
+    if prob >= 0.68:
+        adjust += 3
+        reasons.append("prob высокая +3")
+    elif 0 < prob < 0.58:
+        adjust -= 4
+        reasons.append("prob слабая -4")
+    if confidence >= 84:
+        adjust += 3
+        reasons.append("confidence +3")
+    elif confidence and confidence < 70:
+        adjust -= 4
+        reasons.append("confidence низкий -4")
+    if entry_now >= 90:
+        adjust += 4
+        reasons.append("EntryNow 90+")
+    elif entry_now < 75:
+        adjust -= 5
+        reasons.append("EntryNow слабее")
+    if setup >= 90:
+        adjust += 2
+    if rr >= 1.8:
+        adjust += 2
+        reasons.append("RR хороший")
+    elif rr and rr < 1.45:
+        adjust -= 5
+        reasons.append("RR около минимума")
+    if warnings:
+        penalty = min(8, len(warnings) * 2)
+        adjust -= penalty
+        reasons.append(f"warnings -{penalty}")
+
+    grade = "A" if adjust >= 8 else ("B" if adjust >= 2 else ("C" if adjust >= -4 else "D"))
+    return {
+        "prob": prob,
+        "rr": rr,
+        "entry_now": entry_now,
+        "setup": setup,
+        "confidence": confidence,
+        "expected_r": expected_r,
+        "score_adjust": round(adjust, 2),
+        "grade": grade,
+        "tf_grade": tf_quality.get("grade"),
+        "tf_adjust": tf_adjust,
+        "reasons": reasons[:5],
+    }
+
+
+def _paper_strategy_candidates(chat_id, ticker, interval, data):
+    rows = _base_paper_strategy_candidates_v716(chat_id, ticker, interval, data)
+    for cand in rows:
+        raw = float(cand.get("score") or 0)
+        metrics = _candidate_opportunity_metrics_v717(cand)
+        cand["score_before_opportunity"] = raw
+        cand["opportunity"] = metrics
+        cand["score"] = max(0.0, raw + float(metrics.get("score_adjust") or 0))
+        if metrics.get("score_adjust"):
+            cand["reason"] = (
+                f"{cand.get('reason')}; opportunity {metrics.get('grade')} "
+                f"({metrics.get('score_adjust'):+.1f}, "
+                f"{'; '.join(metrics.get('reasons') or ['без доп. причин'])})"
+            )
+    return rows
+
+
+def market_opportunity_scan(chat_id):
+    tried = []
+    candidates = []
+    pairs = [(ticker, tf) for ticker in PAPER_TRADER_SCAN_TICKERS for tf in PAPER_TRADER_TFS]
+    workers = min(PAPER_SCAN_WORKERS, len(pairs)) or 1
+
+    with _futures_v74.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="opp-scan") as pool:
+        fut_to_pair = {
+            pool.submit(_paper_scan_one_v74, chat_id, ticker, tf): (ticker, tf)
+            for ticker, tf in pairs
+        }
+        for fut in _futures_v74.as_completed(fut_to_pair):
+            ticker, tf = fut_to_pair[fut]
+            try:
+                row, found = fut.result()
+                tried.append(row)
+                candidates.extend(found)
+            except Exception as e:
+                tried.append({"ticker": ticker, "tf": tf, "error": str(e)})
+
+    rows = []
+    for cand in candidates:
+        block = _paper_candidate_block_reason(chat_id, cand)
+        item = dict(cand)
+        item["blocked_reason"] = block
+        item["tradable"] = not bool(block)
+        rows.append(item)
+    rows.sort(key=lambda x: (bool(x.get("tradable")), x.get("score", 0)), reverse=True)
+    return rows, tried
+
+
+def _opportunity_brief_line_v717(candidate, idx):
+    ticker = candidate.get("ticker")
+    label = TICKERS.get(ticker, {}).get("label", ticker)
+    tf = INTERVALS.get(candidate.get("interval"), {}).get("label", candidate.get("interval"))
+    opp = candidate.get("opportunity") or {}
+    direction = str(candidate.get("direction") or "").upper()
+    status = "OK" if candidate.get("tradable") else "BLOCK"
+    score = _safe_float(candidate.get("score"), 0) or 0
+    prob = _safe_float(opp.get("prob"), 0) or 0
+    rr = _safe_float(opp.get("rr"), 0) or 0
+    er = opp.get("expected_r")
+    er_text = "n/a" if er is None else f"{er:+.2f}R"
+    line = (
+        f"{idx}. {label} {direction} | {tf} | {status}\n"
+        f"   score {score:.1f} | grade {opp.get('grade')} | prob {prob * 100:.0f}% | RR {rr:.2f} | expR {er_text}"
+    )
+    if candidate.get("blocked_reason"):
+        line += f"\n   блок: {candidate.get('blocked_reason')}"
+    else:
+        why = "; ".join(opp.get("reasons") or [])
+        if why:
+            line += f"\n   почему выше: {why}"
+    return line
+
+
+def format_market_opportunities(chat_id):
+    candidates, tried = market_opportunity_scan(chat_id)
+    tradable = [c for c in candidates if c.get("tradable")]
+    blocked = [c for c in candidates if not c.get("tradable")]
+    lines = [
+        "🏁 Лучшие возможности рынка",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Скан: {len(PAPER_TRADER_SCAN_TICKERS)} активов × {len(PAPER_TRADER_TFS)} TF",
+        f"Кандидатов: {len(candidates)} | можно открыть: {len(tradable)} | заблокировано: {len(blocked)}",
+        "",
+        "Это отчёт для выбора, а не команда входить. Новая сделка открывается только через Paper Trader и Safety gate.",
+    ]
+    if tradable:
+        lines += ["", "Разрешённые кандидаты:"]
+        for idx, cand in enumerate(tradable[:OPPORTUNITY_REPORT_LIMIT], 1):
+            lines.append(_opportunity_brief_line_v717(cand, idx))
+    else:
+        lines += ["", "Разрешённых кандидатов сейчас нет."]
+
+    if blocked:
+        lines += ["", "Лучшие заблокированные:"]
+        for idx, cand in enumerate(blocked[:4], 1):
+            lines.append(_opportunity_brief_line_v717(cand, idx))
+
+    if not candidates:
+        lines += ["", "Лучшие проверки без полноценного входа:"]
+        lines.extend(_format_scan_rows(tried) or ["• данных для сравнения нет"])
+
+    lines += [
+        "",
+        "Профессиональный вывод: хороший бот должен уметь сказать «лучший сетап всё равно не проходит риск».",
+    ]
+    return "\n\n".join(lines)
+
+
+def opportunity_report_keyboard_v717():
+    return {"inline_keyboard": [
+        [{"text": "▶️ Market scan сейчас", "callback_data": "paper_run_now"}],
+        [{"text": "🤖 Назад: Автобот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+async def _send_market_opportunities_v717(session, chat_id):
+    try:
+        msg = await asyncio.to_thread(format_market_opportunities, chat_id)
+        await async_send_plain_v76(session, chat_id, msg, opportunity_report_keyboard_v717())
+    except Exception as e:
+        await async_send_plain_v76(session, chat_id, f"Ошибка отчёта возможностей: {e}", opportunity_report_keyboard_v717())
+
+
+def autobot_keyboard(chat_id):
+    kb = _base_autobot_keyboard_v716(chat_id)
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [{"text": "🏁 Лучшие сетапы", "callback_data": "market_opportunities"}])
+    return {"inline_keyboard": rows}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data == "market_opportunities":
+                await async_answer_callback(session, callback_id, "Скан")
+                await async_send_plain_v76(
+                    session,
+                    chat_id,
+                    "Готовлю отчёт лучших сетапов в фоне. Можно нажимать другие кнопки.",
+                    opportunity_report_keyboard_v717(),
+                )
+                _track_update_task_v74(asyncio.create_task(_send_market_opportunities_v717(session, chat_id)))
+                return
+        await _base_async_handle_update_v716(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v717] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Expected R</b> — ожидаемый результат в единицах риска. Пример: +0.20R значит, что при таких вероятности и RR идея математически выглядит лучше нуля, но это не гарантия сделки.
+
+<b>Opportunity grade</b> — оценка качества кандидата A/B/C/D. Это не сигнал, а способ сортировать несколько сетапов между собой.
+"""
+
+
+BOT_VERSION_LABEL = "v7.17 Smart Opportunity Ranking"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -14719,6 +14970,7 @@ RUNTIME_LAYERS = [
     ("v7.14", "Paper Trader realism: slippage, partial TP1, break-even SL, max hold and stale exits"),
     ("v7.15", "Execution Gateway dry-run order plans with live trading blocked"),
     ("v7.16", "Safety kill switch, observe-only mode and SL-series cooldown"),
+    ("v7.17", "Smart opportunity ranking and best-setups report"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -14763,6 +15015,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_execution_status": format_execution_status,
     "build_safety_decision": build_safety_decision,
     "format_safety_status": format_safety_status,
+    "market_opportunity_scan": market_opportunity_scan,
+    "format_market_opportunities": format_market_opportunities,
     "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
@@ -14841,6 +15095,10 @@ def validate_runtime_architecture():
         errors.append("safety decision helper is missing")
     if not callable(globals().get("format_safety_status")):
         errors.append("safety status report is missing")
+    if not callable(globals().get("market_opportunity_scan")):
+        errors.append("market opportunity scanner is missing")
+    if not callable(globals().get("format_market_opportunities")):
+        errors.append("market opportunities report is missing")
     mode = _execution_mode_v715()
     if mode not in EXECUTION_ALLOWED_MODES:
         errors.append(f"invalid execution mode: {mode}")
