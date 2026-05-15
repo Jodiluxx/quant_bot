@@ -14,7 +14,7 @@ $env:BOT_EXECUTION_MODE="paper"
 # Use separate Testnet keys only, never real mainnet keys.
 # $env:BINANCE_FUTURES_TESTNET_API_KEY="PASTE_TESTNET_KEY_HERE"
 # $env:BINANCE_FUTURES_TESTNET_API_SECRET="PASTE_TESTNET_SECRET_HERE"
-# $env:BINANCE_TESTNET_ORDER_SUBMIT="1"  # validates entry via /fapi/v1/order/test only
+# $env:BINANCE_TESTNET_ORDER_SUBMIT="1"  # validates entry + SL/TP via /fapi/v1/order/test
 
 # Optional: force observe-only mode from the launcher environment.
 # In observe-only mode the bot analyzes and reports, but does not open new paper trades.

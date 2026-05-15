@@ -22,5 +22,13 @@ def submit_testnet_order_test(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("submit_testnet_order_test", *args, **kwargs)
 
 
+def validate_protection_order_geometry(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("validate_protection_order_geometry", *args, **kwargs)
+
+
+def submit_testnet_protection_order_tests(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("submit_testnet_protection_order_tests", *args, **kwargs)
+
+
 def format_testnet_status(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_testnet_status", *args, **kwargs)

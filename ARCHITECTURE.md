@@ -39,7 +39,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.19 Testnet Order Test`.
+Current active runtime is `v7.20 Testnet Protection Orders`.
 
 Layer summary:
 
@@ -60,6 +60,7 @@ Layer summary:
 15. v7.17: smart opportunity ranking and best-setups report
 16. v7.18: daily and weekly Paper Trader performance reports
 17. v7.19: Binance Futures Testnet `/fapi/v1/order/test` validation
+18. v7.20: Testnet protection order validation for SL and TP reduce-only orders
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

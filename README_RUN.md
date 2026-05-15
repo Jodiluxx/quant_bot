@@ -108,6 +108,11 @@ $env:BOT_EXECUTION_MODE="testnet"
 $env:BINANCE_TESTNET_ORDER_SUBMIT="1"
 ```
 
+Testnet Protection Orders v7.20 also validates protective orders:
+`STOP_MARKET` for SL and `TAKE_PROFIT_MARKET` for TP1/TP2, all with
+`reduceOnly=true`. It blocks bad geometry, for example LONG SL above entry or
+SHORT TP above entry.
+
 Safety Kill Switch v7.16 adds an Autobot safety screen. It can pause new paper
 entries, turn on observe-only mode, block after daily limits, and cool down
 after a series of SL/loss exits.

@@ -15458,7 +15458,334 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.19 Testnet Order Test"
+# ============================================================
+# v7.20 — TESTNET PROTECTION ORDER TESTS
+# ============================================================
+# Entry without protection is not a professional trading workflow. This layer
+# validates SL/TP geometry and can test STOP_MARKET / TAKE_PROFIT_MARKET
+# reduceOnly protection orders on Binance Futures Testnet.
+
+_base_paper_open_candidate_v719 = _paper_open_candidate
+_base_format_testnet_status_v719 = format_testnet_status
+_base_format_execution_status_v719 = format_execution_status
+
+PROTECTION_TP1_QTY_PCT = PAPER_TP1_CLOSE_PCT
+
+
+def _plan_entry_ref_v720(plan):
+    return _safe_float((plan.get("entry_order") or {}).get("entry_reference"), None)
+
+
+def _plan_protection_map_v720(plan):
+    rows = {}
+    for order in plan.get("protection_orders") or []:
+        label = str(order.get("label") or "").upper()
+        if label:
+            rows[label] = order
+    return rows
+
+
+def validate_protection_order_geometry(plan):
+    plan = plan or {}
+    direction = str(plan.get("direction") or "").lower()
+    entry = _plan_entry_ref_v720(plan)
+    prot = _plan_protection_map_v720(plan)
+    sl = _safe_float((prot.get("SL") or {}).get("stop_price"), None)
+    tp1 = _safe_float((prot.get("TP1") or {}).get("stop_price"), None)
+    tp2 = _safe_float((prot.get("TP2") or {}).get("stop_price"), None)
+    blockers = []
+    warnings = []
+
+    if direction not in {"long", "short"}:
+        blockers.append("нет направления long/short для проверки SL/TP")
+    if not entry or entry <= 0:
+        blockers.append("нет entry_reference для проверки SL/TP")
+    if not sl or sl <= 0:
+        blockers.append("нет SL stopPrice")
+    if not tp1 or tp1 <= 0:
+        blockers.append("нет TP1 stopPrice")
+
+    if not blockers:
+        if direction == "long":
+            if sl >= entry:
+                blockers.append(f"LONG SL должен быть ниже entry: SL {sl} >= entry {entry}")
+            if tp1 <= entry:
+                blockers.append(f"LONG TP1 должен быть выше entry: TP1 {tp1} <= entry {entry}")
+            if tp2 and tp2 <= entry:
+                blockers.append(f"LONG TP2 должен быть выше entry: TP2 {tp2} <= entry {entry}")
+            if tp2 and tp2 < tp1:
+                warnings.append("LONG TP2 ниже TP1; проверь логику целей")
+        else:
+            if sl <= entry:
+                blockers.append(f"SHORT SL должен быть выше entry: SL {sl} <= entry {entry}")
+            if tp1 >= entry:
+                blockers.append(f"SHORT TP1 должен быть ниже entry: TP1 {tp1} >= entry {entry}")
+            if tp2 and tp2 >= entry:
+                blockers.append(f"SHORT TP2 должен быть ниже entry: TP2 {tp2} >= entry {entry}")
+            if tp2 and tp2 > tp1:
+                warnings.append("SHORT TP2 выше TP1; проверь логику целей")
+
+    close_side = "SELL" if direction == "long" else ("BUY" if direction == "short" else None)
+    for label, expected_type in (("SL", "STOP_MARKET"), ("TP1", "TAKE_PROFIT_MARKET"), ("TP2", "TAKE_PROFIT_MARKET")):
+        order = prot.get(label)
+        if not order:
+            if label != "TP2":
+                blockers.append(f"нет защитного ордера {label}")
+            continue
+        if order.get("side") != close_side:
+            blockers.append(f"{label}: side должен быть {close_side}, сейчас {order.get('side')}")
+        if order.get("type") != expected_type:
+            blockers.append(f"{label}: type должен быть {expected_type}, сейчас {order.get('type')}")
+        if bool(order.get("reduce_only")) is not True:
+            blockers.append(f"{label}: reduceOnly должен быть true")
+
+    return {
+        "ok": not blockers,
+        "blockers": list(dict.fromkeys(x for x in blockers if x)),
+        "warnings": list(dict.fromkeys(x for x in warnings if x)),
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "direction": direction,
+        "close_side": close_side,
+    }
+
+
+def _protection_order_qty_v720(plan, label):
+    total = _safe_float((plan.get("entry_order") or {}).get("quantity_est"), 0) or 0
+    if total <= 0:
+        return 0.0
+    label = str(label or "").upper()
+    if label == "SL":
+        return total
+    tp1_qty = total * PROTECTION_TP1_QTY_PCT / 100.0
+    if label == "TP1":
+        return max(0.0, tp1_qty)
+    if label == "TP2":
+        return max(0.0, total - tp1_qty)
+    return total
+
+
+def _protect_client_id_v720(plan_id, label):
+    raw = f"v720_{label}_{str(plan_id or 'plan').replace(':', '_')}"
+    return raw[-36:]
+
+
+def build_testnet_protection_order_tests(plan):
+    plan = plan or {}
+    geometry = validate_protection_order_geometry(plan)
+    if not geometry.get("ok"):
+        return [], geometry
+    params = []
+    prot = _plan_protection_map_v720(plan)
+    for label in ("SL", "TP1", "TP2"):
+        order = prot.get(label)
+        if not order:
+            continue
+        qty = _protection_order_qty_v720(plan, label)
+        if qty <= 0:
+            continue
+        params.append({
+            "label": label,
+            "symbol": plan.get("api_symbol") or plan.get("ticker"),
+            "side": order.get("side"),
+            "type": order.get("type"),
+            "quantity": _format_decimal_v719(qty, 8),
+            "stopPrice": _format_decimal_v719(order.get("stop_price"), 8),
+            "reduceOnly": "true",
+            "workingType": "CONTRACT_PRICE",
+            "priceProtect": "false",
+            "newClientOrderId": _protect_client_id_v720(plan.get("plan_id"), label),
+            "newOrderRespType": "ACK",
+        })
+    return params, geometry
+
+
+def submit_testnet_protection_order_tests(plan):
+    plan = plan or {}
+    mode = execution_mode()
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "mode": mode.get("mode"),
+        "endpoint": TESTNET_ORDER_TEST_PATH,
+        "submitted": False,
+        "ok": False,
+        "orders": [],
+    }
+    params_list, geometry = build_testnet_protection_order_tests(plan)
+    result["geometry"] = geometry
+    if not geometry.get("ok"):
+        result["skipped"] = True
+        result["reason"] = "SL/TP geometry invalid"
+        return result
+    if mode.get("mode") != "testnet":
+        result["skipped"] = True
+        result["reason"] = "BOT_EXECUTION_MODE должен быть testnet"
+        return result
+    if not _testnet_submit_enabled_v719():
+        result["skipped"] = True
+        result["reason"] = "BINANCE_TESTNET_ORDER_SUBMIT не включён"
+        return result
+    if plan.get("blockers"):
+        result["skipped"] = True
+        result["reason"] = "ордер-план заблокирован risk/safety"
+        result["blockers"] = list(plan.get("blockers") or [])[:5]
+        return result
+    if not params_list:
+        result["skipped"] = True
+        result["reason"] = "нет защитных ордеров для проверки"
+        return result
+
+    for params in params_list:
+        label = params.get("label")
+        request = dict(params)
+        request.pop("label", None)
+        response = _testnet_post_signed_v719(TESTNET_ORDER_TEST_PATH, request)
+        item = {
+            "label": label,
+            "submitted": not response.get("skipped", False),
+            "ok": bool(response.get("ok")),
+            "status_code": response.get("status_code"),
+            "reason": response.get("reason") or response.get("error"),
+            "request": {
+                "symbol": request.get("symbol"),
+                "side": request.get("side"),
+                "type": request.get("type"),
+                "quantity": request.get("quantity"),
+                "stopPrice": request.get("stopPrice"),
+                "reduceOnly": request.get("reduceOnly"),
+            },
+            "response": response.get("payload"),
+        }
+        result["orders"].append(item)
+
+    result["submitted"] = any(x.get("submitted") for x in result["orders"])
+    result["ok"] = bool(result["orders"]) and all(x.get("ok") for x in result["orders"])
+    if not result["submitted"]:
+        first_reason = next((x.get("reason") for x in result["orders"] if x.get("reason")), None)
+        result["skipped"] = True
+        result["reason"] = first_reason or "protection checks skipped"
+    return result
+
+
+def _record_testnet_protection_result_v720(plan, result):
+    with _execution_lock_v715:
+        state = _execution_load_state_v715()
+        event = {
+            "type": "testnet_protection_order_test",
+            "ts": result.get("ts"),
+            "chat_id": plan.get("chat_id"),
+            "plan_id": plan.get("plan_id"),
+            "ticker": plan.get("ticker"),
+            "interval": plan.get("interval"),
+            "direction": plan.get("direction"),
+            "submitted": result.get("submitted"),
+            "ok": result.get("ok"),
+            "reason": result.get("reason"),
+            "geometry": result.get("geometry"),
+            "orders": result.get("orders"),
+        }
+        state.setdefault("events", []).append(event)
+        _execution_save_state_v715(state)
+    return result
+
+
+def _recent_testnet_protection_events_v720(chat_id=None, limit=5):
+    state = _execution_load_state_v715()
+    events = [e for e in (state.get("events") or []) if e.get("type") == "testnet_protection_order_test"]
+    if chat_id is not None:
+        key = _paper_chat_key(chat_id)
+        events = [e for e in events if str(e.get("chat_id")) == key]
+    events.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    return events[:limit]
+
+
+def _paper_open_candidate(chat_id, candidate):
+    pos, err = _base_paper_open_candidate_v719(chat_id, candidate)
+    if err or not pos:
+        return pos, err
+    try:
+        plan = build_execution_order_plan(chat_id, candidate, position=pos, already_opened=True)
+        result = submit_testnet_protection_order_tests(plan)
+        _record_testnet_protection_result_v720(plan, result)
+        with _paper_lock:
+            live = (_paper_state.get("positions") or {}).get(pos.get("pos_id"))
+            if live is not None:
+                live["testnet_protection_order_tests"] = {
+                    "ts": result.get("ts"),
+                    "submitted": result.get("submitted"),
+                    "ok": result.get("ok"),
+                    "reason": result.get("reason"),
+                    "geometry_ok": (result.get("geometry") or {}).get("ok"),
+                    "orders": [
+                        {
+                            "label": x.get("label"),
+                            "submitted": x.get("submitted"),
+                            "ok": x.get("ok"),
+                            "status_code": x.get("status_code"),
+                            "reason": x.get("reason"),
+                        }
+                        for x in (result.get("orders") or [])
+                    ],
+                }
+                pos.update(live)
+                _paper_save_state()
+    except Exception as e:
+        print(f"  [testnet_v720] protection test hook error: {e}")
+    return pos, None
+
+
+def format_testnet_status(chat_id):
+    text = _base_format_testnet_status_v719(chat_id)
+    events = _recent_testnet_protection_events_v720(chat_id, 3)
+    lines = [
+        text,
+        "",
+        "Protection v7.20:",
+        "• SL: STOP_MARKET reduceOnly=true",
+        "• TP1/TP2: TAKE_PROFIT_MARKET reduceOnly=true",
+        "• geometry: LONG SL ниже entry, TP выше entry; SHORT наоборот",
+    ]
+    if events:
+        lines += ["", "Последние protection checks:"]
+        for event in events:
+            status = "OK" if event.get("ok") else ("SKIP" if not event.get("submitted") else "FAIL")
+            lines.append(f"• {_fmt_dt_short(event.get('ts'))} | {event.get('ticker')} {event.get('direction')} | {status}")
+            reason = event.get("reason")
+            if reason:
+                lines.append(f"  причина: {reason}")
+            for order in (event.get("orders") or [])[:3]:
+                order_status = "OK" if order.get("ok") else ("SKIP" if not order.get("submitted") else "FAIL")
+                req = order.get("request") or {}
+                lines.append(f"  {order.get('label')}: {order_status} {req.get('type')} {req.get('side')} stop={req.get('stopPrice')}")
+    else:
+        lines.append("Проверок защитных ордеров ещё нет.")
+    return "\n".join(lines)
+
+
+def format_execution_status(chat_id):
+    text = _base_format_execution_status_v719(chat_id)
+    events = _recent_testnet_protection_events_v720(chat_id, 1)
+    status = "нет проверок"
+    if events:
+        last = events[0]
+        status = "OK" if last.get("ok") else ("SKIP" if not last.get("submitted") else "FAIL")
+    return text + "\n• последняя protection /order/test: " + status
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Reduce-only</b> — ордер, который может только уменьшить позицию. Для SL/TP это важно: защитный ордер не должен случайно открыть обратную позицию.
+
+<b>STOP_MARKET</b> — стоп-ордер по рынку. Для LONG защитный SELL SL должен быть ниже entry, для SHORT защитный BUY SL должен быть выше entry.
+
+<b>TAKE_PROFIT_MARKET</b> — тейк-профит по рынку. Для LONG SELL TP должен быть выше entry, для SHORT BUY TP должен быть ниже entry.
+"""
+
+
+BOT_VERSION_LABEL = "v7.20 Testnet Protection Orders"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -15504,6 +15831,7 @@ RUNTIME_LAYERS = [
     ("v7.17", "Smart opportunity ranking and best-setups report"),
     ("v7.18", "Daily and weekly Paper Trader performance reports"),
     ("v7.19", "Binance Futures Testnet /order/test validation for entry plans"),
+    ("v7.20", "Testnet STOP_MARKET/TAKE_PROFIT_MARKET protection order validation"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -15547,6 +15875,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "build_execution_order_plan": build_execution_order_plan,
     "format_execution_status": format_execution_status,
     "submit_testnet_order_test": submit_testnet_order_test,
+    "submit_testnet_protection_order_tests": submit_testnet_protection_order_tests,
+    "validate_protection_order_geometry": validate_protection_order_geometry,
     "format_testnet_status": format_testnet_status,
     "build_safety_decision": build_safety_decision,
     "format_safety_status": format_safety_status,
@@ -15641,6 +15971,10 @@ def validate_runtime_architecture():
         errors.append("testnet order test submitter is missing")
     if not callable(globals().get("format_testnet_status")):
         errors.append("testnet status report is missing")
+    if not callable(globals().get("validate_protection_order_geometry")):
+        errors.append("protection geometry validator is missing")
+    if not callable(globals().get("submit_testnet_protection_order_tests")):
+        errors.append("testnet protection order submitter is missing")
     mode = _execution_mode_v715()
     if mode not in EXECUTION_ALLOWED_MODES:
         errors.append(f"invalid execution mode: {mode}")
