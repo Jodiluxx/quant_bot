@@ -113,6 +113,16 @@ Testnet Protection Orders v7.20 also validates protective orders:
 `reduceOnly=true`. It blocks bad geometry, for example LONG SL above entry or
 SHORT TP above entry.
 
+Testnet Journal/Reconciliation v7.21 adds a separate `testnet_journal.json`
+runtime file and reports for planned order checks, accepted/rejected Testnet
+validations, Binance rejection reasons, and plan-vs-result reconciliation.
+
+The first real extraction helpers now live in:
+
+- `quant_bot/execution_gateway.py`
+- `quant_bot/safety.py`
+- `quant_bot/analytics_reports.py`
+
 Safety Kill Switch v7.16 adds an Autobot safety screen. It can pause new paper
 entries, turn on observe-only mode, block after daily limits, and cool down
 after a series of SL/loss exits.

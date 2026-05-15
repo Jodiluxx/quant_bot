@@ -15785,7 +15785,342 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.20 Testnet Protection Orders"
+# ============================================================
+# v7.21 — TESTNET JOURNAL / RECONCILIATION
+# ============================================================
+# Order-test endpoints do not create persistent exchange orders, so
+# reconciliation here means: planned order -> testnet validation result ->
+# rejection/acceptance reason. The journal is stored separately from runtime
+# state so it can be reviewed without digging through technical events.
+
+from quant_bot.execution_gateway import reconcile_testnet_plan as _reconcile_testnet_plan_v721
+
+_base_record_testnet_result_v720 = _record_testnet_result_v719
+_base_record_testnet_protection_result_v720 = _record_testnet_protection_result_v720
+_base_format_testnet_status_v720 = format_testnet_status
+_base_format_execution_status_v720 = format_execution_status
+_base_async_handle_update_v720 = async_handle_update
+
+TESTNET_JOURNAL_FILE = "testnet_journal.json"
+
+
+def _testnet_journal_load_v721():
+    try:
+        if os.path.exists(TESTNET_JOURNAL_FILE):
+            with open(TESTNET_JOURNAL_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("events", [])
+                return data
+    except Exception as e:
+        print(f"  [testnet_journal_v721] load error: {e}")
+    return {"events": []}
+
+
+def _testnet_journal_save_v721(state):
+    try:
+        state["events"] = list(state.get("events") or [])[-1500:]
+        with open(TESTNET_JOURNAL_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [testnet_journal_v721] save error: {e}")
+
+
+def _testnet_result_reason_v721(result):
+    if not isinstance(result, dict):
+        return ""
+    if result.get("reason") or result.get("error"):
+        return str(result.get("reason") or result.get("error"))
+    response = result.get("response")
+    if isinstance(response, dict):
+        code = response.get("code")
+        msg = response.get("msg") or response.get("message")
+        if code is not None and msg:
+            return f"{code}: {msg}"
+        if msg:
+            return str(msg)
+    for order in result.get("orders") or []:
+        reason = order.get("reason")
+        if reason:
+            return f"{order.get('label')}: {reason}"
+        resp = order.get("response")
+        if isinstance(resp, dict) and (resp.get("msg") or resp.get("message")):
+            return f"{order.get('label')}: {resp.get('code')}: {resp.get('msg') or resp.get('message')}"
+    return ""
+
+
+def _testnet_journal_record_v721(kind, plan, result):
+    plan = plan or {}
+    result = result or {}
+    event = {
+        "type": "testnet_journal_event",
+        "kind": kind,
+        "ts": result.get("ts") or datetime.now(timezone.utc).isoformat(),
+        "chat_id": plan.get("chat_id"),
+        "plan_id": plan.get("plan_id") or result.get("plan_id"),
+        "ticker": plan.get("ticker"),
+        "interval": plan.get("interval"),
+        "direction": plan.get("direction"),
+        "strategy": plan.get("strategy"),
+        "submitted": result.get("submitted"),
+        "ok": result.get("ok"),
+        "status_code": result.get("status_code"),
+        "reason": _testnet_result_reason_v721(result),
+        "planned": {
+            "entry_order": plan.get("entry_order"),
+            "protection_orders": plan.get("protection_orders"),
+            "blockers": list(plan.get("blockers") or [])[:6],
+            "warnings": list(plan.get("warnings") or [])[:6],
+        },
+        "request": result.get("request"),
+        "response": result.get("response"),
+        "orders": result.get("orders"),
+        "geometry": result.get("geometry"),
+    }
+    state = _testnet_journal_load_v721()
+    state.setdefault("events", []).append(event)
+    _testnet_journal_save_v721(state)
+    return event
+
+
+def _record_testnet_result_v719(plan, result):
+    out = _base_record_testnet_result_v720(plan, result)
+    try:
+        _testnet_journal_record_v721("entry", plan, result)
+    except Exception as e:
+        print(f"  [testnet_journal_v721] entry record error: {e}")
+    return out
+
+
+def _record_testnet_protection_result_v720(plan, result):
+    out = _base_record_testnet_protection_result_v720(plan, result)
+    try:
+        _testnet_journal_record_v721("protection", plan, result)
+    except Exception as e:
+        print(f"  [testnet_journal_v721] protection record error: {e}")
+    return out
+
+
+def _execution_event_to_journal_v721(event):
+    kind = "entry" if event.get("type") == "testnet_order_test" else "protection"
+    return {
+        "type": "testnet_journal_event",
+        "kind": kind,
+        "ts": event.get("ts"),
+        "chat_id": event.get("chat_id"),
+        "plan_id": event.get("plan_id"),
+        "ticker": event.get("ticker"),
+        "interval": event.get("interval"),
+        "direction": event.get("direction"),
+        "submitted": event.get("submitted"),
+        "ok": event.get("ok"),
+        "status_code": event.get("status_code"),
+        "reason": event.get("reason"),
+        "request": event.get("request"),
+        "response": event.get("response"),
+        "orders": event.get("orders"),
+        "geometry": event.get("geometry"),
+    }
+
+
+def _testnet_journal_events_v721(chat_id=None, limit=None):
+    events = list((_testnet_journal_load_v721().get("events") or []))
+    exec_state = _execution_load_state_v715()
+    for event in exec_state.get("events") or []:
+        if event.get("type") in {"testnet_order_test", "testnet_protection_order_test"}:
+            events.append(_execution_event_to_journal_v721(event))
+    seen = set()
+    deduped = []
+    for event in events:
+        key = (event.get("kind"), event.get("plan_id"), event.get("ts"), event.get("reason"))
+        if key in seen:
+            continue
+        seen.add(key)
+        if chat_id is not None and str(event.get("chat_id")) != _paper_chat_key(chat_id):
+            continue
+        deduped.append(event)
+    deduped.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    return deduped[: int(limit)] if limit else deduped
+
+
+def _testnet_plan_index_v721():
+    plans = _execution_load_state_v715().get("plans") or []
+    return {p.get("plan_id"): p for p in plans if p.get("plan_id")}
+
+
+def _testnet_reconciliations_v721(chat_id=None, limit=6):
+    plans = _testnet_plan_index_v721()
+    by_plan = {}
+    for event in _testnet_journal_events_v721(chat_id, None):
+        plan_id = event.get("plan_id")
+        if not plan_id:
+            continue
+        by_plan.setdefault(plan_id, []).append(event)
+    recs = []
+    for plan_id, events in by_plan.items():
+        plan = plans.get(plan_id)
+        rec = _reconcile_testnet_plan_v721(plan, events)
+        rec["plan_id"] = plan_id
+        rec["last_ts"] = max(str(e.get("ts") or "") for e in events)
+        if plan is None:
+            rec["planned"]["plan_id"] = plan_id
+            rec["planned"]["ticker"] = events[0].get("ticker")
+            rec["planned"]["interval"] = events[0].get("interval")
+            rec["planned"]["direction"] = events[0].get("direction")
+        recs.append(rec)
+    recs.sort(key=lambda r: r.get("last_ts", ""), reverse=True)
+    return recs[: int(limit)]
+
+
+def _testnet_status_word_v721(event):
+    if not event:
+        return "MISSING"
+    if event.get("ok"):
+        return "ACCEPTED"
+    if event.get("submitted") is False or event.get("skipped"):
+        return "SKIPPED"
+    return "REJECTED"
+
+
+def _testnet_event_line_v721(event):
+    req = event.get("request") or {}
+    status = _testnet_status_word_v721(event)
+    kind = "ENTRY" if event.get("kind") == "entry" else "PROTECT"
+    qty = req.get("quantity")
+    side = req.get("side")
+    typ = req.get("type")
+    stop = req.get("stopPrice")
+    bits = [f"{kind} {status}", str(event.get("ticker") or "?"), str(event.get("direction") or "?").upper()]
+    if typ:
+        bits.append(str(typ))
+    if side:
+        bits.append(str(side))
+    if qty:
+        bits.append(f"qty={qty}")
+    if stop:
+        bits.append(f"stop={stop}")
+    line = f"• {_fmt_dt_short(event.get('ts'))} | " + " | ".join(bits)
+    if event.get("reason"):
+        line += f"\n  причина: {event.get('reason')}"
+    return line
+
+
+def format_testnet_journal_report(chat_id, limit=12):
+    events = _testnet_journal_events_v721(chat_id, limit)
+    lines = [
+        "📒 Testnet journal",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "Здесь записано, что бот планировал и что Testnet validation принял/отклонил.",
+    ]
+    if not events:
+        lines += ["", "Пока нет testnet-событий. Они появятся после новой paper-сделки с testnet-check."]
+        return "\n".join(lines)
+    lines += ["", f"Последние события: {len(events)}"]
+    for event in events:
+        lines.append(_testnet_event_line_v721(event))
+    lines += [
+        "",
+        "Важно: /order/test не создаёт реальную позицию. Это проверка параметров, подписи и базовой логики ордера.",
+    ]
+    return "\n".join(lines)
+
+
+def format_testnet_reconciliation_report(chat_id, limit=6):
+    recs = _testnet_reconciliations_v721(chat_id, limit)
+    lines = [
+        "🔎 Testnet reconciliation",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "Сверка: план бота → entry test → protection tests → итог.",
+    ]
+    if not recs:
+        lines += ["", "Пока нет планов с testnet-проверками."]
+        return "\n".join(lines)
+    for idx, rec in enumerate(recs, 1):
+        planned = rec.get("planned") or {}
+        label = TICKERS.get(planned.get("ticker"), {}).get("label", planned.get("ticker"))
+        lines += [
+            "",
+            f"{idx}. {label} {str(planned.get('direction') or '').upper()} | {planned.get('interval')} | {rec.get('overall')}",
+            f"Entry: {rec.get('entry_status')} | Protection: {rec.get('protection_status')}",
+            f"Plan: {planned.get('entry_side')} qty≈{_fmt_num(planned.get('quantity_est'), 6)} notional≈{_fmt_num(planned.get('notional_est'), 2)} USDT",
+        ]
+        reasons = rec.get("reasons") or []
+        if reasons:
+            lines.append("Причина: " + " | ".join(reasons[:2]))
+    lines += [
+        "",
+        "Если итог REJECTED или SKIPPED, это не баг сам по себе. Это место, где бот честно показывает, почему Testnet не принял идею.",
+    ]
+    return "\n".join(lines)
+
+
+def format_testnet_status(chat_id):
+    text = _base_format_testnet_status_v720(chat_id).replace(
+        "• не отправляет защитные SL/TP как реальные orders в v7.19;",
+        "• проверяет защитные SL/TP через /order/test, но не создаёт реальные позиции;",
+    )
+    recs = _testnet_reconciliations_v721(chat_id, 1)
+    if not recs:
+        return text + "\n\nReconciliation v7.21: нет планов для сверки."
+    rec = recs[0]
+    return "\n".join([
+        text,
+        "",
+        "Reconciliation v7.21:",
+        f"• последний итог: {rec.get('overall')}",
+        f"• entry: {rec.get('entry_status')} | protection: {rec.get('protection_status')}",
+    ])
+
+
+def format_execution_status(chat_id):
+    text = _base_format_execution_status_v720(chat_id)
+    recs = _testnet_reconciliations_v721(chat_id, 1)
+    status = recs[0].get("overall") if recs else "нет сверок"
+    return text + "\n• последняя reconciliation: " + status
+
+
+def execution_status_keyboard_v715():
+    return {"inline_keyboard": [
+        [{"text": "🧪 Testnet статус", "callback_data": "testnet_status"}],
+        [
+            {"text": "📒 Testnet журнал", "callback_data": "testnet_journal"},
+            {"text": "🔎 Reconciliation", "callback_data": "testnet_reconcile"},
+        ],
+        [{"text": "🤖 Назад: Автобот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data == "testnet_journal":
+                await async_answer_callback(session, callback_id, "Journal")
+                await async_send_plain_v76(session, chat_id, format_testnet_journal_report(chat_id), execution_status_keyboard_v715())
+                return
+            if data == "testnet_reconcile":
+                await async_answer_callback(session, callback_id, "Reconcile")
+                await async_send_plain_v76(session, chat_id, format_testnet_reconciliation_report(chat_id), execution_status_keyboard_v715())
+                return
+        await _base_async_handle_update_v720(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v721] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Reconciliation</b> — сверка плана и факта. В нашем testnet-этапе это значит: что бот хотел проверить, что Binance Testnet принял, что отклонил и почему.
+
+<b>Testnet journal</b> — отдельный журнал testnet-событий. Он нужен, чтобы не гадать, что произошло, а видеть историю проверок и причины отказов.
+"""
+
+
+BOT_VERSION_LABEL = "v7.21 Testnet Journal Reconciliation"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -15832,6 +16167,7 @@ RUNTIME_LAYERS = [
     ("v7.18", "Daily and weekly Paper Trader performance reports"),
     ("v7.19", "Binance Futures Testnet /order/test validation for entry plans"),
     ("v7.20", "Testnet STOP_MARKET/TAKE_PROFIT_MARKET protection order validation"),
+    ("v7.21", "Testnet journal, reconciliation report and package helper extraction"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -15878,6 +16214,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "submit_testnet_protection_order_tests": submit_testnet_protection_order_tests,
     "validate_protection_order_geometry": validate_protection_order_geometry,
     "format_testnet_status": format_testnet_status,
+    "format_testnet_journal_report": format_testnet_journal_report,
+    "format_testnet_reconciliation_report": format_testnet_reconciliation_report,
     "build_safety_decision": build_safety_decision,
     "format_safety_status": format_safety_status,
     "market_opportunity_scan": market_opportunity_scan,
@@ -15975,6 +16313,10 @@ def validate_runtime_architecture():
         errors.append("protection geometry validator is missing")
     if not callable(globals().get("submit_testnet_protection_order_tests")):
         errors.append("testnet protection order submitter is missing")
+    if not callable(globals().get("format_testnet_journal_report")):
+        errors.append("testnet journal report is missing")
+    if not callable(globals().get("format_testnet_reconciliation_report")):
+        errors.append("testnet reconciliation report is missing")
     mode = _execution_mode_v715()
     if mode not in EXECUTION_ALLOWED_MODES:
         errors.append(f"invalid execution mode: {mode}")

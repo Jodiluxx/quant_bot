@@ -32,3 +32,11 @@ def submit_testnet_protection_order_tests(*args: Any, **kwargs: Any) -> Any:
 
 def format_testnet_status(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_testnet_status", *args, **kwargs)
+
+
+def format_testnet_journal_report(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("format_testnet_journal_report", *args, **kwargs)
+
+
+def format_testnet_reconciliation_report(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("format_testnet_reconciliation_report", *args, **kwargs)

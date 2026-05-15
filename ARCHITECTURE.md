@@ -23,6 +23,9 @@ quant_bot/
   legacy.py                only module that imports quant bot.py
   paths.py                 project paths
   config.py                safe config helpers
+  execution_gateway.py     pure execution/reconciliation helpers
+  safety.py                pure safety calculation helpers
+  analytics_reports.py     pure analytics/report calculation helpers
   adapters/
     market_data.py         candles, price, futures context
     signals.py             signal engine and message formatting
@@ -39,7 +42,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.20 Testnet Protection Orders`.
+Current active runtime is `v7.21 Testnet Journal Reconciliation`.
 
 Layer summary:
 
@@ -61,6 +64,7 @@ Layer summary:
 16. v7.18: daily and weekly Paper Trader performance reports
 17. v7.19: Binance Futures Testnet `/fapi/v1/order/test` validation
 18. v7.20: Testnet protection order validation for SL and TP reduce-only orders
+19. v7.21: Testnet journal, reconciliation report and first package helpers
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

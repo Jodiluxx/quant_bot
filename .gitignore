@@ -16,6 +16,7 @@ secrets.local*
 paper_trader_state.json
 execution_gateway_state.json
 safety_state.json
+testnet_journal.json
 signal_journal.json
 positions.json
 risk_state.json
