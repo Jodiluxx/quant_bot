@@ -12772,6 +12772,334 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
+# ============================================================
+# v7.11 — SETUP PERFORMANCE ANALYTICS
+# ============================================================
+# Detailed paper-trade diagnostics by ticker, timeframe and strategy. The goal
+# is to find where the bot loses quality before changing weights or risk.
+
+_base_autobot_keyboard_v710 = autobot_keyboard
+_base_async_handle_update_v710 = async_handle_update
+
+
+def _parse_dt_v711(value):
+    try:
+        dt = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _hold_minutes_v711(trade):
+    opened = _parse_dt_v711(trade.get("opened_at"))
+    closed = _parse_dt_v711(trade.get("closed_at")) or datetime.now(timezone.utc)
+    if not opened:
+        return None
+    return max(0.0, (closed - opened).total_seconds() / 60.0)
+
+
+def _fmt_minutes_v711(value):
+    if value is None:
+        return "n/a"
+    try:
+        value = float(value)
+    except Exception:
+        return "n/a"
+    if value < 90:
+        return f"{value:.0f} мин"
+    return f"{value / 60.0:.1f} ч"
+
+
+def _exit_kind_v711(trade):
+    reason = str(trade.get("exit_reason") or "").upper()
+    if "SL" in reason:
+        return "SL"
+    if "TP" in reason:
+        return "TP"
+    return reason or "OTHER"
+
+
+def _avg_v711(values):
+    values = [v for v in values if v is not None]
+    return sum(values) / len(values) if values else None
+
+
+def _trade_excursion_v711(trade, ohlcv_cache):
+    ticker = trade.get("ticker")
+    interval = trade.get("interval")
+    entry = _safe_float(trade.get("entry_price"), 0) or 0
+    sl = _safe_float(trade.get("sl"), 0) or 0
+    direction = str(trade.get("direction") or "").lower()
+    opened = _parse_dt_v711(trade.get("opened_at"))
+    closed = _parse_dt_v711(trade.get("closed_at"))
+    if not ticker or not interval or entry <= 0 or sl <= 0 or not opened or not closed:
+        return None
+
+    risk_pct = abs(entry - sl) / entry * 100
+    if risk_pct <= 0:
+        return None
+
+    key = (ticker, interval)
+    if key not in ohlcv_cache:
+        try:
+            ohlcv_cache[key] = get_ohlcv_with_times(ticker, interval, limit=500)
+        except Exception as e:
+            ohlcv_cache[key] = {"error": str(e)}
+    data = ohlcv_cache.get(key) or {}
+    if data.get("error"):
+        return None
+
+    start_ms = int(opened.timestamp() * 1000)
+    end_ms = int(closed.timestamp() * 1000)
+    highs = []
+    lows = []
+    for open_ms, close_ms, high, low in zip(
+        data.get("open_times", []),
+        data.get("close_times", []),
+        data.get("highs", []),
+        data.get("lows", []),
+    ):
+        if close_ms < start_ms:
+            continue
+        if open_ms > end_ms:
+            continue
+        highs.append(float(high))
+        lows.append(float(low))
+
+    if not highs or not lows:
+        return None
+
+    max_high = max(highs)
+    min_low = min(lows)
+    if direction == "long":
+        mfe_pct = (max_high - entry) / entry * 100
+        mae_pct = (min_low - entry) / entry * 100
+    elif direction == "short":
+        mfe_pct = (entry - min_low) / entry * 100
+        mae_pct = (entry - max_high) / entry * 100
+    else:
+        return None
+
+    return {
+        "mfe_pct": mfe_pct,
+        "mae_pct": mae_pct,
+        "mfe_r": mfe_pct / risk_pct,
+        "mae_r": mae_pct / risk_pct,
+        "candles": len(highs),
+    }
+
+
+def _enrich_trades_v711(trades):
+    ohlcv_cache = {}
+    rows = []
+    for trade in trades:
+        row = dict(trade)
+        row["r"] = _trade_r_multiple_v710(row)
+        row["hold_min"] = _hold_minutes_v711(row)
+        row["exit_kind"] = _exit_kind_v711(row)
+        excursion = _trade_excursion_v711(row, ohlcv_cache)
+        if excursion:
+            row.update(excursion)
+        rows.append(row)
+    return rows
+
+
+def _setup_group_stats_v711(rows, key_fn, min_n=1):
+    groups = {}
+    for row in rows:
+        key = key_fn(row)
+        groups.setdefault(str(key or "unknown"), []).append(row)
+
+    out = []
+    for key, items in groups.items():
+        if len(items) < min_n:
+            continue
+        wins = [x for x in items if (_safe_float(x.get("net_usd"), 0) or 0) > 0]
+        losses = [x for x in items if (_safe_float(x.get("net_usd"), 0) or 0) < 0]
+        sl = [x for x in items if x.get("exit_kind") == "SL"]
+        tp = [x for x in items if x.get("exit_kind") == "TP"]
+        r_values = [x.get("r") for x in items if x.get("r") is not None]
+        stats = {
+            "n": len(items),
+            "wins": len(wins),
+            "losses": len(losses),
+            "sl": len(sl),
+            "tp": len(tp),
+            "wr": len(wins) / len(items) * 100 if items else 0,
+            "sl_rate": len(sl) / len(items) * 100 if items else 0,
+            "tp_rate": len(tp) / len(items) * 100 if items else 0,
+            "net": sum(_safe_float(x.get("net_usd"), 0) or 0 for x in items),
+            "pf": _profit_factor_v710(items),
+            "avg_r": sum(r_values) / len(r_values) if r_values else None,
+            "avg_hold": _avg_v711(x.get("hold_min") for x in items),
+            "avg_mfe_r": _avg_v711(x.get("mfe_r") for x in items),
+            "avg_mae_r": _avg_v711(x.get("mae_r") for x in items),
+        }
+        out.append((key, stats))
+    return out
+
+
+def _setup_stat_line_v711(name, stats):
+    avg_r = "n/a" if stats["avg_r"] is None else f"{stats['avg_r']:+.2f}R"
+    mfe = "n/a" if stats["avg_mfe_r"] is None else f"{stats['avg_mfe_r']:+.2f}R"
+    mae = "n/a" if stats["avg_mae_r"] is None else f"{stats['avg_mae_r']:+.2f}R"
+    return (
+        f"• {name}: n={stats['n']} | WR {_fmt_pct_v710(stats['wr'])} | "
+        f"SL {_fmt_pct_v710(stats['sl_rate'])} | AvgR {avg_r} | "
+        f"hold {_fmt_minutes_v711(stats['avg_hold'])} | MFE/MAE {mfe}/{mae}"
+    )
+
+
+def _format_group_section_v711(title, rows, sort_key, reverse=True, limit=6):
+    lines = [title]
+    if not rows:
+        lines.append("Данных пока нет.")
+        return lines
+    ordered = sorted(rows, key=lambda item: sort_key(item[1]), reverse=reverse)
+    for name, stats in ordered[:limit]:
+        lines.append(_setup_stat_line_v711(name, stats))
+    return lines
+
+
+def _setup_recommendations_v711(rows, by_tf, by_strategy, by_ticker):
+    recs = []
+    weak_tf = sorted([x for x in by_tf if x[1]["n"] >= 2], key=lambda x: (x[1]["avg_r"] if x[1]["avg_r"] is not None else -999))
+    if weak_tf and (weak_tf[0][1]["avg_r"] is not None and weak_tf[0][1]["avg_r"] < 0):
+        recs.append(f"слабый TF под наблюдение: {weak_tf[0][0]} AvgR {weak_tf[0][1]['avg_r']:+.2f}R")
+
+    sl_hot = sorted([x for x in by_strategy if x[1]["n"] >= 2], key=lambda x: x[1]["sl_rate"], reverse=True)
+    if sl_hot and sl_hot[0][1]["sl_rate"] >= 60:
+        recs.append(f"проверить стратегию {sl_hot[0][0]}: SL-rate {sl_hot[0][1]['sl_rate']:.0f}%")
+
+    ticker_sl = sorted([x for x in by_ticker if x[1]["n"] >= 2], key=lambda x: x[1]["sl_rate"], reverse=True)
+    if ticker_sl and ticker_sl[0][1]["sl_rate"] >= 60:
+        recs.append(f"проверить тикер {ticker_sl[0][0]}: часто ловит SL")
+
+    mfe_rows = [x for x in rows if x.get("mfe_r") is not None and x.get("r") is not None]
+    missed = [x for x in mfe_rows if x["mfe_r"] >= 1.0 and x["r"] < 0]
+    if len(missed) >= 2:
+        recs.append("есть сделки, где цена давала +1R, но закрылась минусом: позже стоит тестировать BE/trailing")
+
+    if len(rows) < 30:
+        recs.append("выборка ещё маленькая: выводы использовать как гипотезы, не как доказательство")
+
+    if not recs:
+        recs.append("сейчас главное — продолжать сбор независимых setup и не повышать риск")
+    return recs[:5]
+
+
+def format_setup_analytics_report(chat_id):
+    _paper_load_state()
+    trades = sorted(_paper_closed_trades(chat_id), key=_sort_key_v77)
+    rows = _enrich_trades_v711(trades)
+    quality = paper_data_quality_summary(chat_id)
+
+    by_ticker = _setup_group_stats_v711(rows, lambda x: x.get("ticker"))
+    by_tf = _setup_group_stats_v711(rows, lambda x: x.get("interval"))
+    by_strategy = _setup_group_stats_v711(rows, lambda x: x.get("strategy"))
+    by_exit = _setup_group_stats_v711(rows, lambda x: x.get("exit_kind"))
+
+    all_stats = _setup_group_stats_v711(rows, lambda x: "all")
+    total = all_stats[0][1] if all_stats else {
+        "n": 0, "wins": 0, "losses": 0, "sl": 0, "tp": 0, "wr": 0, "sl_rate": 0, "tp_rate": 0,
+        "net": 0, "pf": None, "avg_r": None, "avg_hold": None, "avg_mfe_r": None, "avg_mae_r": None,
+    }
+    avg_r = "n/a" if total["avg_r"] is None else f"{total['avg_r']:+.2f}R"
+    mfe = "n/a" if total["avg_mfe_r"] is None else f"{total['avg_mfe_r']:+.2f}R"
+    mae = "n/a" if total["avg_mae_r"] is None else f"{total['avg_mae_r']:+.2f}R"
+
+    lines = [
+        "📊 <b>Setup статистика</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "<b>1. Выборка</b>",
+        f"Закрытых строк: {quality['closed_trades']}",
+        f"Независимых setup: {quality['independent_closed_setups']}",
+        f"Рыночных setup всего: {paper_data_quality_summary(None)['independent_market_closed_setups']}",
+        "Данных мало: выводы пока гипотезы." if quality["independent_closed_setups"] < 30 else "Данных уже достаточно для осторожного сравнения групп.",
+        "",
+        "<b>2. Общий результат</b>",
+        f"WR: {total['wins']}/{total['n']} = {_fmt_pct_v710(total['wr'])}",
+        f"TP/SL: {total['tp']}/{total['sl']} | SL-rate {_fmt_pct_v710(total['sl_rate'])}",
+        f"Net: {total['net']:+.3f} USDT | PF {_pf_text_v710(total['pf'])}",
+        f"Avg R: {avg_r} | среднее удержание: {_fmt_minutes_v711(total['avg_hold'])}",
+        f"Avg MFE/MAE: {mfe}/{mae}",
+    ]
+
+    lines += [""] + _format_group_section_v711("<b>3. По тикерам</b>", by_ticker, lambda s: s["avg_r"] if s["avg_r"] is not None else -999)
+    lines += [""] + _format_group_section_v711("<b>4. По таймфреймам</b>", by_tf, lambda s: s["avg_r"] if s["avg_r"] is not None else -999)
+    lines += [""] + _format_group_section_v711("<b>5. По стратегиям</b>", by_strategy, lambda s: s["avg_r"] if s["avg_r"] is not None else -999)
+    lines += [""] + _format_group_section_v711("<b>6. Где чаще выход</b>", by_exit, lambda s: s["n"])
+
+    bad_groups = sorted(
+        [x for x in by_ticker + by_tf + by_strategy if x[1]["n"] >= 2],
+        key=lambda x: (x[1]["sl_rate"], -x[1]["n"]),
+        reverse=True,
+    )
+    lines += ["", "<b>7. Где чаще ловит SL</b>"]
+    if bad_groups:
+        for name, stats in bad_groups[:5]:
+            avg_r_text = "n/a" if stats["avg_r"] is None else f"{stats['avg_r']:+.2f}R"
+            lines.append(f"• {name}: SL {stats['sl']}/{stats['n']} = {_fmt_pct_v710(stats['sl_rate'])} | AvgR {avg_r_text}")
+    else:
+        lines.append("Пока нет групп с достаточным числом сделок.")
+
+    lines += ["", "<b>8. Что делать дальше</b>"]
+    for rec in _setup_recommendations_v711(rows, by_tf, by_strategy, by_ticker):
+        lines.append("• " + rec)
+    lines.append("")
+    lines.append("MFE — максимум, куда сделка ходила в плюс. MAE — максимум, куда она уходила против входа. Это нужно, чтобы потом тестировать BE/trailing без угадывания.")
+    return "\n".join(lines)
+
+
+def setup_analytics_keyboard_v711():
+    return {"inline_keyboard": [
+        [{"text": "◀️ Назад", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def autobot_keyboard(chat_id):
+    kb = _base_autobot_keyboard_v710(chat_id)
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [{"text": "📊 Setup статистика", "callback_data": "setup_analytics"}])
+    return {"inline_keyboard": rows}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data == "setup_analytics":
+                await async_answer_callback(session, callback_id, "Setup статистика")
+                msg = await asyncio.to_thread(format_setup_analytics_report, chat_id)
+                await async_send_plain_v76(session, chat_id, msg, setup_analytics_keyboard_v711())
+                return
+        await _base_async_handle_update_v710(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v711] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>MFE</b> — maximum favorable excursion: насколько далеко сделка успевала уйти в плюс до закрытия. Если MFE часто большой, но итог слабый, можно тестировать перенос SL или trailing.
+
+<b>MAE</b> — maximum adverse excursion: насколько далеко сделка уходила против входа. Если MAE часто большой до TP, значит вход может быть слишком ранним или стоп слишком близким.
+
+<b>R-multiple</b> — результат сделки в единицах начального риска. +2R значит прибыль в два риска, -1R значит стоп примерно на один риск.
+"""
+
+
 LEARN_TEXTS["learn_new_terms"] += """
 
 <b>Setup ID</b> — уникальный номер торговой идеи: актив, таймфрейм, направление, стратегия и свеча. Он нужен, чтобы бот не открыл одну и ту же paper-сделку два раза.
@@ -12782,7 +13110,7 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.10 Bot Performance Analytics"
+BOT_VERSION_LABEL = "v7.11 Setup Performance Analytics"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -12819,6 +13147,7 @@ RUNTIME_LAYERS = [
     ("v7.8.4", "remove schedule wording from Autobot screen"),
     ("v7.9", "Paper Trader setup_id, duplicate guard and independent setup data quality summary"),
     ("v7.10", "Bot quality report with paper expectancy, profit factor and signal journal diagnostics"),
+    ("v7.11", "Setup analytics by ticker, timeframe, strategy, R, hold time and MFE/MAE"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -12854,6 +13183,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_paper_report": format_paper_report,
     "paper_data_quality_summary": paper_data_quality_summary,
     "format_bot_quality_report": format_bot_quality_report,
+    "format_setup_analytics_report": format_setup_analytics_report,
     "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
@@ -12914,6 +13244,8 @@ def validate_runtime_architecture():
         errors.append("paper duplicate guard is missing")
     if not callable(globals().get("format_bot_quality_report")):
         errors.append("bot quality report is missing")
+    if not callable(globals().get("format_setup_analytics_report")):
+        errors.append("setup analytics report is missing")
     if errors:
         raise RuntimeError("Runtime architecture validation failed: " + "; ".join(errors))
     return True

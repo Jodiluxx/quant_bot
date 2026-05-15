@@ -69,6 +69,10 @@ The Autobot screen also has a bot quality report. It checks whether the current
 paper and signal-journal data is large enough to tune the strategy, then shows
 winrate, profit factor, average R, weak timeframes, and practical next steps.
 
+Setup analytics breaks the paper journal down by ticker, timeframe and
+strategy, including SL-rate, TP-rate, average holding time, result in R, and
+MFE/MAE where recent candles are available.
+
 ## Trading note
 
 A working bot is not the same as a safe strategy. Before trading live, test on paper trading and check risk per trade, max drawdown, fees, slippage, and liquidation distance.
