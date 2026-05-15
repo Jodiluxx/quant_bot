@@ -20,3 +20,7 @@ def paper_trader_scan_tickers(*args: Any, **kwargs: Any) -> Any:
 
 def format_paper_report(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_paper_report", *args, **kwargs)
+
+
+def paper_data_quality_summary(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("paper_data_quality_summary", *args, **kwargs)

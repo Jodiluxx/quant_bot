@@ -62,6 +62,9 @@ New code should be added to the `quant_bot/` package. The big `quant bot.py`
 file is still the live legacy runtime, but it now has adapter modules around it:
 market data, signals, risk, Paper Trader, backtesting, and Telegram UI.
 
+Paper Trader stores a `setup_id` for each new paper position so repeated auto
+cycles do not count one market idea as several independent trades.
+
 ## Trading note
 
 A working bot is not the same as a safe strategy. Before trading live, test on paper trading and check risk per trade, max drawdown, fees, slippage, and liquidation distance.

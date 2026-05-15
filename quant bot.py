@@ -12206,7 +12206,307 @@ def settings_keyboard_v59():
 # ============================================================
 # v6.1 — RUNTIME ARCHITECTURE REGISTRY
 # ============================================================
-BOT_VERSION_LABEL = "v7.8.4 Autobot No Schedule Text"
+# ============================================================
+# v7.9 — PAPER DATA QUALITY / DUPLICATE SETUP GUARD
+# ============================================================
+# One market idea must be logged once. Paper Trader can run from auto tasks,
+# manual button presses, and background retries, so the duplicate guard lives
+# inside the final open-position critical section.
+
+_paper_lock = threading.RLock()
+_base_paper_load_state_v784 = _paper_load_state
+_base_paper_candidate_block_reason_v784 = _paper_candidate_block_reason
+_paper_state_setup_migrated_v79 = False
+
+
+def _paper_interval_minutes_v79(interval):
+    meta = AUTO_SEND_INTERVALS.get(interval) or {}
+    minutes = meta.get("minutes")
+    if minutes:
+        return int(minutes)
+    text = str(interval or "").strip().lower()
+    try:
+        if text.endswith("m"):
+            return max(1, int(text[:-1]))
+        if text.endswith("h"):
+            return max(1, int(text[:-1]) * 60)
+        if text.endswith("d"):
+            return max(1, int(text[:-1]) * 1440)
+    except Exception:
+        pass
+    return 15
+
+
+def _paper_parse_dt_v79(value):
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        except Exception:
+            dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _paper_setup_slot_v79(interval, value=None):
+    dt = _paper_parse_dt_v79(value)
+    seconds = _paper_interval_minutes_v79(interval) * 60
+    return int(dt.timestamp()) // max(seconds, 60)
+
+
+def _paper_setup_ids_v79(chat_id=None, candidate=None, item=None, value=None):
+    src = candidate or item or {}
+    ticker = str(src.get("ticker") or "").upper()
+    interval = str(src.get("interval") or src.get("tf") or "").lower()
+    direction = str(src.get("direction") or "").lower()
+    strategy = str(src.get("strategy") or "unknown").lower()
+    chat_key = _paper_chat_key(chat_id if chat_id is not None else src.get("chat_id"))
+    slot = src.get("setup_slot") or _paper_setup_slot_v79(interval, value or src.get("opened_at") or src.get("ts"))
+    family_id = f"paper_setup:{chat_key}:{ticker}:{interval}:{direction}:{slot}"
+    setup_id = f"{family_id}:{strategy}"
+    return setup_id, family_id, int(slot)
+
+
+def _paper_enrich_setup_fields_v79(item, chat_id=None):
+    if not isinstance(item, dict):
+        return False
+    setup_id, family_id, slot = _paper_setup_ids_v79(chat_id=chat_id, item=item)
+    changed = False
+    for key, value in (
+        ("setup_id", setup_id),
+        ("setup_family_id", family_id),
+        ("setup_slot", slot),
+        ("data_quality_version", "v7.9"),
+    ):
+        if not item.get(key):
+            item[key] = value
+            changed = True
+    return changed
+
+
+def _paper_migrate_state_setup_ids_v79():
+    changed = False
+    for pos in (_paper_state.get("positions") or {}).values():
+        changed = _paper_enrich_setup_fields_v79(pos) or changed
+    for trade in _paper_state.get("trades") or []:
+        changed = _paper_enrich_setup_fields_v79(trade) or changed
+    for event in _paper_state.get("events") or []:
+        if isinstance(event, dict) and event.get("type") == "paper_open":
+            changed = _paper_enrich_setup_fields_v79(event) or changed
+    if changed:
+        _paper_state["data_quality_version"] = "v7.9"
+        _paper_save_state()
+
+
+def _paper_load_state():
+    global _paper_state_setup_migrated_v79
+    _base_paper_load_state_v784()
+    if not _paper_state_setup_migrated_v79:
+        _paper_migrate_state_setup_ids_v79()
+        _paper_state_setup_migrated_v79 = True
+
+
+def _paper_duplicate_reason_from_state_v79(chat_key, setup_id, family_id):
+    for pos in (_paper_state.get("positions") or {}).values():
+        if str(pos.get("chat_id")) != str(chat_key):
+            continue
+        if pos.get("setup_id") == setup_id:
+            return f"этот setup уже открыт: {pos.get('ticker')} {pos.get('interval')} {str(pos.get('direction')).upper()}"
+        if pos.get("setup_family_id") == family_id:
+            return f"такая торговая идея уже открыта на этой свече: {pos.get('ticker')} {pos.get('interval')} {str(pos.get('direction')).upper()}"
+
+    for trade in reversed((_paper_state.get("trades") or [])[-300:]):
+        if str(trade.get("chat_id")) != str(chat_key):
+            continue
+        if trade.get("setup_id") == setup_id or trade.get("setup_family_id") == family_id:
+            return "этот setup уже был открыт на текущей свече; повторный вход заблокирован"
+
+    for event in reversed((_paper_state.get("events") or [])[-500:]):
+        if str(event.get("chat_id")) != str(chat_key):
+            continue
+        if event.get("setup_id") == setup_id or event.get("setup_family_id") == family_id:
+            return "этот setup уже попадал в журнал открытий; повторный вход заблокирован"
+
+    return None
+
+
+def _paper_duplicate_reason_v79(chat_id, candidate):
+    _paper_load_state()
+    setup_id, family_id, _ = _paper_setup_ids_v79(chat_id=chat_id, candidate=candidate)
+    with _paper_lock:
+        return _paper_duplicate_reason_from_state_v79(_paper_chat_key(chat_id), setup_id, family_id)
+
+
+def _paper_candidate_block_reason(chat_id, candidate):
+    reason = _base_paper_candidate_block_reason_v784(chat_id, candidate)
+    if reason:
+        return reason
+    return _paper_duplicate_reason_v79(chat_id, candidate)
+
+
+def _paper_open_candidate(chat_id, candidate):
+    _paper_load_state()
+    data = candidate["data"]
+    ep = candidate["entry_plan"]
+    ticker = candidate["ticker"]
+    interval = candidate["interval"]
+    direction = candidate["direction"]
+    strategy = candidate.get("strategy")
+
+    bal, size_pct, lev, margin, notional = _paper_position_notional(chat_id)
+    entry = get_price(ticker)
+    sl = _safe_float(ep.get("sl"), None) or _safe_float((data.get("risk_levels") or {}).get("sl"), None)
+    tp1 = _safe_float(ep.get("tp1"), None) or _safe_float((data.get("risk_levels") or {}).get("tp1"), None)
+    tp2 = _safe_float(ep.get("tp2"), None) or _safe_float((data.get("risk_levels") or {}).get("tp2"), tp1)
+    if not sl or not tp1:
+        return None, "Нет SL/TP для paper-сделки."
+
+    risk_usd = abs(entry - sl) / entry * notional if entry > 0 else 0
+    risk_pct = risk_usd / bal * 100 if bal > 0 else 0
+    if risk_pct > RISK_MAX_SINGLE_TRADE_PCT:
+        return None, f"Paper-сделка заблокирована: риск {risk_pct:.2f}% выше лимита {RISK_MAX_SINGLE_TRADE_PCT:.2f}%."
+
+    opened_at = datetime.now(timezone.utc).isoformat()
+    setup_id, family_id, setup_slot = _paper_setup_ids_v79(chat_id=chat_id, candidate=candidate, value=opened_at)
+    pos_id = f"paper_{ticker}_{interval}_{direction}_{setup_slot}_{int(time.time() * 1000)}"
+    snapshot = _paper_decision_snapshot(candidate)
+
+    pos = {
+        "pos_id": pos_id,
+        "chat_id": _paper_chat_key(chat_id),
+        "ticker": ticker,
+        "interval": interval,
+        "direction": direction,
+        "strategy": strategy,
+        "entry_price": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "balance": bal,
+        "size_pct": size_pct,
+        "leverage": lev,
+        "margin": margin,
+        "notional": notional,
+        "risk_usd": risk_usd,
+        "risk_pct": risk_pct,
+        "opened_at": opened_at,
+        "reason": candidate.get("reason"),
+        "decision": snapshot,
+        "journal_note": _paper_journal_note(snapshot),
+        "selection_score": candidate.get("score"),
+        "setup_id": setup_id,
+        "setup_family_id": family_id,
+        "setup_slot": setup_slot,
+        "data_quality_version": "v7.9",
+    }
+
+    with _paper_lock:
+        duplicate_reason = _paper_duplicate_reason_from_state_v79(pos["chat_id"], setup_id, family_id)
+        if duplicate_reason:
+            return None, "Paper-сделка не открыта: " + duplicate_reason + "."
+
+        _paper_state.setdefault("positions", {})[pos_id] = pos
+        _paper_state.setdefault("events", []).append({
+            "type": "paper_open",
+            "ts": opened_at,
+            "chat_id": pos["chat_id"],
+            "pos_id": pos_id,
+            "ticker": ticker,
+            "interval": interval,
+            "direction": direction,
+            "strategy": strategy,
+            "setup_id": setup_id,
+            "setup_family_id": family_id,
+            "setup_slot": setup_slot,
+            "decision": snapshot,
+        })
+        _paper_state["events"] = _paper_state["events"][-1000:]
+        _paper_save_state()
+
+    return pos, None
+
+
+def _paper_independent_setup_count_v79(items):
+    seen = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        family_id = item.get("setup_family_id")
+        if not family_id:
+            _, family_id, _ = _paper_setup_ids_v79(item=item)
+        seen.add(family_id)
+    return len(seen)
+
+
+def _paper_independent_market_setup_count_v79(items):
+    seen = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        interval = str(item.get("interval") or item.get("tf") or "").lower()
+        slot = item.get("setup_slot") or _paper_setup_slot_v79(interval, item.get("opened_at") or item.get("ts"))
+        seen.add((
+            str(item.get("ticker") or "").upper(),
+            interval,
+            str(item.get("direction") or "").lower(),
+            int(slot),
+        ))
+    return len(seen)
+
+
+def paper_data_quality_summary(chat_id=None):
+    _paper_load_state()
+    trades = _paper_closed_trades(chat_id)
+    positions = _paper_positions(chat_id)
+    closed_setups = _paper_independent_setup_count_v79(trades)
+    open_setups = _paper_independent_setup_count_v79(positions)
+    closed_market_setups = _paper_independent_market_setup_count_v79(trades)
+    open_market_setups = _paper_independent_market_setup_count_v79(positions)
+    return {
+        "closed_trades": len(trades),
+        "independent_closed_setups": closed_setups,
+        "independent_market_closed_setups": closed_market_setups,
+        "open_positions": len(positions),
+        "independent_open_setups": open_setups,
+        "independent_market_open_setups": open_market_setups,
+        "closed_duplicate_rows": max(0, len(trades) - closed_setups),
+        "open_duplicate_rows": max(0, len(positions) - open_setups),
+        "market_closed_duplicate_rows": max(0, len(trades) - closed_market_setups),
+        "market_open_duplicate_rows": max(0, len(positions) - open_market_setups),
+        "data_quality_version": "v7.9",
+    }
+
+
+_base_format_paper_journal_home_v784 = format_paper_journal_home_v78
+
+
+def format_paper_journal_home_v78(chat_id):
+    text = _base_format_paper_journal_home_v784(chat_id)
+    q = paper_data_quality_summary(chat_id)
+    if q["closed_trades"] or q["open_positions"]:
+        text += (
+            "\n\nКачество данных:"
+            f"\nЗакрытые сделки: {q['closed_trades']} строк / {q['independent_closed_setups']} независимых setup"
+            f"\nОткрытые позиции: {q['open_positions']} строк / {q['independent_open_setups']} независимых setup"
+        )
+        if q["closed_duplicate_rows"] or q["open_duplicate_rows"]:
+            text += "\nДубли старых записей учитываются отдельно; новые повторные входы блокируются."
+    return text
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Setup ID</b> — уникальный номер торговой идеи: актив, таймфрейм, направление, стратегия и свеча. Он нужен, чтобы бот не открыл одну и ту же paper-сделку два раза.
+
+<b>Независимый setup</b> — отдельная торговая идея. Две одинаковые позиции, открытые в одну свечу по одной причине, не считаются двумя независимыми доказательствами качества стратегии.
+
+<b>Duplicate guard</b> — защитный фильтр Paper Trader. Он блокирует повторный вход в тот же setup, даже если автоцикл и ручная кнопка сработали почти одновременно.
+"""
+
+
+BOT_VERSION_LABEL = "v7.9 Paper Data Quality Guard"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -12241,6 +12541,7 @@ RUNTIME_LAYERS = [
     ("v7.8.2", "short auto-settings Back button returning to Settings menu"),
     ("v7.8.3", "Autobot screen cleaned; schedules and global auto toggle moved into Auto Settings"),
     ("v7.8.4", "remove schedule wording from Autobot screen"),
+    ("v7.9", "Paper Trader setup_id, duplicate guard and independent setup data quality summary"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -12274,6 +12575,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "paper_select_trade_candidate": paper_select_trade_candidate,
     "paper_trader_scan_tickers": paper_trader_scan_tickers,
     "format_paper_report": format_paper_report,
+    "paper_data_quality_summary": paper_data_quality_summary,
+    "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
     "run_walk_forward_optimization": run_walk_forward_optimization,
@@ -12327,6 +12630,10 @@ def validate_runtime_architecture():
         errors.append("timestamp OHLCV helper is missing")
     if not callable(globals().get("build_trade_risk_decision")):
         errors.append("risk manager decision helper is missing")
+    if not callable(globals().get("paper_data_quality_summary")):
+        errors.append("paper data quality summary is missing")
+    if not callable(globals().get("_paper_duplicate_reason_v79")):
+        errors.append("paper duplicate guard is missing")
     if errors:
         raise RuntimeError("Runtime architecture validation failed: " + "; ".join(errors))
     return True

@@ -38,7 +38,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.8.4 Autobot No Schedule Text`.
+Current active runtime is `v7.9 Paper Data Quality Guard`.
 
 Layer summary:
 
@@ -48,6 +48,7 @@ Layer summary:
 4. v6.6-v6.9: compact cards, signal submenu, futures aliases, backtest tuning
 5. v7.0-v7.4: Paper Trader, all-asset scanner, Autobot menu, responsiveness
 6. v7.5-v7.8.4: reliable reports, clean journal, autostart tasks, sorted Autobot
+7. v7.9: Paper Trader setup IDs, duplicate guard, independent setup statistics
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.
