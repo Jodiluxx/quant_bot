@@ -16120,7 +16120,295 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.21 Testnet Journal Reconciliation"
+# ============================================================
+# v7.22 — LIVE READINESS CHECKLIST
+# ============================================================
+# This is a go/no-go checklist only. It does not enable live trading and keeps
+# mainnet order submission blocked by design.
+
+from quant_bot.live_readiness import (
+    evaluate_live_readiness as _evaluate_live_readiness_v722,
+    setup_coverage as _setup_coverage_v722,
+    summarize_reconciliations as _summarize_reconciliations_v722,
+)
+
+_base_autobot_keyboard_v721 = autobot_keyboard
+_base_async_handle_update_v721 = async_handle_update
+_base_execution_status_keyboard_v721 = execution_status_keyboard_v715
+
+LIVE_MIN_PAPER_TRADES = 100
+LIVE_MIN_INDEPENDENT_SETUPS = 80
+LIVE_MIN_MARKET_SETUPS = 100
+LIVE_MIN_TESTNET_RECONCILIATIONS = 25
+LIVE_MIN_TESTNET_ACCEPTED = 20
+LIVE_MAX_TESTNET_REJECT_RATE = 20.0
+LIVE_MIN_SETUP_GROUPS = 3
+LIVE_MIN_PROFIT_FACTOR = 1.20
+LIVE_MIN_AVG_R = 0.0
+
+
+def _live_readiness_thresholds_v722():
+    return {
+        "min_paper_trades": LIVE_MIN_PAPER_TRADES,
+        "min_independent_setups": LIVE_MIN_INDEPENDENT_SETUPS,
+        "min_market_setups": LIVE_MIN_MARKET_SETUPS,
+        "min_testnet_reconciliations": LIVE_MIN_TESTNET_RECONCILIATIONS,
+        "min_testnet_accepted": LIVE_MIN_TESTNET_ACCEPTED,
+        "max_testnet_reject_rate": LIVE_MAX_TESTNET_REJECT_RATE,
+        "min_setup_groups": LIVE_MIN_SETUP_GROUPS,
+        "min_profit_factor": LIVE_MIN_PROFIT_FACTOR,
+        "min_avg_r": LIVE_MIN_AVG_R,
+        "max_daily_loss_limit_pct": RISK_MAX_DAILY_REALIZED_LOSS_PCT,
+    }
+
+
+def _live_testnet_summary_v722(chat_id):
+    recs = _testnet_reconciliations_v721(chat_id, 5000)
+    summary = _summarize_reconciliations_v722(recs)
+    summary["last"] = recs[0] if recs else None
+    return summary
+
+
+def _live_setup_summary_v722(chat_id):
+    _paper_load_state()
+    trades = _paper_closed_trades(chat_id)
+    coverage = _setup_coverage_v722(trades)
+    market_coverage = _setup_coverage_v722(_paper_closed_trades(None))
+    return {
+        "user": coverage,
+        "market": market_coverage,
+    }
+
+
+def _live_metric_text_v722(value, suffix=""):
+    if value is None:
+        return "n/a"
+    try:
+        value = float(value)
+        if math.isinf(value):
+            return "∞"
+        return f"{value:.2f}{suffix}"
+    except Exception:
+        return str(value)
+
+
+def _live_unique_reasons_v722(items):
+    out = []
+    seen = set()
+    for item in items or []:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def build_live_readiness_checklist(chat_id):
+    _paper_load_state()
+    trades = sorted(_paper_closed_trades(chat_id), key=_sort_key_v77)
+    paper_stats = _paper_stats_v710(trades)
+    quality_user = paper_data_quality_summary(chat_id)
+    quality_market = paper_data_quality_summary(None)
+    setup = _live_setup_summary_v722(chat_id)
+    setup_user = setup.get("user") or {}
+    setup_market = setup.get("market") or {}
+    testnet = _live_testnet_summary_v722(chat_id)
+    safety = build_safety_decision(chat_id)
+    mode = execution_mode()
+    thresholds = _live_readiness_thresholds_v722()
+    metrics = {
+        "paper_closed_trades": quality_user.get("closed_trades", 0),
+        "paper_independent_setups": quality_user.get("independent_closed_setups", 0),
+        "paper_market_setups": quality_market.get("independent_market_closed_setups", 0),
+        "paper_profit_factor": paper_stats.get("pf"),
+        "paper_avg_r": paper_stats.get("avg_r"),
+        "testnet_total": testnet.get("total", 0),
+        "testnet_accepted": testnet.get("accepted", 0),
+        "testnet_rejected": testnet.get("rejected", 0),
+        "testnet_skipped": testnet.get("skipped", 0),
+        "testnet_reject_rate": testnet.get("reject_rate", 0.0),
+        "daily_loss_limit_pct": RISK_MAX_DAILY_REALIZED_LOSS_PCT,
+        "max_daily_trades": PAPER_TRADER_MAX_TRADES_PER_DAY,
+        "max_open_positions": PAPER_TRADER_MAX_POSITIONS,
+        "kill_switch_configured": callable(globals().get("build_safety_decision"))
+        and SAFETY_MAX_CONSECUTIVE_SL > 0
+        and SAFETY_COOLDOWN_AFTER_SL_MIN > 0,
+        "setup_groups": max(setup_user.get("groups", 0), setup_market.get("groups", 0)),
+        "setup_tickers": max(setup_user.get("tickers", 0), setup_market.get("tickers", 0)),
+        "setup_intervals": max(setup_user.get("intervals", 0), setup_market.get("intervals", 0)),
+        "setup_strategies": max(setup_user.get("strategies", 0), setup_market.get("strategies", 0)),
+        "live_orders_enabled": mode.get("live_orders_enabled"),
+    }
+    result = _evaluate_live_readiness_v722(metrics, thresholds)
+    live_forbidden = [
+        "Live/mainnet исполнение отключено кодом: live_orders_enabled=False.",
+        "Нужен отдельный ручной этап ревью перед любым реальным ключом.",
+    ]
+    live_forbidden.extend(result.get("blockers") or [])
+    live_forbidden.extend("Safety сейчас: " + x for x in (safety.get("blockers") or []))
+    return {
+        "status": result.get("status"),
+        "score": result.get("score"),
+        "checks": result.get("checks") or [],
+        "blockers": result.get("blockers") or [],
+        "warnings": result.get("warnings") or [],
+        "live_forbidden": _live_unique_reasons_v722(live_forbidden),
+        "metrics": metrics,
+        "thresholds": thresholds,
+        "paper_stats": paper_stats,
+        "quality_user": quality_user,
+        "quality_market": quality_market,
+        "testnet": testnet,
+        "setup": setup,
+        "safety": safety,
+        "mode": mode,
+    }
+
+
+def _live_check_map_v722(checks):
+    return {item.get("key"): item for item in checks or []}
+
+
+def _live_check_line_v722(item):
+    if not item:
+        return "❌ n/a"
+    icon = "✅" if item.get("ok") else ("❌" if item.get("hard_block") else "⚠️")
+    return f"{icon} {item.get('title')}: {item.get('value')} / цель {item.get('target')}"
+
+
+def format_live_readiness_checklist(chat_id):
+    data = build_live_readiness_checklist(chat_id)
+    checks = _live_check_map_v722(data.get("checks"))
+    status = data.get("status")
+    if status == "READY_TO_DISCUSS":
+        verdict = "🟢 ДАННЫХ ХВАТАЕТ ДЛЯ ОБСУЖДЕНИЯ СЛЕДУЮЩЕГО ЭТАПА"
+    elif status == "WATCH":
+        verdict = "🟡 НУЖНО НАБЛЮДАТЬ И ДОБРАТЬ ПОДТВЕРЖДЕНИЯ"
+    else:
+        verdict = "⛔ LIVE НЕ ГОТОВ"
+
+    stats = data.get("paper_stats") or {}
+    q_user = data.get("quality_user") or {}
+    q_market = data.get("quality_market") or {}
+    testnet = data.get("testnet") or {}
+    setup = (data.get("setup") or {}).get("market") or {}
+    safety = data.get("safety") or {}
+    mode = data.get("mode") or {}
+
+    lines = [
+        "🚦 Live Readiness Checklist v7.22",
+        "━━━━━━━━━━━━━━━━━━━━",
+        verdict,
+        f"Оценка чеклиста: {data.get('score', 0):.1f}/100",
+        "Это не запуск live. Это список условий, без которых live запрещён.",
+        "",
+        "1. Paper-статистика",
+        _live_check_line_v722(checks.get("paper_trades")),
+        _live_check_line_v722(checks.get("independent_setups")),
+        _live_check_line_v722(checks.get("market_setups")),
+        f"• В этом чате: {q_user.get('closed_trades', 0)} сделок / {q_user.get('independent_closed_setups', 0)} независимых setup",
+        f"• Рынок всего: {q_market.get('closed_trades', 0)} сделок / {q_market.get('independent_market_closed_setups', 0)} независимых market setup",
+        "",
+        "2. Качество результата",
+        _live_check_line_v722(checks.get("paper_profit_factor")),
+        _live_check_line_v722(checks.get("paper_avg_r")),
+        f"• WR: {stats.get('wins', 0)}/{stats.get('n', 0)} = {_fmt_pct_v710(stats.get('wr', 0))}",
+        f"• Net: {stats.get('net', 0):+.3f} USDT | Max DD: {stats.get('max_dd', 0):+.3f} USDT",
+        "",
+        "3. Testnet / Reconciliation",
+        _live_check_line_v722(checks.get("testnet_total")),
+        _live_check_line_v722(checks.get("testnet_accepted")),
+        _live_check_line_v722(checks.get("testnet_reject_rate")),
+        f"• Accepted/Rejected/Skipped: {testnet.get('accepted', 0)}/{testnet.get('rejected', 0)}/{testnet.get('skipped', 0)}",
+        "",
+        "4. Risk / Safety",
+        _live_check_line_v722(checks.get("daily_loss_limit")),
+        _live_check_line_v722(checks.get("kill_switch")),
+        _live_check_line_v722(checks.get("position_limits")),
+        f"• Сейчас Safety: {safety.get('status')} | открыто {safety.get('open_positions', 0)}/{PAPER_TRADER_MAX_POSITIONS} | сегодня {safety.get('today_open', 0)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}",
+        "",
+        "5. Setup-статистика",
+        _live_check_line_v722(checks.get("setup_stats")),
+        f"• Покрытие: {setup.get('tickers', 0)} тикеров, {setup.get('intervals', 0)} TF, {setup.get('strategies', 0)} стратегий, {setup.get('groups', 0)} групп",
+        "",
+        "6. Защита от случайного live",
+        _live_check_line_v722(checks.get("live_blocked_by_code")),
+        f"• Режим: {str(mode.get('mode') or 'paper').upper()} | Testnet keys: {'есть' if mode.get('testnet_keys_present') else 'нет'}",
+        "",
+        "Что запрещает live сейчас:",
+    ]
+    for reason in data.get("live_forbidden") or []:
+        lines.append("• " + reason)
+    lines += [
+        "",
+        "Профессиональная логика простая: сначала честная статистика, потом Testnet-сверка, потом отдельное решение. Не наоборот.",
+    ]
+    return "\n".join(lines)
+
+
+def live_readiness_keyboard_v722():
+    return {"inline_keyboard": [
+        [
+            {"text": "📒 Testnet журнал", "callback_data": "testnet_journal"},
+            {"text": "🔎 Reconciliation", "callback_data": "testnet_reconcile"},
+        ],
+        [
+            {"text": "📊 Setup статистика", "callback_data": "setup_analytics"},
+            {"text": "📈 Качество бота", "callback_data": "bot_quality"},
+        ],
+        [{"text": "◀️ Назад", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def execution_status_keyboard_v715():
+    kb = _base_execution_status_keyboard_v721()
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 2)
+    rows.insert(insert_at, [{"text": "🚦 Live readiness", "callback_data": "live_readiness"}])
+    return {"inline_keyboard": rows}
+
+
+def autobot_keyboard(chat_id):
+    kb = _base_autobot_keyboard_v721(chat_id)
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [{"text": "🚦 Live readiness", "callback_data": "live_readiness"}])
+    return {"inline_keyboard": rows}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data == "live_readiness":
+                await async_answer_callback(session, callback_id, "Live readiness")
+                msg = await asyncio.to_thread(format_live_readiness_checklist, chat_id)
+                await async_send_plain_v76(session, chat_id, msg, live_readiness_keyboard_v722())
+                return
+        await _base_async_handle_update_v721(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v722] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Live Readiness</b> — чеклист готовности к обсуждению реальной торговли. Он не включает live, а проверяет, хватает ли paper-статистики, testnet-сверок, risk limits и kill switch.
+
+<b>Go/No-Go checklist</b> — список условий “можно / нельзя”. В трейдинге это защита от импульса: если хотя бы одно ключевое условие не выполнено, live запрещён независимо от желания “поскорее попробовать”.
+"""
+
+
+BOT_VERSION_LABEL = "v7.22 Live Readiness Checklist"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -16168,6 +16456,7 @@ RUNTIME_LAYERS = [
     ("v7.19", "Binance Futures Testnet /order/test validation for entry plans"),
     ("v7.20", "Testnet STOP_MARKET/TAKE_PROFIT_MARKET protection order validation"),
     ("v7.21", "Testnet journal, reconciliation report and package helper extraction"),
+    ("v7.22", "live readiness checklist for paper, testnet, safety and setup evidence"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -16216,6 +16505,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_testnet_status": format_testnet_status,
     "format_testnet_journal_report": format_testnet_journal_report,
     "format_testnet_reconciliation_report": format_testnet_reconciliation_report,
+    "build_live_readiness_checklist": build_live_readiness_checklist,
+    "format_live_readiness_checklist": format_live_readiness_checklist,
     "build_safety_decision": build_safety_decision,
     "format_safety_status": format_safety_status,
     "market_opportunity_scan": market_opportunity_scan,
@@ -16317,6 +16608,10 @@ def validate_runtime_architecture():
         errors.append("testnet journal report is missing")
     if not callable(globals().get("format_testnet_reconciliation_report")):
         errors.append("testnet reconciliation report is missing")
+    if not callable(globals().get("build_live_readiness_checklist")):
+        errors.append("live readiness checklist builder is missing")
+    if not callable(globals().get("format_live_readiness_checklist")):
+        errors.append("live readiness checklist report is missing")
     mode = _execution_mode_v715()
     if mode not in EXECUTION_ALLOWED_MODES:
         errors.append(f"invalid execution mode: {mode}")

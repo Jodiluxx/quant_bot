@@ -117,11 +117,18 @@ Testnet Journal/Reconciliation v7.21 adds a separate `testnet_journal.json`
 runtime file and reports for planned order checks, accepted/rejected Testnet
 validations, Binance rejection reasons, and plan-vs-result reconciliation.
 
+Live Readiness Checklist v7.22 adds a go/no-go report in Autobot. It checks
+whether there are enough paper trades, independent setup statistics, accepted
+Testnet reconciliations, daily loss limits, position limits and kill-switch
+controls. It does not enable live trading; mainnet order submission remains
+blocked by code.
+
 The first real extraction helpers now live in:
 
 - `quant_bot/execution_gateway.py`
 - `quant_bot/safety.py`
 - `quant_bot/analytics_reports.py`
+- `quant_bot/live_readiness.py`
 
 Safety Kill Switch v7.16 adds an Autobot safety screen. It can pause new paper
 entries, turn on observe-only mode, block after daily limits, and cool down

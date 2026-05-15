@@ -40,3 +40,11 @@ def format_testnet_journal_report(*args: Any, **kwargs: Any) -> Any:
 
 def format_testnet_reconciliation_report(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_testnet_reconciliation_report", *args, **kwargs)
+
+
+def build_live_readiness_checklist(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("build_live_readiness_checklist", *args, **kwargs)
+
+
+def format_live_readiness_checklist(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("format_live_readiness_checklist", *args, **kwargs)

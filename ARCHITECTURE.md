@@ -26,6 +26,7 @@ quant_bot/
   execution_gateway.py     pure execution/reconciliation helpers
   safety.py                pure safety calculation helpers
   analytics_reports.py     pure analytics/report calculation helpers
+  live_readiness.py        pure live-readiness checklist helpers
   adapters/
     market_data.py         candles, price, futures context
     signals.py             signal engine and message formatting
@@ -42,7 +43,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.21 Testnet Journal Reconciliation`.
+Current active runtime is `v7.22 Live Readiness Checklist`.
 
 Layer summary:
 
@@ -65,6 +66,8 @@ Layer summary:
 17. v7.19: Binance Futures Testnet `/fapi/v1/order/test` validation
 18. v7.20: Testnet protection order validation for SL and TP reduce-only orders
 19. v7.21: Testnet journal, reconciliation report and first package helpers
+20. v7.22: live-readiness checklist for paper evidence, testnet checks,
+    safety limits, kill switch and setup statistics
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.
