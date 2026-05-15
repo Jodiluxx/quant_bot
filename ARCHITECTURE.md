@@ -39,7 +39,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.17 Smart Opportunity Ranking`.
+Current active runtime is `v7.18 Period Performance Reports`.
 
 Layer summary:
 
@@ -58,6 +58,7 @@ Layer summary:
 13. v7.15: dry-run execution gateway with order plans and live trading blocked
 14. v7.16: safety kill switch, observe-only mode and SL-series cooldown
 15. v7.17: smart opportunity ranking and best-setups report
+16. v7.18: daily and weekly Paper Trader performance reports
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

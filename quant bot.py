@@ -14927,7 +14927,235 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.17 Smart Opportunity Ranking"
+# ============================================================
+# v7.18 — DAILY / WEEKLY PERFORMANCE REPORT
+# ============================================================
+# A trading system improves from structured review. This report summarizes
+# paper performance by period, ticker, timeframe and strategy, including R,
+# profit factor, SL clusters and simple probability calibration.
+
+_base_paper_decision_snapshot_v717 = _paper_decision_snapshot
+_base_autobot_keyboard_v717 = autobot_keyboard
+_base_async_handle_update_v717 = async_handle_update
+
+
+def _paper_decision_snapshot(candidate):
+    snap = _base_paper_decision_snapshot_v717(candidate)
+    data = candidate.get("data") or {}
+    ep = candidate.get("entry_plan") or {}
+    opp = candidate.get("opportunity") or _candidate_opportunity_metrics_v717(candidate)
+    snap["prob"] = data.get("prob")
+    snap["opportunity_grade"] = opp.get("grade")
+    snap["expected_r"] = opp.get("expected_r")
+    snap["opportunity_adjust"] = opp.get("score_adjust")
+    snap["entry_now_score"] = ep.get("entry_now_score", snap.get("entry_now_score"))
+    snap["setup_score"] = ep.get("setup_score", snap.get("setup_score"))
+    return snap
+
+
+def _period_start_v718(days):
+    return datetime.now(timezone.utc) - timedelta(days=int(days))
+
+
+def _paper_trades_since_v718(chat_id, days):
+    start = _period_start_v718(days)
+    rows = []
+    for trade in _paper_closed_trades(chat_id):
+        ts = _safety_parse_dt_v716(trade.get("closed_at") or trade.get("opened_at"))
+        if ts and ts >= start:
+            rows.append(trade)
+    rows.sort(key=_sort_key_v77)
+    return rows
+
+
+def _trade_r_v718(trade):
+    risk = _safe_float(trade.get("risk_usd"), 0) or 0
+    net = _safe_float(trade.get("net_usd"), 0) or 0
+    if risk <= 0:
+        return None
+    return net / risk
+
+
+def _period_stats_v718(trades):
+    n = len(trades)
+    wins = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) > 0]
+    losses = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) < 0]
+    gross_win = sum(_safe_float(t.get("net_usd"), 0) or 0 for t in wins)
+    gross_loss = abs(sum(_safe_float(t.get("net_usd"), 0) or 0 for t in losses))
+    r_values = [_trade_r_v718(t) for t in trades]
+    r_values = [r for r in r_values if r is not None]
+    return {
+        "n": n,
+        "wins": len(wins),
+        "losses": len(losses),
+        "wr": len(wins) / n * 100 if n else 0.0,
+        "net": sum(_safe_float(t.get("net_usd"), 0) or 0 for t in trades),
+        "gross_win": gross_win,
+        "gross_loss": gross_loss,
+        "pf": gross_win / gross_loss if gross_loss > 0 else (None if gross_win <= 0 else float("inf")),
+        "avg_r": sum(r_values) / len(r_values) if r_values else None,
+        "sum_r": sum(r_values) if r_values else None,
+    }
+
+
+def _period_group_stats_v718(trades, key_fn, limit=4, reverse=True):
+    grouped = {}
+    for trade in trades:
+        key = key_fn(trade) or "unknown"
+        grouped.setdefault(key, []).append(trade)
+    rows = []
+    for key, items in grouped.items():
+        stats = _period_stats_v718(items)
+        rows.append((key, stats))
+    rows.sort(key=lambda kv: (kv[1]["net"], kv[1]["wr"], kv[1]["n"]), reverse=reverse)
+    return rows[:limit]
+
+
+def _pf_text_v718(value):
+    if value is None:
+        return "n/a"
+    if value == float("inf"):
+        return "∞"
+    return f"{value:.2f}"
+
+
+def _avg_r_text_v718(value):
+    return "n/a" if value is None else f"{value:+.2f}R"
+
+
+def _period_group_line_v718(name, stats):
+    return (
+        f"• {name}: n={stats['n']} | WR {stats['wr']:.0f}% | "
+        f"net {stats['net']:+.3f} USDT | avgR {_avg_r_text_v718(stats['avg_r'])}"
+    )
+
+
+def _period_probability_line_v718(trades):
+    rows = []
+    for trade in trades:
+        prob = _safe_float((trade.get("decision") or {}).get("prob"), 0) or 0
+        if prob <= 0:
+            continue
+        net = _safe_float(trade.get("net_usd"), 0) or 0
+        rows.append((prob, 1 if net > 0 else 0))
+    if len(rows) < 3:
+        return "Проверка вероятностей: мало сделок с записанной вероятностью."
+    avg_prob = sum(x[0] for x in rows) / len(rows) * 100
+    actual = sum(x[1] for x in rows) / len(rows) * 100
+    gap = actual - avg_prob
+    return f"Проверка вероятностей: avg forecast {avg_prob:.1f}% | факт {actual:.1f}% | gap {gap:+.1f} pp"
+
+
+def _sl_cluster_lines_v718(trades):
+    sl_trades = [t for t in trades if "SL" in str(t.get("exit_reason") or "").upper()]
+    if not sl_trades:
+        return ["SL-кластеры: за период нет закрытий по SL."]
+    by_ticker = _period_group_stats_v718(sl_trades, lambda t: t.get("ticker"), limit=3, reverse=True)
+    by_tf = _period_group_stats_v718(sl_trades, lambda t: t.get("interval"), limit=3, reverse=True)
+    lines = [f"SL-кластеры: {len(sl_trades)} закрытий по SL."]
+    if by_ticker:
+        lines.append("По тикерам: " + " | ".join(f"{k}: {s['n']}" for k, s in by_ticker))
+    if by_tf:
+        lines.append("По TF: " + " | ".join(f"{k}: {s['n']}" for k, s in by_tf))
+    return lines
+
+
+def format_period_performance_report(chat_id, days=1):
+    days = int(days or 1)
+    trades = _paper_trades_since_v718(chat_id, days)
+    stats = _period_stats_v718(trades)
+    title = "📅 Дневной отчёт" if days <= 1 else "📆 Недельный отчёт"
+    lines = [
+        f"{title} Paper Trader",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Период: последние {days} дн.",
+        f"Сделок: {stats['n']} | Win/Loss: {stats['wins']}/{stats['losses']} | WR {stats['wr']:.1f}%",
+        f"Net: {stats['net']:+.3f} USDT | PF {_pf_text_v718(stats['pf'])} | AvgR {_avg_r_text_v718(stats['avg_r'])}",
+        _period_probability_line_v718(trades),
+    ]
+    if stats["n"] < 20:
+        lines.append("Выводы предварительные: для уверенной настройки нужно хотя бы 50-100 независимых setup.")
+
+    best_tickers = _period_group_stats_v718(trades, lambda t: t.get("ticker"), limit=4, reverse=True)
+    weak_tickers = _period_group_stats_v718(trades, lambda t: t.get("ticker"), limit=4, reverse=False)
+    by_tf = _period_group_stats_v718(trades, lambda t: t.get("interval"), limit=4, reverse=True)
+    by_strategy = _period_group_stats_v718(trades, lambda t: t.get("strategy"), limit=4, reverse=True)
+
+    if best_tickers:
+        lines += ["", "Лучшие тикеры:"] + [
+            _period_group_line_v718(TICKERS.get(k, {}).get("label", k), s) for k, s in best_tickers
+        ]
+    if weak_tickers:
+        lines += ["", "Слабые тикеры:"] + [
+            _period_group_line_v718(TICKERS.get(k, {}).get("label", k), s) for k, s in weak_tickers
+        ]
+    if by_tf:
+        lines += ["", "TF:"] + [_period_group_line_v718(k, s) for k, s in by_tf]
+    if by_strategy:
+        lines += ["", "Стратегии:"] + [_period_group_line_v718(k, s) for k, s in by_strategy]
+
+    lines += [""] + _sl_cluster_lines_v718(trades)
+    safety = build_safety_decision(chat_id)
+    if not safety.get("allowed"):
+        lines += ["", "Safety сейчас блокирует новые входы:", "• " + "; ".join(safety.get("blockers", [])[:3])]
+    lines += [
+        "",
+        "Что улучшать по этому отчёту: сначала ищем повторяющиеся слабые зоны, а не меняем стратегию из-за одной сделки.",
+    ]
+    return "\n".join(lines)
+
+
+def period_report_keyboard_v718():
+    return {"inline_keyboard": [
+        [
+            {"text": "📅 День", "callback_data": "performance_today"},
+            {"text": "📆 Неделя", "callback_data": "performance_week"},
+        ],
+        [{"text": "🤖 Назад: Автобот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def autobot_keyboard(chat_id):
+    kb = _base_autobot_keyboard_v717(chat_id)
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [{"text": "📅 День / неделя", "callback_data": "performance_today"}])
+    return {"inline_keyboard": rows}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data in {"performance_today", "performance_week"}:
+                days = 1 if data == "performance_today" else 7
+                await async_answer_callback(session, callback_id, "Отчёт")
+                msg = await asyncio.to_thread(format_period_performance_report, chat_id, days)
+                await async_send_plain_v76(session, chat_id, msg, period_report_keyboard_v718())
+                return
+        await _base_async_handle_update_v717(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v718] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Profit Factor</b> — отношение общей прибыли к общему убытку. PF выше 1 означает, что прибыль за период больше убытков, но на маленькой выборке это легко случайность.
+
+<b>Avg R</b> — средний результат сделки в единицах риска. Это лучше, чем смотреть только USDT, потому что сделки могут быть разного размера.
+"""
+
+
+BOT_VERSION_LABEL = "v7.18 Period Performance Reports"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -14971,6 +15199,7 @@ RUNTIME_LAYERS = [
     ("v7.15", "Execution Gateway dry-run order plans with live trading blocked"),
     ("v7.16", "Safety kill switch, observe-only mode and SL-series cooldown"),
     ("v7.17", "Smart opportunity ranking and best-setups report"),
+    ("v7.18", "Daily and weekly Paper Trader performance reports"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -15017,6 +15246,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_safety_status": format_safety_status,
     "market_opportunity_scan": market_opportunity_scan,
     "format_market_opportunities": format_market_opportunities,
+    "format_period_performance_report": format_period_performance_report,
     "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
@@ -15099,6 +15329,8 @@ def validate_runtime_architecture():
         errors.append("market opportunity scanner is missing")
     if not callable(globals().get("format_market_opportunities")):
         errors.append("market opportunities report is missing")
+    if not callable(globals().get("format_period_performance_report")):
+        errors.append("period performance report is missing")
     mode = _execution_mode_v715()
     if mode not in EXECUTION_ALLOWED_MODES:
         errors.append(f"invalid execution mode: {mode}")

@@ -32,3 +32,7 @@ def market_opportunity_scan(*args: Any, **kwargs: Any) -> Any:
 
 def format_market_opportunities(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_market_opportunities", *args, **kwargs)
+
+
+def format_period_performance_report(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("format_period_performance_report", *args, **kwargs)
