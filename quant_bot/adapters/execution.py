@@ -16,3 +16,11 @@ def build_execution_order_plan(*args: Any, **kwargs: Any) -> Any:
 
 def format_execution_status(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_execution_status", *args, **kwargs)
+
+
+def submit_testnet_order_test(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("submit_testnet_order_test", *args, **kwargs)
+
+
+def format_testnet_status(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("format_testnet_status", *args, **kwargs)

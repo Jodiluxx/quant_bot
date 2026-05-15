@@ -37,9 +37,12 @@ import threading
 import json
 import os
 import math
+import hmac
+import hashlib
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import urlencode
 
 def _make_session():
     s = requests.Session()
@@ -13879,7 +13882,7 @@ EXECUTION_MAX_DAILY_PLANS = PAPER_TRADER_MAX_TRADES_PER_DAY
 EXECUTION_MAX_OPEN_POSITIONS = PAPER_TRADER_MAX_POSITIONS
 BINANCE_FUTURES_TESTNET_REST = os.getenv(
     "BINANCE_FUTURES_TESTNET_REST",
-    "https://testnet.binancefuture.com",
+    "https://demo-fapi.binance.com",
 ).strip()
 _execution_lock_v715 = threading.RLock()
 
@@ -13916,7 +13919,7 @@ def execution_mode():
         "testnet_rest": BINANCE_FUTURES_TESTNET_REST,
         "testnet_keys_present": bool(key and secret),
         "testnet_submit_requested": _env_bool_v715("BINANCE_TESTNET_ORDER_SUBMIT", False),
-        "message": "v7.15 строит ордер-планы и журнал, но не отправляет реальные Binance-ордера.",
+        "message": "v7.19 строит ордер-планы; Testnet /order/test включается только отдельным флагом.",
     }
 
 
@@ -15155,7 +15158,307 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.18 Period Performance Reports"
+# ============================================================
+# v7.19 — BINANCE FUTURES TESTNET ORDER TEST
+# ============================================================
+# Testnet is still not live trading. This layer can validate the entry order
+# against Binance Futures Testnet's /fapi/v1/order/test endpoint when the user
+# explicitly enables it with testnet keys and BINANCE_TESTNET_ORDER_SUBMIT=1.
+
+_base_paper_open_candidate_v718 = _paper_open_candidate
+_base_format_execution_status_v718 = format_execution_status
+_base_async_handle_update_v718 = async_handle_update
+
+TESTNET_ORDER_TEST_PATH = "/fapi/v1/order/test"
+TESTNET_RECV_WINDOW_MS = int(os.getenv("BINANCE_TESTNET_RECV_WINDOW", "5000"))
+
+
+def _testnet_keys_v719():
+    key = (
+        os.getenv("BINANCE_FUTURES_TESTNET_API_KEY")
+        or os.getenv("BINANCE_TESTNET_API_KEY")
+        or ""
+    ).strip()
+    secret = (
+        os.getenv("BINANCE_FUTURES_TESTNET_API_SECRET")
+        or os.getenv("BINANCE_TESTNET_API_SECRET")
+        or ""
+    ).strip()
+    return key, secret
+
+
+def _testnet_submit_enabled_v719():
+    return _env_bool_v715("BINANCE_TESTNET_ORDER_SUBMIT", False)
+
+
+def _format_decimal_v719(value, max_decimals=8):
+    try:
+        value = float(value)
+    except Exception:
+        return "0"
+    if value <= 0:
+        return "0"
+    text = f"{value:.{int(max_decimals)}f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _testnet_signed_payload_v719(params, secret):
+    clean = {}
+    for key, value in (params or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        clean[key] = str(value)
+    clean.setdefault("recvWindow", str(TESTNET_RECV_WINDOW_MS))
+    clean.setdefault("timestamp", str(int(time.time() * 1000)))
+    query = urlencode(clean)
+    signature = hmac.new(secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+    clean["signature"] = signature
+    return clean, query
+
+
+def _testnet_post_signed_v719(path, params):
+    api_key, secret = _testnet_keys_v719()
+    if not api_key or not secret:
+        return {"ok": False, "skipped": True, "reason": "testnet API key/secret не заданы"}
+    signed, _ = _testnet_signed_payload_v719(params, secret)
+    url = BINANCE_FUTURES_TESTNET_REST.rstrip("/") + path
+    try:
+        response = _session.post(
+            url,
+            data=signed,
+            headers={"X-MBX-APIKEY": api_key},
+            timeout=15,
+        )
+        payload = response.json() if response.text else {}
+        return {
+            "ok": response.status_code < 400,
+            "status_code": response.status_code,
+            "payload": payload,
+            "headers": {
+                "order_count_10s": response.headers.get("X-MBX-ORDER-COUNT-10S"),
+                "order_count_1m": response.headers.get("X-MBX-ORDER-COUNT-1M"),
+                "used_weight_1m": response.headers.get("X-MBX-USED-WEIGHT-1M"),
+            },
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _entry_order_test_params_v719(plan):
+    order = plan.get("entry_order") or {}
+    qty = _format_decimal_v719(order.get("quantity_est"), 8)
+    return {
+        "symbol": plan.get("api_symbol") or plan.get("ticker"),
+        "side": order.get("side"),
+        "type": "MARKET",
+        "quantity": qty,
+        "newClientOrderId": order.get("client_order_id"),
+        "newOrderRespType": "ACK",
+    }
+
+
+def submit_testnet_order_test(plan):
+    plan = plan or {}
+    mode = execution_mode()
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "mode": mode.get("mode"),
+        "endpoint": TESTNET_ORDER_TEST_PATH,
+        "submitted": False,
+        "ok": False,
+    }
+    if mode.get("mode") != "testnet":
+        result["skipped"] = True
+        result["reason"] = "BOT_EXECUTION_MODE должен быть testnet"
+        return result
+    if not _testnet_submit_enabled_v719():
+        result["skipped"] = True
+        result["reason"] = "BINANCE_TESTNET_ORDER_SUBMIT не включён"
+        return result
+    if plan.get("blockers"):
+        result["skipped"] = True
+        result["reason"] = "ордер-план заблокирован risk/safety"
+        result["blockers"] = list(plan.get("blockers") or [])[:5]
+        return result
+    qty = _safe_float((plan.get("entry_order") or {}).get("quantity_est"), 0) or 0
+    if qty <= 0:
+        result["skipped"] = True
+        result["reason"] = "quantity_est <= 0"
+        return result
+
+    params = _entry_order_test_params_v719(plan)
+    result["request"] = {
+        "symbol": params.get("symbol"),
+        "side": params.get("side"),
+        "type": params.get("type"),
+        "quantity": params.get("quantity"),
+        "newClientOrderId": params.get("newClientOrderId"),
+    }
+    response = _testnet_post_signed_v719(TESTNET_ORDER_TEST_PATH, params)
+    result.update({
+        "submitted": not response.get("skipped", False),
+        "ok": bool(response.get("ok")),
+        "status_code": response.get("status_code"),
+        "response": response.get("payload"),
+        "headers": response.get("headers"),
+        "error": response.get("error"),
+        "reason": response.get("reason"),
+    })
+    return result
+
+
+def _record_testnet_result_v719(plan, result):
+    with _execution_lock_v715:
+        state = _execution_load_state_v715()
+        event = {
+            "type": "testnet_order_test",
+            "ts": result.get("ts"),
+            "chat_id": plan.get("chat_id"),
+            "plan_id": plan.get("plan_id"),
+            "ticker": plan.get("ticker"),
+            "interval": plan.get("interval"),
+            "direction": plan.get("direction"),
+            "submitted": result.get("submitted"),
+            "ok": result.get("ok"),
+            "status_code": result.get("status_code"),
+            "reason": result.get("reason") or result.get("error"),
+            "request": result.get("request"),
+            "response": result.get("response"),
+        }
+        state.setdefault("events", []).append(event)
+        _execution_save_state_v715(state)
+    return result
+
+
+def _recent_testnet_events_v719(chat_id=None, limit=5):
+    state = _execution_load_state_v715()
+    events = [e for e in (state.get("events") or []) if e.get("type") == "testnet_order_test"]
+    if chat_id is not None:
+        key = _paper_chat_key(chat_id)
+        events = [e for e in events if str(e.get("chat_id")) == key]
+    events.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    return events[:limit]
+
+
+def _paper_open_candidate(chat_id, candidate):
+    pos, err = _base_paper_open_candidate_v718(chat_id, candidate)
+    if err or not pos:
+        return pos, err
+    try:
+        plan = build_execution_order_plan(chat_id, candidate, position=pos, already_opened=True)
+        result = submit_testnet_order_test(plan)
+        _record_testnet_result_v719(plan, result)
+        with _paper_lock:
+            live = (_paper_state.get("positions") or {}).get(pos.get("pos_id"))
+            if live is not None:
+                live["testnet_order_test"] = {
+                    "ts": result.get("ts"),
+                    "submitted": result.get("submitted"),
+                    "ok": result.get("ok"),
+                    "status_code": result.get("status_code"),
+                    "reason": result.get("reason") or result.get("error"),
+                }
+                pos.update(live)
+                _paper_save_state()
+    except Exception as e:
+        print(f"  [testnet_v719] order test hook error: {e}")
+    return pos, None
+
+
+def format_testnet_status(chat_id):
+    info = execution_mode()
+    events = _recent_testnet_events_v719(chat_id, 5)
+    lines = [
+        "🧪 Binance Futures Testnet v7.19",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Mode: {str(info.get('mode')).upper()}",
+        f"Testnet REST: {info.get('testnet_rest')}",
+        f"Keys: {'есть' if info.get('testnet_keys_present') else 'не заданы'}",
+        f"Submit flag: {'ON' if _testnet_submit_enabled_v719() else 'OFF'}",
+        "Endpoint: POST /fapi/v1/order/test",
+        "",
+        "Что реально делает:",
+        "• проверяет entry MARKET order через Testnet API;",
+        "• не отправляет mainnet-ордера;",
+        "• не отправляет защитные SL/TP как реальные orders в v7.19;",
+        "• пишет результат в execution journal.",
+    ]
+    if info.get("mode") != "testnet":
+        lines += ["", "Чтобы валидировать через Testnet, нужен BOT_EXECUTION_MODE=testnet."]
+    if not _testnet_submit_enabled_v719():
+        lines += ["", "Флаг отправки выключен. Это безопасный default."]
+    if events:
+        lines += ["", "Последние проверки:"]
+        for event in events:
+            status = "OK" if event.get("ok") else ("SKIP" if not event.get("submitted") else "FAIL")
+            req = event.get("request") or {}
+            lines.append(
+                f"• {_fmt_dt_short(event.get('ts'))} | {event.get('ticker')} {event.get('direction')} | "
+                f"{status} | {req.get('side')} {req.get('quantity')}"
+            )
+            reason = event.get("reason")
+            if reason:
+                lines.append(f"  причина: {reason}")
+    else:
+        lines += ["", "Проверок ещё нет. Они появятся после новой paper-сделки при включённом testnet mode."]
+    return "\n".join(lines)
+
+
+def format_execution_status(chat_id):
+    text = _base_format_execution_status_v718(chat_id)
+    info = execution_mode()
+    events = _recent_testnet_events_v719(chat_id, 1)
+    flag = "ON" if _testnet_submit_enabled_v719() else "OFF"
+    status = "нет проверок"
+    if events:
+        last = events[0]
+        status = "OK" if last.get("ok") else ("SKIP" if not last.get("submitted") else "FAIL")
+    return "\n".join([
+        text,
+        "",
+        "Testnet v7.19:",
+        f"• mode {str(info.get('mode')).upper()} | keys {'есть' if info.get('testnet_keys_present') else 'нет'} | submit {flag}",
+        f"• последняя /order/test: {status}",
+    ])
+
+
+def execution_status_keyboard_v715():
+    return {"inline_keyboard": [
+        [{"text": "🧪 Testnet статус", "callback_data": "testnet_status"}],
+        [{"text": "🤖 Назад: Автобот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data == "testnet_status":
+                await async_answer_callback(session, callback_id, "Testnet")
+                await async_send_plain_v76(session, chat_id, format_testnet_status(chat_id), execution_status_keyboard_v715())
+                return
+        await _base_async_handle_update_v718(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v719] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Order test endpoint</b> — безопасный API-запрос Binance Futures `/fapi/v1/order/test`. Он проверяет параметры и подпись, но не отправляет ордер в стакан.
+
+<b>HMAC SHA256 signature</b> — криптографическая подпись запроса API. Биржа по ней проверяет, что запрос действительно создан владельцем API secret.
+"""
+
+
+BOT_VERSION_LABEL = "v7.19 Testnet Order Test"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -15200,6 +15503,7 @@ RUNTIME_LAYERS = [
     ("v7.16", "Safety kill switch, observe-only mode and SL-series cooldown"),
     ("v7.17", "Smart opportunity ranking and best-setups report"),
     ("v7.18", "Daily and weekly Paper Trader performance reports"),
+    ("v7.19", "Binance Futures Testnet /order/test validation for entry plans"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -15242,6 +15546,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "execution_mode": execution_mode,
     "build_execution_order_plan": build_execution_order_plan,
     "format_execution_status": format_execution_status,
+    "submit_testnet_order_test": submit_testnet_order_test,
+    "format_testnet_status": format_testnet_status,
     "build_safety_decision": build_safety_decision,
     "format_safety_status": format_safety_status,
     "market_opportunity_scan": market_opportunity_scan,
@@ -15331,6 +15637,10 @@ def validate_runtime_architecture():
         errors.append("market opportunities report is missing")
     if not callable(globals().get("format_period_performance_report")):
         errors.append("period performance report is missing")
+    if not callable(globals().get("submit_testnet_order_test")):
+        errors.append("testnet order test submitter is missing")
+    if not callable(globals().get("format_testnet_status")):
+        errors.append("testnet status report is missing")
     mode = _execution_mode_v715()
     if mode not in EXECUTION_ALLOWED_MODES:
         errors.append(f"invalid execution mode: {mode}")

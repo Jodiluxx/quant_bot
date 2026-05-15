@@ -39,7 +39,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.18 Period Performance Reports`.
+Current active runtime is `v7.19 Testnet Order Test`.
 
 Layer summary:
 
@@ -59,6 +59,7 @@ Layer summary:
 14. v7.16: safety kill switch, observe-only mode and SL-series cooldown
 15. v7.17: smart opportunity ranking and best-setups report
 16. v7.18: daily and weekly Paper Trader performance reports
+17. v7.19: Binance Futures Testnet `/fapi/v1/order/test` validation
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

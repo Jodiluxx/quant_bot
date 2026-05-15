@@ -99,6 +99,15 @@ $env:BINANCE_FUTURES_TESTNET_API_KEY="..."
 $env:BINANCE_FUTURES_TESTNET_API_SECRET="..."
 ```
 
+Testnet Order Test v7.19 can validate entry orders through Binance Futures
+Testnet `/fapi/v1/order/test`. This endpoint checks request parameters and
+signature, but does not send the order to the matching engine.
+
+```powershell
+$env:BOT_EXECUTION_MODE="testnet"
+$env:BINANCE_TESTNET_ORDER_SUBMIT="1"
+```
+
 Safety Kill Switch v7.16 adds an Autobot safety screen. It can pause new paper
 entries, turn on observe-only mode, block after daily limits, and cool down
 after a series of SL/loss exits.
