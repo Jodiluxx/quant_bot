@@ -13336,6 +13336,154 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
+# ============================================================
+# v7.13 — TIMEFRAME QUALITY WEIGHTING
+# ============================================================
+# Weak timeframes are not banned. They receive a score penalty in Paper Trader,
+# so an exceptional setup can still pass while mediocre weak-TF setups lose
+# priority.
+
+_base_paper_strategy_candidates_v712 = _paper_strategy_candidates
+_base_format_probability_calibration_report_v712 = format_probability_calibration_report
+_tf_quality_cache_v713 = {"ts": 0.0, "data": {}}
+_tf_quality_lock_v713 = threading.RLock()
+
+TF_QUALITY_MIN_SIGNALS = 80
+TF_QUALITY_CACHE_TTL_SEC = 600
+TF_QUALITY_MAX_PENALTY = -18
+TF_QUALITY_MAX_BONUS = 4
+
+
+def _tf_quality_grade_v713(stats):
+    n = int(stats.get("binary_n") or 0)
+    wr = stats.get("actual_wr")
+    gap = stats.get("gap")
+    if n < TF_QUALITY_MIN_SIGNALS or wr is None or gap is None:
+        return "LOW_SAMPLE", 0, "мало данных"
+    if wr < 0.45 or (wr < 0.48 and gap < -0.12):
+        return "WEAK", TF_QUALITY_MAX_PENALTY, "сильное переоценивание/низкий WR"
+    if wr < 0.48 or (wr < 0.52 and gap < -0.12):
+        return "WEAK", -14, "низкий WR или сильный gap"
+    if wr < 0.52 or gap < -0.18:
+        return "WATCH", -8, "под наблюдением"
+    if wr >= 0.58 and gap > -0.10:
+        return "GOOD", TF_QUALITY_MAX_BONUS, "статистика выглядит лучше среднего"
+    return "NEUTRAL", 0, "нейтрально"
+
+
+def tf_quality_summary_v713(force=False):
+    now_ts = time.time()
+    with _tf_quality_lock_v713:
+        if (
+            not force
+            and _tf_quality_cache_v713.get("data")
+            and now_ts - float(_tf_quality_cache_v713.get("ts") or 0) < TF_QUALITY_CACHE_TTL_SEC
+        ):
+            return dict(_tf_quality_cache_v713["data"])
+
+    rows = _prob_records_v712("12b")
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("interval") or "unknown"), []).append(row)
+
+    summary = {}
+    for tf, items in grouped.items():
+        stats = _calibration_stats_v712(items)
+        grade, score_adjust, note = _tf_quality_grade_v713(stats)
+        summary[tf] = {
+            "tf": tf,
+            "n": int(stats.get("binary_n") or 0),
+            "avg_prob": stats.get("avg_prob"),
+            "actual_wr": stats.get("actual_wr"),
+            "gap": stats.get("gap"),
+            "brier": stats.get("brier"),
+            "grade": grade,
+            "score_adjust": score_adjust,
+            "note": note,
+        }
+
+    with _tf_quality_lock_v713:
+        _tf_quality_cache_v713["ts"] = now_ts
+        _tf_quality_cache_v713["data"] = dict(summary)
+    return summary
+
+
+def _tf_quality_for_interval_v713(interval):
+    summary = tf_quality_summary_v713()
+    return summary.get(str(interval), {
+        "tf": interval,
+        "n": 0,
+        "avg_prob": None,
+        "actual_wr": None,
+        "gap": None,
+        "brier": None,
+        "grade": "LOW_SAMPLE",
+        "score_adjust": 0,
+        "note": "нет статистики",
+    })
+
+
+def _tf_quality_line_v713(info):
+    wr = "n/a" if info.get("actual_wr") is None else _fmt_pct_v710(info["actual_wr"] * 100)
+    gap = "n/a" if info.get("gap") is None else f"{info['gap'] * 100:+.1f} pp"
+    return (
+        f"• {info.get('tf')}: {info.get('grade')} | n={info.get('n')} | "
+        f"WR {wr} | gap {gap} | score {info.get('score_adjust', 0):+}"
+    )
+
+
+def _tf_quality_lines_v713():
+    summary = tf_quality_summary_v713()
+    ordered = sorted(
+        summary.values(),
+        key=lambda x: (x.get("score_adjust", 0), x.get("actual_wr") if x.get("actual_wr") is not None else 0),
+    )
+    lines = [
+        "",
+        "<b>6. Приоритет TF для PaperTrader</b>",
+        "Слабый TF не запрещается, но получает штраф к score кандидата.",
+    ]
+    if not ordered:
+        lines.append("Пока нет данных для оценки TF.")
+        return lines
+    for info in ordered:
+        lines.append(_tf_quality_line_v713(info))
+    return lines
+
+
+def _paper_strategy_candidates(chat_id, ticker, interval, data):
+    rows = _base_paper_strategy_candidates_v712(chat_id, ticker, interval, data)
+    if not rows:
+        return rows
+    quality = _tf_quality_for_interval_v713(interval)
+    score_adjust = int(quality.get("score_adjust") or 0)
+    for cand in rows:
+        raw_score = float(cand.get("score") or 0)
+        cand["raw_score"] = raw_score
+        cand["tf_quality"] = quality
+        cand["tf_quality_adjustment"] = score_adjust
+        cand["score"] = max(0, raw_score + score_adjust)
+        if score_adjust:
+            cand["reason"] = (
+                f"{cand.get('reason')}; TF quality {quality.get('grade')} "
+                f"({score_adjust:+} score, {quality.get('note')})"
+            )
+    return rows
+
+
+def format_probability_calibration_report(chat_id=None):
+    text = _base_format_probability_calibration_report_v712(chat_id)
+    return text + "\n" + "\n".join(_tf_quality_lines_v713())
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>TF quality penalty</b> — мягкий штраф к score Paper Trader для слабого таймфрейма. Это не запрет сделки: сильный setup всё ещё может пройти.
+
+<b>Score adjustment</b> — добавка или штраф к оценке кандидата. Она помогает ранжировать сделки, но не заменяет риск-менеджмент.
+"""
+
+
 LEARN_TEXTS["learn_new_terms"] += """
 
 <b>Setup ID</b> — уникальный номер торговой идеи: актив, таймфрейм, направление, стратегия и свеча. Он нужен, чтобы бот не открыл одну и ту же paper-сделку два раза.
@@ -13346,7 +13494,7 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.12 Probability Calibration"
+BOT_VERSION_LABEL = "v7.13 Timeframe Quality Weighting"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -13385,6 +13533,7 @@ RUNTIME_LAYERS = [
     ("v7.10", "Bot quality report with paper expectancy, profit factor and signal journal diagnostics"),
     ("v7.11", "Setup analytics by ticker, timeframe, strategy, R, hold time and MFE/MAE"),
     ("v7.12", "Probability calibration by forecast bucket, timeframe and direction"),
+    ("v7.13", "Paper Trader soft timeframe quality weighting from calibrated signal stats"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -13422,6 +13571,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_bot_quality_report": format_bot_quality_report,
     "format_setup_analytics_report": format_setup_analytics_report,
     "format_probability_calibration_report": format_probability_calibration_report,
+    "tf_quality_summary": tf_quality_summary_v713,
     "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
@@ -13486,6 +13636,8 @@ def validate_runtime_architecture():
         errors.append("setup analytics report is missing")
     if not callable(globals().get("format_probability_calibration_report")):
         errors.append("probability calibration report is missing")
+    if not callable(globals().get("tf_quality_summary_v713")):
+        errors.append("timeframe quality summary is missing")
     if errors:
         raise RuntimeError("Runtime architecture validation failed: " + "; ".join(errors))
     return True

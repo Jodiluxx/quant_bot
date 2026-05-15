@@ -20,3 +20,7 @@ def format_setup_analytics_report(*args: Any, **kwargs: Any) -> Any:
 
 def format_probability_calibration_report(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_probability_calibration_report", *args, **kwargs)
+
+
+def tf_quality_summary(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("tf_quality_summary_v713", *args, **kwargs)
