@@ -79,6 +79,9 @@ signal-journal outcomes, grouped by probability bucket, timeframe and direction.
 Paper Trader uses a soft timeframe quality adjustment: weak timeframes receive a
 score penalty, but they are not fully banned.
 
+Paper Trader realism adds explicit slippage, 50% partial close on TP1, break-even
+SL for the remaining position, max-hold exits, and stale-signal exits.
+
 ## Trading note
 
 A working bot is not the same as a safe strategy. Before trading live, test on paper trading and check risk per trade, max drawdown, fees, slippage, and liquidation distance.

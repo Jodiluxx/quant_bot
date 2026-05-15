@@ -13484,6 +13484,373 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
+# ============================================================
+# v7.14 — PAPER TRADER REALISM V1
+# ============================================================
+# The simulator now models worse fills, partial TP1, break-even stop movement,
+# max holding time and stale-signal exits. This makes paper stats less pretty
+# and more useful.
+
+_base_paper_open_candidate_v713 = _paper_open_candidate
+_base_paper_close_position_v713 = _paper_close_position
+_base_paper_manage_open_positions_v713 = _paper_manage_open_positions
+
+PAPER_SLIPPAGE_BPS = 4.0
+PAPER_TP1_CLOSE_PCT = 50.0
+PAPER_BREAKEVEN_BUFFER_BPS = 0.0
+PAPER_STALE_MIN_CANDLES = 3
+PAPER_MAX_HOLD_MINUTES = {
+    "5m": 180,
+    "15m": 360,
+    "30m": 720,
+    "45m": 900,
+    "1h": 1440,
+}
+
+
+def _paper_interval_minutes_v714(interval):
+    return _paper_interval_minutes_v79(interval)
+
+
+def _paper_max_hold_minutes_v714(interval):
+    return int(PAPER_MAX_HOLD_MINUTES.get(str(interval), _paper_interval_minutes_v714(interval) * 24))
+
+
+def _paper_fill_price_v714(price, direction, action):
+    price = _safe_float(price, 0) or 0
+    slip = PAPER_SLIPPAGE_BPS / 10000.0
+    direction = str(direction or "").lower()
+    if action == "entry":
+        return price * (1 + slip) if direction == "long" else price * (1 - slip)
+    return price * (1 - slip) if direction == "long" else price * (1 + slip)
+
+
+def _paper_breakeven_sl_v714(entry, direction):
+    buffer = PAPER_BREAKEVEN_BUFFER_BPS / 10000.0
+    if str(direction).lower() == "long":
+        return entry * (1 + buffer)
+    return entry * (1 - buffer)
+
+
+def _paper_position_defaults_v714(pos):
+    notional = _safe_float(pos.get("notional"), 0) or 0
+    if not pos.get("original_notional"):
+        pos["original_notional"] = notional
+    if not pos.get("remaining_notional"):
+        pos["remaining_notional"] = notional
+    if "entry_fee_usd" not in pos:
+        pos["entry_fee_usd"] = notional * BACKTEST_FEE_RATE
+    if "partials" not in pos or not isinstance(pos.get("partials"), list):
+        pos["partials"] = []
+    pos.setdefault("tp1_done", False)
+    pos.setdefault("sl_original", pos.get("sl"))
+    pos.setdefault("sl_current", pos.get("sl"))
+    pos.setdefault("realism_version", "v7.14")
+    pos.setdefault("slippage_bps", PAPER_SLIPPAGE_BPS)
+    pos.setdefault("tp1_close_pct", PAPER_TP1_CLOSE_PCT)
+    pos.setdefault("max_hold_minutes", _paper_max_hold_minutes_v714(pos.get("interval")))
+    return pos
+
+
+def _paper_pnl_usd_v714(direction, entry, exit_price, notional):
+    pct = _paper_calc_pnl_pct(direction, entry, exit_price)
+    return notional * pct / 100.0
+
+
+def _paper_take_partial_tp1_v714(pos, market_price):
+    _paper_position_defaults_v714(pos)
+    if pos.get("tp1_done"):
+        return None
+    direction = pos.get("direction")
+    entry = _safe_float(pos.get("entry_price"), 0) or 0
+    remaining = _safe_float(pos.get("remaining_notional"), 0) or 0
+    original = _safe_float(pos.get("original_notional"), 0) or remaining
+    close_notional = min(remaining, original * PAPER_TP1_CLOSE_PCT / 100.0)
+    if entry <= 0 or close_notional <= 0:
+        return None
+    fill = _paper_fill_price_v714(market_price, direction, "exit")
+    pnl_usd = _paper_pnl_usd_v714(direction, entry, fill, close_notional)
+    exit_fee = close_notional * BACKTEST_FEE_RATE
+    net_usd = pnl_usd - exit_fee
+    partial = {
+        "type": "TP1_PARTIAL",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "exit_price": fill,
+        "market_price": market_price,
+        "notional": close_notional,
+        "pnl_usd": pnl_usd,
+        "fee_usd": exit_fee,
+        "net_usd": net_usd,
+        "close_pct": PAPER_TP1_CLOSE_PCT,
+    }
+    pos["partials"].append(partial)
+    pos["remaining_notional"] = max(0.0, remaining - close_notional)
+    pos["tp1_done"] = True
+    pos["tp1_hit_at"] = partial["ts"]
+    pos["sl_before_be"] = pos.get("sl")
+    pos["sl"] = _paper_breakeven_sl_v714(entry, direction)
+    pos["sl_current"] = pos["sl"]
+    pos["breakeven_active"] = True
+    pos["journal_note"] = (pos.get("journal_note") or pos.get("reason") or "") + " | TP1 partial taken, SL moved to BE"
+    return partial
+
+
+def _paper_close_position(pos_id, exit_price, reason):
+    _paper_load_state()
+    with _paper_lock:
+        pos = (_paper_state.get("positions") or {}).pop(pos_id, None)
+        if not pos:
+            _paper_save_state()
+            return None
+        _paper_position_defaults_v714(pos)
+        direction = pos.get("direction")
+        entry = _safe_float(pos.get("entry_price"), 0) or 0
+        original_notional = _safe_float(pos.get("original_notional"), 0) or (_safe_float(pos.get("notional"), 0) or 0)
+        remaining = _safe_float(pos.get("remaining_notional"), 0) or original_notional
+        partials = list(pos.get("partials") or [])
+        partial_pnl = sum(_safe_float(p.get("pnl_usd"), 0) or 0 for p in partials)
+        partial_fees = sum(_safe_float(p.get("fee_usd"), 0) or 0 for p in partials)
+        final_pnl = _paper_pnl_usd_v714(direction, entry, exit_price, remaining) if remaining > 0 else 0.0
+        final_exit_fee = remaining * BACKTEST_FEE_RATE
+        entry_fee = _safe_float(pos.get("entry_fee_usd"), 0) or original_notional * BACKTEST_FEE_RATE
+        pnl_usd = partial_pnl + final_pnl
+        fee_usd = entry_fee + partial_fees + final_exit_fee
+        net_usd = pnl_usd - fee_usd
+        pnl_pct = pnl_usd / max(original_notional, 0.0001) * 100
+        trade = dict(pos)
+        trade.update({
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "exit_price": exit_price,
+            "exit_reason": reason,
+            "pnl_pct": pnl_pct,
+            "pnl_usd": pnl_usd,
+            "fee_usd": fee_usd,
+            "entry_fee_usd": entry_fee,
+            "partial_fee_usd": partial_fees,
+            "final_exit_fee_usd": final_exit_fee,
+            "partial_pnl_usd": partial_pnl,
+            "final_pnl_usd": final_pnl,
+            "net_usd": net_usd,
+            "net_pct_balance": net_usd / max(_safe_float(pos.get("balance"), DEFAULT_BALANCE) or DEFAULT_BALANCE, 0.0001) * 100,
+            "remaining_notional": 0.0,
+            "closed_realism_version": "v7.14",
+        })
+        _paper_state.setdefault("trades", []).append(trade)
+        _paper_state["trades"] = _paper_state["trades"][-1000:]
+        _paper_save_state()
+        return trade
+
+
+def _paper_should_stale_exit_v714(pos):
+    opened = _parse_dt_v711(pos.get("opened_at"))
+    if not opened:
+        return False
+    hold_min = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+    min_hold = _paper_interval_minutes_v714(pos.get("interval")) * PAPER_STALE_MIN_CANDLES
+    if hold_min < max(min_hold, 15):
+        return False
+    try:
+        data = _full_analyze_for_scan_v74(pos.get("ticker"), pos.get("interval"))
+        direction = str(pos.get("direction") or "").lower()
+        new_direction = str(data.get("direction") or "").lower()
+        ep = data.get("entry_plan") or {}
+        if new_direction and direction and new_direction != direction and ep.get("status") == "ENTER_NOW":
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _paper_open_candidate(chat_id, candidate):
+    _paper_load_state()
+    data = candidate["data"]
+    ep = candidate["entry_plan"]
+    ticker = candidate["ticker"]
+    interval = candidate["interval"]
+    direction = candidate["direction"]
+    strategy = candidate.get("strategy")
+
+    bal, size_pct, lev, margin, notional = _paper_position_notional(chat_id)
+    market_entry = get_price(ticker)
+    entry = _paper_fill_price_v714(market_entry, direction, "entry")
+    sl = _safe_float(ep.get("sl"), None) or _safe_float((data.get("risk_levels") or {}).get("sl"), None)
+    tp1 = _safe_float(ep.get("tp1"), None) or _safe_float((data.get("risk_levels") or {}).get("tp1"), None)
+    tp2 = _safe_float(ep.get("tp2"), None) or _safe_float((data.get("risk_levels") or {}).get("tp2"), tp1)
+    if not sl or not tp1:
+        return None, "Нет SL/TP для paper-сделки."
+
+    risk_usd = abs(entry - sl) / entry * notional if entry > 0 else 0
+    risk_pct = risk_usd / bal * 100 if bal > 0 else 0
+    if risk_pct > RISK_MAX_SINGLE_TRADE_PCT:
+        return None, f"Paper-сделка заблокирована: риск {risk_pct:.2f}% выше лимита {RISK_MAX_SINGLE_TRADE_PCT:.2f}%."
+
+    opened_at = datetime.now(timezone.utc).isoformat()
+    setup_id, family_id, setup_slot = _paper_setup_ids_v79(chat_id=chat_id, candidate=candidate, value=opened_at)
+    pos_id = f"paper_{ticker}_{interval}_{direction}_{setup_slot}_{int(time.time() * 1000)}"
+    snapshot = _paper_decision_snapshot(candidate)
+
+    pos = {
+        "pos_id": pos_id,
+        "chat_id": _paper_chat_key(chat_id),
+        "ticker": ticker,
+        "interval": interval,
+        "direction": direction,
+        "strategy": strategy,
+        "entry_price": entry,
+        "entry_market_price": market_entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "balance": bal,
+        "size_pct": size_pct,
+        "leverage": lev,
+        "margin": margin,
+        "notional": notional,
+        "original_notional": notional,
+        "remaining_notional": notional,
+        "entry_fee_usd": notional * BACKTEST_FEE_RATE,
+        "risk_usd": risk_usd,
+        "risk_pct": risk_pct,
+        "opened_at": opened_at,
+        "reason": candidate.get("reason"),
+        "decision": snapshot,
+        "journal_note": _paper_journal_note(snapshot),
+        "selection_score": candidate.get("score"),
+        "setup_id": setup_id,
+        "setup_family_id": family_id,
+        "setup_slot": setup_slot,
+        "partials": [],
+        "tp1_done": False,
+        "sl_original": sl,
+        "sl_current": sl,
+        "slippage_bps": PAPER_SLIPPAGE_BPS,
+        "tp1_close_pct": PAPER_TP1_CLOSE_PCT,
+        "max_hold_minutes": _paper_max_hold_minutes_v714(interval),
+        "data_quality_version": "v7.14",
+        "realism_version": "v7.14",
+    }
+
+    with _paper_lock:
+        duplicate_reason = _paper_duplicate_reason_from_state_v79(pos["chat_id"], setup_id, family_id)
+        if duplicate_reason:
+            return None, "Paper-сделка не открыта: " + duplicate_reason + "."
+
+        _paper_state.setdefault("positions", {})[pos_id] = pos
+        _paper_state.setdefault("events", []).append({
+            "type": "paper_open",
+            "ts": opened_at,
+            "chat_id": pos["chat_id"],
+            "pos_id": pos_id,
+            "ticker": ticker,
+            "interval": interval,
+            "direction": direction,
+            "strategy": strategy,
+            "setup_id": setup_id,
+            "setup_family_id": family_id,
+            "setup_slot": setup_slot,
+            "entry_market_price": market_entry,
+            "entry_price": entry,
+            "slippage_bps": PAPER_SLIPPAGE_BPS,
+            "decision": snapshot,
+        })
+        _paper_state["events"] = _paper_state["events"][-1000:]
+        _paper_save_state()
+
+    return pos, None
+
+
+def _paper_manage_open_positions(chat_id):
+    closed = []
+    _paper_load_state()
+    for pos in list(_paper_positions(chat_id)):
+        try:
+            ticker = pos.get("ticker")
+            price = get_price(ticker)
+            direction = pos.get("direction")
+            sl = _safe_float(pos.get("sl"), 0) or 0
+            tp1 = _safe_float(pos.get("tp1"), 0) or 0
+            tp2 = _safe_float(pos.get("tp2"), tp1) or tp1
+            pos_id = pos.get("pos_id")
+            hit = None
+
+            if direction == "long":
+                if price <= sl:
+                    hit = "SL_BE" if pos.get("breakeven_active") else "SL"
+                elif pos.get("tp1_done") and tp2 and price >= tp2:
+                    hit = "TP2"
+                elif not pos.get("tp1_done") and price >= tp1:
+                    with _paper_lock:
+                        live = (_paper_state.get("positions") or {}).get(pos_id)
+                        if live is not None:
+                            partial = _paper_take_partial_tp1_v714(live, price)
+                            if partial:
+                                _paper_state.setdefault("events", []).append({
+                                    "type": "paper_partial_tp1",
+                                    "chat_id": live.get("chat_id"),
+                                    "pos_id": pos_id,
+                                    "ts": partial.get("ts"),
+                                    "ticker": ticker,
+                                    "interval": live.get("interval"),
+                                    "direction": direction,
+                                    "net_usd": partial.get("net_usd"),
+                                })
+                                _paper_state["events"] = _paper_state["events"][-1000:]
+                                _paper_save_state()
+                    continue
+            else:
+                if price >= sl:
+                    hit = "SL_BE" if pos.get("breakeven_active") else "SL"
+                elif pos.get("tp1_done") and tp2 and price <= tp2:
+                    hit = "TP2"
+                elif not pos.get("tp1_done") and price <= tp1:
+                    with _paper_lock:
+                        live = (_paper_state.get("positions") or {}).get(pos_id)
+                        if live is not None:
+                            partial = _paper_take_partial_tp1_v714(live, price)
+                            if partial:
+                                _paper_state.setdefault("events", []).append({
+                                    "type": "paper_partial_tp1",
+                                    "chat_id": live.get("chat_id"),
+                                    "pos_id": pos_id,
+                                    "ts": partial.get("ts"),
+                                    "ticker": ticker,
+                                    "interval": live.get("interval"),
+                                    "direction": direction,
+                                    "net_usd": partial.get("net_usd"),
+                                })
+                                _paper_state["events"] = _paper_state["events"][-1000:]
+                                _paper_save_state()
+                    continue
+
+            opened = _parse_dt_v711(pos.get("opened_at"))
+            hold_min = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0 if opened else 0
+            if not hit and hold_min >= _paper_max_hold_minutes_v714(pos.get("interval")):
+                hit = "MAX_HOLD"
+            if not hit and _paper_should_stale_exit_v714(pos):
+                hit = "STALE_SIGNAL"
+
+            if hit:
+                fill = _paper_fill_price_v714(price, direction, "exit")
+                trade = _paper_close_position(pos_id, fill, hit)
+                if trade:
+                    closed.append(trade)
+        except Exception as e:
+            print(f"  [paper_realism_v714] manage error: {e}")
+    return closed
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Slippage</b> — проскальзывание. Это разница между ценой, которую мы видим, и худшей ценой исполнения. В paper-режиме теперь входы и выходы чуть ухудшаются.
+
+<b>Partial TP1</b> — частичное закрытие на первой цели. Бот фиксирует 50% позиции на TP1, а оставшуюся часть ведёт дальше.
+
+<b>Break-even SL</b> — перенос stop loss к цене входа после TP1. Это снижает риск остатка позиции, но из-за комиссий и проскальзывания не гарантирует идеальный ноль.
+
+<b>Max hold</b> — максимальное время удержания paper-сделки. Если позиция слишком долго не доходит до целей, симулятор закрывает её как устаревшую.
+"""
+
+
 LEARN_TEXTS["learn_new_terms"] += """
 
 <b>Setup ID</b> — уникальный номер торговой идеи: актив, таймфрейм, направление, стратегия и свеча. Он нужен, чтобы бот не открыл одну и ту же paper-сделку два раза.
@@ -13494,7 +13861,7 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.13 Timeframe Quality Weighting"
+BOT_VERSION_LABEL = "v7.14 Paper Trader Realism"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -13534,6 +13901,7 @@ RUNTIME_LAYERS = [
     ("v7.11", "Setup analytics by ticker, timeframe, strategy, R, hold time and MFE/MAE"),
     ("v7.12", "Probability calibration by forecast bucket, timeframe and direction"),
     ("v7.13", "Paper Trader soft timeframe quality weighting from calibrated signal stats"),
+    ("v7.14", "Paper Trader realism: slippage, partial TP1, break-even SL, max hold and stale exits"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -13564,6 +13932,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "_bt_score_signal": _bt_score_signal,
     "build_auto_task_message": build_auto_task_message,
     "paper_trader_cycle": paper_trader_cycle,
+    "paper_manage_open_positions": _paper_manage_open_positions,
     "paper_select_trade_candidate": paper_select_trade_candidate,
     "paper_trader_scan_tickers": paper_trader_scan_tickers,
     "format_paper_report": format_paper_report,
@@ -13638,6 +14007,10 @@ def validate_runtime_architecture():
         errors.append("probability calibration report is missing")
     if not callable(globals().get("tf_quality_summary_v713")):
         errors.append("timeframe quality summary is missing")
+    if not callable(globals().get("_paper_take_partial_tp1_v714")):
+        errors.append("paper partial TP1 helper is missing")
+    if not callable(globals().get("_paper_manage_open_positions")):
+        errors.append("paper realism position manager is missing")
     if errors:
         raise RuntimeError("Runtime architecture validation failed: " + "; ".join(errors))
     return True
