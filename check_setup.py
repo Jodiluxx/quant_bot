@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 BOT_FILE = ROOT / "quant bot.py"
 RUNTIME_FILE = ROOT / "bot_runtime.py"
+PACKAGE_DIR = ROOT / "quant_bot"
 REQUIRED_MODULES = ["requests", "numpy", "scipy", "aiohttp", "asyncpg"]
 
 
@@ -27,6 +28,12 @@ def warn(msg: str) -> None:
 
 def fail(msg: str) -> None:
     print(f"[FAIL] {msg}")
+
+
+def package_python_files() -> list[Path]:
+    if not PACKAGE_DIR.exists():
+        return []
+    return sorted(PACKAGE_DIR.rglob("*.py"))
 
 
 def main() -> int:
@@ -60,6 +67,11 @@ def main() -> int:
             ok("bot_runtime.py syntax compiles")
         else:
             warn("bot_runtime.py is missing; direct legacy launch is still possible")
+        package_files = package_python_files()
+        for path in package_files:
+            py_compile.compile(str(path), doraise=True)
+        if package_files:
+            ok(f"quant_bot package syntax compiles ({len(package_files)} files)")
     except Exception as exc:
         fail(f"Syntax/import compile error: {exc}")
         return 1
@@ -71,12 +83,10 @@ def main() -> int:
         warn("TELEGRAM_BOT_TOKEN is not set; the bot will not start until you set it")
 
     try:
-        spec = importlib.util.spec_from_file_location("quant_bot_import_check", BOT_FILE)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("Could not create module spec")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        ok("quant bot.py imports without starting the bot")
+        from quant_bot.legacy import load_bot_module
+
+        module = load_bot_module(reload=True)
+        ok("quant_bot package imports quant bot.py without starting the bot")
         if hasattr(module, "validate_runtime_architecture"):
             module.validate_runtime_architecture()
             ok("Runtime architecture validates")

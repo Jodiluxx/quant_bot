@@ -1,22 +1,56 @@
 # Runtime Architecture
 
-`quant bot.py` is a legacy layered file. Several functions are intentionally redefined: each later layer wraps the previous active function and then becomes the new active runtime function.
+The project now has two levels:
 
-Current layer order:
+1. `quant_bot/` is the clean package facade. New code should import through
+   this package.
+2. `quant bot.py` is the legacy runtime. It still contains the current trading
+   logic and Telegram bot behavior.
 
-1. base: indicators, signal voting, sync Telegram fallback
-2. v5.6: signal journal, self-score, quality/risk blockers
-3. v5.7: SQLite state, candle cache, ensemble, portfolio analytics
-4. v5.8: async Telegram runtime, futures websocket, orderflow storage
-5. v5.9: organized Telegram UI and learning menus
-6. v6.0: entry timing / entry point engine
-7. v6.1: aligned auto scheduler, per-task auto jobs, 45m support
-8. v6.2: mark price, funding, open interest, futures volume context
-9. v6.3: event backtest metrics, R-multiples, fees, exposure and trade log
-10. v6.4: timestamped walk-forward train/test validation and MTF alignment
-11. v6.5: portfolio risk gate, daily limits, leverage and liquidation checks
+This is intentional. The bot already works, so the safe migration path is:
 
-The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the bottom of `quant bot.py`.
+1. Add stable module boundaries.
+2. Keep behavior unchanged.
+3. Move real implementations out of `quant bot.py` one area at a time.
+4. Run setup checks after every move.
+
+## Package map
+
+```text
+quant_bot/
+  __main__.py              python -m quant_bot entrypoint
+  runtime.py               application entrypoint
+  legacy.py                only module that imports quant bot.py
+  paths.py                 project paths
+  config.py                safe config helpers
+  adapters/
+    market_data.py         candles, price, futures context
+    signals.py             signal engine and message formatting
+    risk.py                entry plan and risk manager
+    paper.py               Paper Trader and journal report
+    backtesting.py         backtest and walk-forward optimization
+    telegram_app.py        Telegram UI, keyboards and async handlers
+```
+
+## Legacy layer order
+
+`quant bot.py` is still a layered file. Several functions are intentionally
+redefined: each later layer wraps the previous active function and then becomes
+the new active runtime function.
+
+Current active runtime is `v7.8.4 Autobot No Schedule Text`.
+
+Layer summary:
+
+1. base: core indicators, signal voting, sync Telegram fallback
+2. v5.6-v5.9: journal, SQLite, async runtime, organized UI and learning menus
+3. v6.0-v6.5: entry timing, scheduler, futures context, backtest, WFO, risk gate
+4. v6.6-v6.9: compact cards, signal submenu, futures aliases, backtest tuning
+5. v7.0-v7.4: Paper Trader, all-asset scanner, Autobot menu, responsiveness
+6. v7.5-v7.8.4: reliable reports, clean journal, autostart tasks, sorted Autobot
+
+The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
+bottom of `quant bot.py`.
 
 Use this to check the architecture without starting the bot:
 
@@ -32,4 +66,13 @@ cd "D:\Trading project"
 .\run_bot.bat
 ```
 
-Do not delete earlier duplicate-looking functions until their wrapper chain has been folded into the final active implementation. Some older definitions are still used through `_base_*` references.
+Optional direct package launch:
+
+```powershell
+cd "D:\Trading project"
+python -m quant_bot
+```
+
+Do not delete earlier duplicate-looking functions until their wrapper chain has
+been folded into the final active implementation. Some older definitions are
+still used through `_base_*` references.

@@ -40,12 +40,27 @@ set TELEGRAM_BOT_TOKEN=123456:ABC...
 
 ## 4. Start the bot
 
-The launcher starts `bot_runtime.py`, which imports the legacy `quant bot.py` and validates the active runtime before Telegram polling starts.
+The launcher starts `bot_runtime.py`. That entrypoint goes through the
+`quant_bot` package facade, which imports the legacy `quant bot.py` and
+validates the active runtime before Telegram polling starts.
 
 ```powershell
 cd "D:\Trading project"
 .\run_bot.bat
 ```
+
+Optional direct package launch:
+
+```powershell
+cd "D:\Trading project"
+python -m quant_bot
+```
+
+## 5. Architecture note
+
+New code should be added to the `quant_bot/` package. The big `quant bot.py`
+file is still the live legacy runtime, but it now has adapter modules around it:
+market data, signals, risk, Paper Trader, backtesting, and Telegram UI.
 
 ## Trading note
 
