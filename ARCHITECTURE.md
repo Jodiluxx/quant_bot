@@ -39,7 +39,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.11 Setup Performance Analytics`.
+Current active runtime is `v7.12 Probability Calibration`.
 
 Layer summary:
 
@@ -52,6 +52,7 @@ Layer summary:
 7. v7.9: Paper Trader setup IDs, duplicate guard, independent setup statistics
 8. v7.10: bot quality report, profit factor, average R, signal diagnostics
 9. v7.11: setup analytics by ticker, timeframe, strategy, hold time, MFE/MAE
+10. v7.12: probability calibration by forecast bucket, timeframe and direction
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

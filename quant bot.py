@@ -13100,6 +13100,242 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
+# ============================================================
+# v7.12 — PROBABILITY CALIBRATION
+# ============================================================
+# Calibration checks whether stated probabilities match realised outcomes.
+# If the bot says 70%, a large sample of similar signals should win near 70%.
+
+_base_autobot_keyboard_v711 = autobot_keyboard
+_base_async_handle_update_v711 = async_handle_update
+
+
+def _prob_value_v712(value):
+    try:
+        p = float(value)
+    except Exception:
+        return None
+    if p > 1.0:
+        p /= 100.0
+    if p < 0 or p > 1:
+        return None
+    return p
+
+
+def _prob_bucket_v712(prob, step=5):
+    pct = prob * 100
+    lo = int(pct // step) * step
+    hi = lo + step
+    return f"{lo}-{hi}%"
+
+
+def _prob_records_v712(horizon="12b"):
+    rows = []
+    try:
+        journal = list(_load_signal_journal())
+    except Exception:
+        journal = []
+    for rec in journal:
+        if not isinstance(rec, dict):
+            continue
+        p = _prob_value_v712(rec.get("prob"))
+        ev = (rec.get("evaluations") or {}).get(horizon) or {}
+        outcome = ev.get("outcome")
+        if p is None or outcome not in {"win", "loss", "neutral"}:
+            continue
+        rows.append({
+            "prob": p,
+            "bucket": _prob_bucket_v712(p),
+            "ticker": rec.get("ticker"),
+            "interval": rec.get("interval"),
+            "direction": rec.get("direction"),
+            "confidence": int(rec.get("confidence") or 0),
+            "outcome": outcome,
+        })
+    return rows
+
+
+def _calibration_stats_v712(rows):
+    binary = [r for r in rows if r["outcome"] in {"win", "loss"}]
+    if not binary:
+        return {
+            "n": len(rows), "binary_n": 0, "neutral": len(rows), "avg_prob": None,
+            "actual_wr": None, "gap": None, "brier": None, "ece": None,
+        }
+    avg_prob = sum(r["prob"] for r in binary) / len(binary)
+    actual_wr = sum(1 for r in binary if r["outcome"] == "win") / len(binary)
+    brier = sum((r["prob"] - (1.0 if r["outcome"] == "win" else 0.0)) ** 2 for r in binary) / len(binary)
+    return {
+        "n": len(rows),
+        "binary_n": len(binary),
+        "neutral": len(rows) - len(binary),
+        "avg_prob": avg_prob,
+        "actual_wr": actual_wr,
+        "gap": actual_wr - avg_prob,
+        "brier": brier,
+        "ece": None,
+    }
+
+
+def _calibration_group_v712(rows, key_fn, min_n=20):
+    groups = {}
+    for row in rows:
+        groups.setdefault(str(key_fn(row) or "unknown"), []).append(row)
+    out = []
+    total_binary = sum(1 for r in rows if r["outcome"] in {"win", "loss"})
+    weighted_abs_gap = 0.0
+    for key, items in groups.items():
+        stats = _calibration_stats_v712(items)
+        if stats["binary_n"] < min_n:
+            continue
+        weighted_abs_gap += abs(stats["gap"] or 0) * stats["binary_n"]
+        out.append((key, stats))
+    ece = weighted_abs_gap / total_binary if total_binary else None
+    out.sort(key=lambda item: item[0])
+    return out, ece
+
+
+def _calibration_line_v712(name, stats):
+    avg = "n/a" if stats["avg_prob"] is None else _fmt_pct_v710(stats["avg_prob"] * 100)
+    actual = "n/a" if stats["actual_wr"] is None else _fmt_pct_v710(stats["actual_wr"] * 100)
+    gap = "n/a" if stats["gap"] is None else f"{stats['gap'] * 100:+.1f} pp"
+    return f"• {name}: n={stats['binary_n']} | bot {avg} | факт {actual} | gap {gap}"
+
+
+def _calibration_verdict_v712(overall, ece):
+    n = overall.get("binary_n", 0)
+    if n < 100:
+        return "Выборка мала: проценты пока нельзя считать надёжными."
+    if ece is None:
+        return "Недостаточно групп для ECE."
+    if ece <= 0.05:
+        return "Калибровка нормальная: вероятности близки к факту."
+    if ece <= 0.10:
+        return "Калибровка средняя: проценты полезны как ориентир, но не как точная вероятность."
+    return "Калибровка слабая: бот заметно переоценивает или недооценивает вероятность."
+
+
+def _calibration_recommendations_v712(bucket_rows, interval_rows, overall):
+    recs = []
+    overconfident = [x for x in bucket_rows if (x[1]["gap"] is not None and x[1]["gap"] < -0.08)]
+    underconfident = [x for x in bucket_rows if (x[1]["gap"] is not None and x[1]["gap"] > 0.08)]
+    if overconfident:
+        recs.append("уменьшить доверие к бакетам: " + ", ".join(x[0] for x in overconfident[:3]))
+    if underconfident:
+        recs.append("проверить недооценённые бакеты: " + ", ".join(x[0] for x in underconfident[:3]))
+    weak_tf = [x for x in interval_rows if (x[1]["gap"] is not None and x[1]["gap"] < -0.08)]
+    if weak_tf:
+        recs.append("по TF бот переоценивает: " + ", ".join(f"{x[0]} gap {x[1]['gap']*100:+.0f}pp" for x in weak_tf[:3]))
+    if overall.get("binary_n", 0) < 300:
+        recs.append("не менять формулу вероятности резко: нужно 300+ бинарных исходов")
+    if not recs:
+        recs.append("пока использовать вероятность как фильтр, но риск держать фиксированным")
+    return recs[:5]
+
+
+def format_probability_calibration_report(chat_id=None):
+    rows = _prob_records_v712("12b")
+    overall = _calibration_stats_v712(rows)
+    bucket_rows, ece_bucket = _calibration_group_v712(rows, lambda r: r["bucket"], min_n=20)
+    interval_rows, _ = _calibration_group_v712(rows, lambda r: r["interval"], min_n=30)
+    direction_rows, _ = _calibration_group_v712(rows, lambda r: r["direction"], min_n=30)
+    overall["ece"] = ece_bucket
+
+    brier = "n/a" if overall["brier"] is None else f"{overall['brier']:.3f}"
+    ece = "n/a" if ece_bucket is None else f"{ece_bucket * 100:.1f} pp"
+    avg = "n/a" if overall["avg_prob"] is None else _fmt_pct_v710(overall["avg_prob"] * 100)
+    actual = "n/a" if overall["actual_wr"] is None else _fmt_pct_v710(overall["actual_wr"] * 100)
+    gap = "n/a" if overall["gap"] is None else f"{overall['gap'] * 100:+.1f} pp"
+
+    lines = [
+        "🎯 <b>Проверка вероятностей</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "<b>1. Общая калибровка</b>",
+        f"Горизонт: 12 свечей",
+        f"Сигналов: {overall['n']} | win/loss: {overall['binary_n']} | neutral: {overall['neutral']}",
+        f"Средняя вероятность бота: {avg}",
+        f"Фактический winrate: {actual}",
+        f"Gap факт - бот: {gap}",
+        f"Brier score: {brier} | ECE: {ece}",
+        _calibration_verdict_v712(overall, ece_bucket),
+    ]
+
+    lines += ["", "<b>2. По probability bucket</b>"]
+    if bucket_rows:
+        for name, stats in bucket_rows:
+            lines.append(_calibration_line_v712(name, stats))
+    else:
+        lines.append("Пока мало данных по бакетам.")
+
+    lines += ["", "<b>3. По таймфреймам</b>"]
+    if interval_rows:
+        for name, stats in sorted(interval_rows, key=lambda x: x[1]["gap"] if x[1]["gap"] is not None else 0)[:6]:
+            lines.append(_calibration_line_v712(name, stats))
+    else:
+        lines.append("Пока мало данных по TF.")
+
+    lines += ["", "<b>4. По направлению</b>"]
+    if direction_rows:
+        for name, stats in direction_rows:
+            lines.append(_calibration_line_v712(name, stats))
+    else:
+        lines.append("Пока мало данных по направлению.")
+
+    lines += ["", "<b>5. Что делать дальше</b>"]
+    for rec in _calibration_recommendations_v712(bucket_rows, interval_rows, overall):
+        lines.append("• " + rec)
+    lines.append("")
+    lines.append("Важно: калибровка не говорит, куда войти. Она говорит, насколько честно бот оценивает свою уверенность.")
+    return "\n".join(lines)
+
+
+def probability_calibration_keyboard_v712():
+    return {"inline_keyboard": [
+        [{"text": "◀️ Назад", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def autobot_keyboard(chat_id):
+    kb = _base_autobot_keyboard_v711(chat_id)
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [{"text": "🎯 Проверка вероятностей", "callback_data": "prob_calibration"}])
+    return {"inline_keyboard": rows}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data == "prob_calibration":
+                await async_answer_callback(session, callback_id, "Вероятности")
+                msg = await asyncio.to_thread(format_probability_calibration_report, chat_id)
+                await async_send_plain_v76(session, chat_id, msg, probability_calibration_keyboard_v712())
+                return
+        await _base_async_handle_update_v711(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v712] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Probability bucket</b> — группа сигналов с похожей заявленной вероятностью, например 65-70%. По bucket видно, насколько бот честен в своих процентах.
+
+<b>Brier score</b> — ошибка вероятностного прогноза. Чем ниже, тем лучше. Он штрафует уверенные, но неправильные вероятности.
+
+<b>ECE</b> — expected calibration error: средняя разница между заявленной вероятностью и фактическим winrate по группам.
+"""
+
+
 LEARN_TEXTS["learn_new_terms"] += """
 
 <b>Setup ID</b> — уникальный номер торговой идеи: актив, таймфрейм, направление, стратегия и свеча. Он нужен, чтобы бот не открыл одну и ту же paper-сделку два раза.
@@ -13110,7 +13346,7 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.11 Setup Performance Analytics"
+BOT_VERSION_LABEL = "v7.12 Probability Calibration"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -13148,6 +13384,7 @@ RUNTIME_LAYERS = [
     ("v7.9", "Paper Trader setup_id, duplicate guard and independent setup data quality summary"),
     ("v7.10", "Bot quality report with paper expectancy, profit factor and signal journal diagnostics"),
     ("v7.11", "Setup analytics by ticker, timeframe, strategy, R, hold time and MFE/MAE"),
+    ("v7.12", "Probability calibration by forecast bucket, timeframe and direction"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -13184,6 +13421,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "paper_data_quality_summary": paper_data_quality_summary,
     "format_bot_quality_report": format_bot_quality_report,
     "format_setup_analytics_report": format_setup_analytics_report,
+    "format_probability_calibration_report": format_probability_calibration_report,
     "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
@@ -13246,6 +13484,8 @@ def validate_runtime_architecture():
         errors.append("bot quality report is missing")
     if not callable(globals().get("format_setup_analytics_report")):
         errors.append("setup analytics report is missing")
+    if not callable(globals().get("format_probability_calibration_report")):
+        errors.append("probability calibration report is missing")
     if errors:
         raise RuntimeError("Runtime architecture validation failed: " + "; ".join(errors))
     return True

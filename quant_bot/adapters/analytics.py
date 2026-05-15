@@ -16,3 +16,7 @@ def format_bot_quality_report(*args: Any, **kwargs: Any) -> Any:
 
 def format_setup_analytics_report(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_setup_analytics_report", *args, **kwargs)
+
+
+def format_probability_calibration_report(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("format_probability_calibration_report", *args, **kwargs)
