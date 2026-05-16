@@ -13919,6 +13919,7 @@ def execution_mode():
         "testnet_rest": BINANCE_FUTURES_TESTNET_REST,
         "testnet_keys_present": bool(key and secret),
         "testnet_submit_requested": _env_bool_v715("BINANCE_TESTNET_ORDER_SUBMIT", False),
+        "testnet_real_submit_requested": _env_bool_v715("BINANCE_TESTNET_REAL_ORDER_SUBMIT", False),
         "message": "v7.19 строит ордер-планы; Testnet /order/test включается только отдельным флагом.",
     }
 
@@ -15985,7 +15986,14 @@ def _testnet_status_word_v721(event):
 def _testnet_event_line_v721(event):
     req = event.get("request") or {}
     status = _testnet_status_word_v721(event)
-    kind = "ENTRY" if event.get("kind") == "entry" else "PROTECT"
+    kind = {
+        "entry": "ENTRY",
+        "protection": "PROTECT",
+        "real_leverage": "REAL LEVERAGE",
+        "real_entry": "REAL ENTRY",
+        "real_protection": "REAL PROTECT",
+        "real_emergency_close": "EMERGENCY CLOSE",
+    }.get(event.get("kind"), str(event.get("kind") or "EVENT").upper())
     qty = req.get("quantity")
     side = req.get("side")
     typ = req.get("type")
@@ -17346,7 +17354,438 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.28 Telegram UI Polish Phase 1"
+# ============================================================
+# v7.29 - REAL BINANCE FUTURES TESTNET ORDERS + CLEAN JOURNALS
+# ============================================================
+# Testnet-only execution. Mainnet/live remains blocked. Real testnet orders
+# require explicit env flags and successful /order/test validation.
+
+_base_paper_open_candidate_v728 = _paper_open_candidate
+_base_format_execution_status_v728 = format_execution_status
+_base_format_testnet_status_v728 = format_testnet_status
+
+TESTNET_ORDER_REAL_PATH = "/fapi/v1/order"
+TESTNET_LEVERAGE_PATH = "/fapi/v1/leverage"
+TESTNET_REAL_EVENTS_FILE_KIND = "testnet_real_order"
+JOURNAL_RESET_FILES = (
+    "paper_trader_state.json",
+    "execution_gateway_state.json",
+    "testnet_journal.json",
+)
+
+
+def _testnet_real_submit_enabled_v729():
+    return _env_bool_v715("BINANCE_TESTNET_REAL_ORDER_SUBMIT", False)
+
+
+def _testnet_real_guard_v729(plan, validation=None):
+    mode = execution_mode()
+    blockers = []
+    if mode.get("mode") != "testnet":
+        blockers.append("BOT_EXECUTION_MODE должен быть testnet")
+    if not mode.get("testnet_keys_present"):
+        blockers.append("Binance Futures Testnet API key/secret не заданы")
+    if not _testnet_submit_enabled_v719():
+        blockers.append("BINANCE_TESTNET_ORDER_SUBMIT=1 нужен для обязательной /order/test проверки")
+    if not _testnet_real_submit_enabled_v729():
+        blockers.append("BINANCE_TESTNET_REAL_ORDER_SUBMIT=1 не включён")
+    if plan.get("blockers"):
+        blockers.append("ордер-план заблокирован risk/safety")
+    validation = validation or {}
+    if validation and not validation.get("entry_test_ok"):
+        blockers.append("entry /order/test не прошёл; real testnet entry заблокирован")
+    if validation and not validation.get("protection_test_ok"):
+        blockers.append("protection /order/test не прошёл; real testnet entry заблокирован")
+    return blockers
+
+
+def _testnet_real_validation_from_position_v729(pos):
+    entry = pos.get("testnet_order_test") or {}
+    protection = pos.get("testnet_protection_order_tests") or {}
+    return {
+        "entry_test_ok": bool(entry.get("ok")),
+        "protection_test_ok": bool(protection.get("ok")),
+        "entry_reason": entry.get("reason"),
+        "protection_reason": protection.get("reason"),
+    }
+
+
+def _testnet_set_leverage_params_v729(plan):
+    leverage = int((plan.get("entry_order") or {}).get("leverage") or DEFAULT_LEVERAGE)
+    leverage = max(1, min(125, leverage))
+    return {
+        "symbol": plan.get("api_symbol") or plan.get("ticker"),
+        "leverage": leverage,
+    }
+
+
+def submit_testnet_set_leverage(plan):
+    plan = plan or {}
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "endpoint": TESTNET_LEVERAGE_PATH,
+        "submitted": False,
+        "ok": False,
+    }
+    blockers = _testnet_real_guard_v729(plan, {"entry_test_ok": True, "protection_test_ok": True})
+    if blockers:
+        result["skipped"] = True
+        result["reason"] = "; ".join(blockers[:3])
+        return result
+    params = _testnet_set_leverage_params_v729(plan)
+    result["request"] = dict(params)
+    response = _testnet_post_signed_v719(TESTNET_LEVERAGE_PATH, params)
+    result.update({
+        "submitted": not response.get("skipped", False),
+        "ok": bool(response.get("ok")),
+        "status_code": response.get("status_code"),
+        "response": response.get("payload"),
+        "headers": response.get("headers"),
+        "error": response.get("error"),
+        "reason": response.get("reason"),
+    })
+    return result
+
+
+def _entry_order_real_params_v729(plan):
+    params = _entry_order_test_params_v719(plan)
+    params["newClientOrderId"] = ("real_" + str(params.get("newClientOrderId") or ""))[-36:]
+    return params
+
+
+def submit_testnet_real_entry_order(plan, validation=None):
+    plan = plan or {}
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "mode": execution_mode().get("mode"),
+        "endpoint": TESTNET_ORDER_REAL_PATH,
+        "kind": "real_entry",
+        "submitted": False,
+        "ok": False,
+    }
+    blockers = _testnet_real_guard_v729(plan, validation)
+    if blockers:
+        result["skipped"] = True
+        result["reason"] = "; ".join(blockers[:5])
+        result["blockers"] = blockers
+        return result
+    qty = _safe_float((plan.get("entry_order") or {}).get("quantity_est"), 0) or 0
+    if qty <= 0:
+        result["skipped"] = True
+        result["reason"] = "quantity_est <= 0"
+        return result
+    params = _entry_order_real_params_v729(plan)
+    result["request"] = {
+        "symbol": params.get("symbol"),
+        "side": params.get("side"),
+        "type": params.get("type"),
+        "quantity": params.get("quantity"),
+        "newClientOrderId": params.get("newClientOrderId"),
+    }
+    response = _testnet_post_signed_v719(TESTNET_ORDER_REAL_PATH, params)
+    result.update({
+        "submitted": not response.get("skipped", False),
+        "ok": bool(response.get("ok")),
+        "status_code": response.get("status_code"),
+        "response": response.get("payload"),
+        "headers": response.get("headers"),
+        "error": response.get("error"),
+        "reason": response.get("reason"),
+    })
+    return result
+
+
+def _real_protection_client_id_v729(plan_id, label):
+    raw = f"real_{label}_{str(plan_id or 'plan').replace(':', '_')}"
+    return raw[-36:]
+
+
+def _real_protection_order_params_v729(plan):
+    params_list, geometry = build_testnet_protection_order_tests(plan)
+    out = []
+    for item in params_list:
+        params = dict(item)
+        label = params.pop("label", None)
+        params["newClientOrderId"] = _real_protection_client_id_v729(plan.get("plan_id"), label)
+        out.append((label, params))
+    return out, geometry
+
+
+def submit_testnet_real_protection_orders(plan, entry_result=None):
+    plan = plan or {}
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "mode": execution_mode().get("mode"),
+        "endpoint": TESTNET_ORDER_REAL_PATH,
+        "kind": "real_protection",
+        "submitted": False,
+        "ok": False,
+        "orders": [],
+    }
+    if entry_result and not entry_result.get("ok"):
+        result["skipped"] = True
+        result["reason"] = "entry order не принят; protective orders не отправляются"
+        return result
+    blockers = _testnet_real_guard_v729(plan, {"entry_test_ok": True, "protection_test_ok": True})
+    if blockers:
+        result["skipped"] = True
+        result["reason"] = "; ".join(blockers[:5])
+        result["blockers"] = blockers
+        return result
+    params_list, geometry = _real_protection_order_params_v729(plan)
+    result["geometry"] = geometry
+    if not geometry.get("ok"):
+        result["skipped"] = True
+        result["reason"] = "SL/TP geometry invalid"
+        return result
+    for label, params in params_list:
+        response = _testnet_post_signed_v719(TESTNET_ORDER_REAL_PATH, params)
+        item = {
+            "label": label,
+            "submitted": not response.get("skipped", False),
+            "ok": bool(response.get("ok")),
+            "status_code": response.get("status_code"),
+            "reason": response.get("reason") or response.get("error"),
+            "request": {
+                "symbol": params.get("symbol"),
+                "side": params.get("side"),
+                "type": params.get("type"),
+                "quantity": params.get("quantity"),
+                "stopPrice": params.get("stopPrice"),
+                "reduceOnly": params.get("reduceOnly"),
+            },
+            "response": response.get("payload"),
+        }
+        result["orders"].append(item)
+    result["submitted"] = any(x.get("submitted") for x in result["orders"])
+    result["ok"] = bool(result["orders"]) and all(x.get("ok") for x in result["orders"])
+    if not result["ok"]:
+        result["reason"] = next((x.get("reason") for x in result["orders"] if x.get("reason")), "protective order rejected")
+    return result
+
+
+def submit_testnet_emergency_close_order(plan, reason="protection_failed"):
+    plan = plan or {}
+    order = plan.get("entry_order") or {}
+    close_side = "SELL" if str(plan.get("direction")).lower() == "long" else "BUY"
+    params = {
+        "symbol": plan.get("api_symbol") or plan.get("ticker"),
+        "side": close_side,
+        "type": "MARKET",
+        "quantity": _format_decimal_v719(order.get("quantity_est"), 8),
+        "reduceOnly": "true",
+        "newClientOrderId": ("emergency_" + str(plan.get("plan_id") or "").replace(":", "_"))[-36:],
+        "newOrderRespType": "ACK",
+    }
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "mode": execution_mode().get("mode"),
+        "endpoint": TESTNET_ORDER_REAL_PATH,
+        "kind": "real_emergency_close",
+        "submitted": False,
+        "ok": False,
+        "reason": reason,
+        "request": {k: params.get(k) for k in ("symbol", "side", "type", "quantity", "reduceOnly", "newClientOrderId")},
+    }
+    blockers = _testnet_real_guard_v729(plan, {"entry_test_ok": True, "protection_test_ok": True})
+    if blockers:
+        result["skipped"] = True
+        result["reason"] = "; ".join(blockers[:5])
+        return result
+    response = _testnet_post_signed_v719(TESTNET_ORDER_REAL_PATH, params)
+    result.update({
+        "submitted": not response.get("skipped", False),
+        "ok": bool(response.get("ok")),
+        "status_code": response.get("status_code"),
+        "response": response.get("payload"),
+        "headers": response.get("headers"),
+        "error": response.get("error"),
+    })
+    return result
+
+
+def _record_testnet_real_order_result_v729(kind, plan, result):
+    plan = plan or {}
+    result = result or {}
+    with _execution_lock_v715:
+        state = _execution_load_state_v715()
+        state.setdefault("events", []).append({
+            "type": TESTNET_REAL_EVENTS_FILE_KIND,
+            "kind": kind,
+            "ts": result.get("ts"),
+            "chat_id": plan.get("chat_id"),
+            "plan_id": plan.get("plan_id"),
+            "ticker": plan.get("ticker"),
+            "interval": plan.get("interval"),
+            "direction": plan.get("direction"),
+            "submitted": result.get("submitted"),
+            "ok": result.get("ok"),
+            "status_code": result.get("status_code"),
+            "reason": result.get("reason") or result.get("error"),
+            "request": result.get("request"),
+            "response": result.get("response"),
+            "orders": result.get("orders"),
+        })
+        _execution_save_state_v715(state)
+    try:
+        _testnet_journal_record_v721(kind, plan, result)
+    except Exception as e:
+        print(f"  [testnet_real_v729] journal record error: {e}")
+    return result
+
+
+def _recent_testnet_real_events_v729(chat_id=None, limit=6):
+    events = [
+        e for e in (_execution_load_state_v715().get("events") or [])
+        if e.get("type") == TESTNET_REAL_EVENTS_FILE_KIND
+    ]
+    if chat_id is not None:
+        key = _paper_chat_key(chat_id)
+        events = [e for e in events if str(e.get("chat_id")) == key]
+    events.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    return events[: int(limit)]
+
+
+def _paper_open_candidate(chat_id, candidate):
+    pos, err = _base_paper_open_candidate_v728(chat_id, candidate)
+    if err or not pos:
+        return pos, err
+    try:
+        plan = build_execution_order_plan(chat_id, candidate, position=pos, already_opened=True)
+        validation = _testnet_real_validation_from_position_v729(pos)
+        leverage_result = submit_testnet_set_leverage(plan)
+        _record_testnet_real_order_result_v729("real_leverage", plan, leverage_result)
+        entry_result = submit_testnet_real_entry_order(plan, validation)
+        _record_testnet_real_order_result_v729("real_entry", plan, entry_result)
+        protection_result = None
+        emergency_result = None
+        if entry_result.get("ok"):
+            protection_result = submit_testnet_real_protection_orders(plan, entry_result)
+            _record_testnet_real_order_result_v729("real_protection", plan, protection_result)
+            if not protection_result.get("ok"):
+                emergency_result = submit_testnet_emergency_close_order(plan, "protection_failed_after_entry")
+                _record_testnet_real_order_result_v729("real_emergency_close", plan, emergency_result)
+        with _paper_lock:
+            live = (_paper_state.get("positions") or {}).get(pos.get("pos_id"))
+            if live is not None:
+                live["testnet_real_order"] = {
+                    "ts": entry_result.get("ts"),
+                    "enabled": _testnet_real_submit_enabled_v729(),
+                    "validation": validation,
+                    "leverage": {
+                        "submitted": leverage_result.get("submitted"),
+                        "ok": leverage_result.get("ok"),
+                        "reason": leverage_result.get("reason") or leverage_result.get("error"),
+                    },
+                    "entry": {
+                        "submitted": entry_result.get("submitted"),
+                        "ok": entry_result.get("ok"),
+                        "status_code": entry_result.get("status_code"),
+                        "reason": entry_result.get("reason") or entry_result.get("error"),
+                    },
+                    "protection": {
+                        "submitted": (protection_result or {}).get("submitted"),
+                        "ok": (protection_result or {}).get("ok"),
+                        "reason": (protection_result or {}).get("reason") or (protection_result or {}).get("error"),
+                    },
+                    "emergency_close": {
+                        "submitted": (emergency_result or {}).get("submitted"),
+                        "ok": (emergency_result or {}).get("ok"),
+                        "reason": (emergency_result or {}).get("reason") or (emergency_result or {}).get("error"),
+                    } if emergency_result else None,
+                }
+                pos.update(live)
+                _paper_save_state()
+    except Exception as e:
+        print(f"  [testnet_real_v729] real submit hook error: {e}")
+    return pos, None
+
+
+def format_testnet_status(chat_id):
+    text = _base_format_testnet_status_v728(chat_id)
+    info = execution_mode()
+    events = _recent_testnet_real_events_v729(chat_id, 4)
+    lines = [
+        text,
+        "",
+        "Real Testnet v7.29:",
+        f"• real submit flag: {'ON' if _testnet_real_submit_enabled_v729() else 'OFF'}",
+        f"• mode: {str(info.get('mode')).upper()} | keys: {'есть' if info.get('testnet_keys_present') else 'нет'}",
+        "• endpoint: POST /fapi/v1/order",
+        "• mainnet/live: заблокирован",
+    ]
+    if events:
+        lines += ["", "Последние real testnet события:"]
+        for event in events:
+            status = "OK" if event.get("ok") else ("SKIP" if not event.get("submitted") else "FAIL")
+            req = event.get("request") or {}
+            lines.append(
+                f"• {_fmt_dt_short(event.get('ts'))} | {event.get('kind')} | {event.get('ticker')} "
+                f"{event.get('direction')} | {status} | {req.get('type')} {req.get('side')}"
+            )
+            if event.get("reason"):
+                lines.append(f"  причина: {event.get('reason')}")
+    else:
+        lines.append("Реальных testnet order-событий пока нет.")
+    return "\n".join(lines)
+
+
+def format_execution_status(chat_id):
+    text = _base_format_execution_status_v728(chat_id)
+    info = execution_mode()
+    events = _recent_testnet_real_events_v729(chat_id, 1)
+    status = "нет"
+    if events:
+        last = events[0]
+        status = "OK" if last.get("ok") else ("SKIP" if not last.get("submitted") else "FAIL")
+    return "\n".join([
+        text,
+        "",
+        "Real Testnet v7.29:",
+        f"• real submit {'ON' if _testnet_real_submit_enabled_v729() else 'OFF'} | mode {str(info.get('mode')).upper()} | last {status}",
+    ])
+
+
+def reset_demo_journals(reason="clean_testnet_start"):
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_dir = os.path.join(os.getcwd(), "journal_backups", ts)
+    os.makedirs(backup_dir, exist_ok=True)
+    backed_up = []
+    for name in JOURNAL_RESET_FILES:
+        src = os.path.abspath(name)
+        if os.path.exists(src):
+            import shutil
+            dst = os.path.join(backup_dir, os.path.basename(name))
+            shutil.copy2(src, dst)
+            backed_up.append(dst)
+    reset_at = datetime.now(timezone.utc).isoformat()
+    with open("paper_trader_state.json", "w", encoding="utf-8") as f:
+        json.dump({"positions": {}, "trades": [], "events": [], "reset_at": reset_at, "reset_reason": reason}, f, indent=2, ensure_ascii=False)
+    with open("execution_gateway_state.json", "w", encoding="utf-8") as f:
+        json.dump({"plans": [], "events": [], "reset_at": reset_at, "reset_reason": reason}, f, indent=2, ensure_ascii=False)
+    with open("testnet_journal.json", "w", encoding="utf-8") as f:
+        json.dump({"events": [], "reset_at": reset_at, "reset_reason": reason}, f, indent=2, ensure_ascii=False)
+    try:
+        global _paper_state
+        _paper_state = {"positions": {}, "trades": [], "events": [], "reset_at": reset_at, "reset_reason": reason}
+    except Exception:
+        pass
+    return {"reset_at": reset_at, "backup_dir": backup_dir, "backed_up": backed_up}
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Real Testnet order</b> — настоящий ордер в Binance Futures Testnet. Это демо-среда Binance, не mainnet. Включается только через отдельный локальный флаг и Testnet API keys.
+
+<b>Emergency close</b> — аварийная попытка закрыть testnet-позицию, если вход прошёл, а защитные SL/TP не выставились.
+"""
+
+
+BOT_VERSION_LABEL = "v7.29 Real Testnet Orders + Clean Journals"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -17401,6 +17840,7 @@ RUNTIME_LAYERS = [
     ("v7.26", "Paper Trader engine math extracted for fills, TP1, BE and exits"),
     ("v7.27", "Probability calibration math extracted to analytics reports module"),
     ("v7.28", "Telegram UI polish for main menu, signal cards, Autobot and market scan"),
+    ("v7.29", "Real Binance Futures Testnet entry/protection orders behind explicit flags and clean journal reset"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -17457,6 +17897,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_execution_status": format_execution_status,
     "submit_testnet_order_test": submit_testnet_order_test,
     "submit_testnet_protection_order_tests": submit_testnet_protection_order_tests,
+    "submit_testnet_real_entry_order": submit_testnet_real_entry_order,
+    "submit_testnet_real_protection_orders": submit_testnet_real_protection_orders,
+    "submit_testnet_emergency_close_order": submit_testnet_emergency_close_order,
     "validate_protection_order_geometry": validate_protection_order_geometry,
     "format_testnet_status": format_testnet_status,
     "testnet_event_line": _testnet_event_line_v721,
@@ -17471,6 +17914,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "market_opportunity_scan": market_opportunity_scan,
     "format_market_opportunities": format_market_opportunities,
     "format_period_performance_report": format_period_performance_report,
+    "reset_demo_journals": reset_demo_journals,
     "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
@@ -17585,6 +18029,14 @@ def validate_runtime_architecture():
         errors.append("protection geometry validator is missing")
     if not callable(globals().get("submit_testnet_protection_order_tests")):
         errors.append("testnet protection order submitter is missing")
+    if not callable(globals().get("submit_testnet_real_entry_order")):
+        errors.append("real testnet entry submitter is missing")
+    if not callable(globals().get("submit_testnet_real_protection_orders")):
+        errors.append("real testnet protection submitter is missing")
+    if not callable(globals().get("submit_testnet_emergency_close_order")):
+        errors.append("real testnet emergency close helper is missing")
+    if not callable(globals().get("reset_demo_journals")):
+        errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):
         errors.append("testnet journal report is missing")
     if not callable(globals().get("format_testnet_reconciliation_report")):

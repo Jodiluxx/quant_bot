@@ -117,6 +117,21 @@ Testnet Journal/Reconciliation v7.21 adds a separate `testnet_journal.json`
 runtime file and reports for planned order checks, accepted/rejected Testnet
 validations, Binance rejection reasons, and plan-vs-result reconciliation.
 
+Real Testnet Orders v7.29 can send real Binance Futures Testnet orders through
+`POST /fapi/v1/order`. This is still demo/Testnet only. It requires all of:
+Testnet mode, Testnet API keys, `/order/test` validation enabled, and a
+separate real-submit flag.
+
+```powershell
+$env:BOT_EXECUTION_MODE="testnet"
+$env:BINANCE_TESTNET_ORDER_SUBMIT="1"
+$env:BINANCE_TESTNET_REAL_ORDER_SUBMIT="1"
+```
+
+If a real Testnet entry is accepted but protective SL/TP orders fail, the bot
+attempts an emergency reduce-only market close and records the event in the
+Testnet journal. Mainnet/live order submission remains blocked by code.
+
 Live Readiness Checklist v7.22 adds a go/no-go report in Autobot. It checks
 whether there are enough paper trades, independent setup statistics, accepted
 Testnet reconciliations, daily loss limits, position limits and kill-switch
@@ -154,6 +169,10 @@ Telegram UI Polish v7.28 keeps trading logic unchanged and only improves
 presentation: compact main menu, shorter signal cards, cleaner
 Autobot/PaperTrader buttons, compact market scan cards and readable position
 updates. Existing `callback_data` values are preserved.
+
+Demo journal reset v7.29 can archive and clear the local paper/testnet runtime
+files (`paper_trader_state.json`, `execution_gateway_state.json`,
+`testnet_journal.json`) so Testnet evaluation starts from a clean sheet.
 
 The first real extraction helpers now live in:
 
