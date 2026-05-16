@@ -180,6 +180,13 @@ Demo journal reset v7.29 can archive and clear the local paper/testnet runtime
 files (`paper_trader_state.json`, `execution_gateway_state.json`,
 `testnet_journal.json`) so Testnet evaluation starts from a clean sheet.
 
+Simple Public UI v7.31 hides internal analytics screens from Telegram users.
+The bot still keeps and uses analytics/backtest/WFO/testnet data internally, but
+the public interface shows only manual signals, auto-signal notification
+settings, and demo trading status. The demo bot sends a 15-minute cycle report
+that says whether a trade was opened or skipped, while choosing its own
+timeframe.
+
 The first real extraction helpers now live in:
 
 - `quant_bot/execution_gateway.py`

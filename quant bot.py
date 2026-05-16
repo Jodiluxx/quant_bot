@@ -18110,7 +18110,521 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.30 Testnet Position / Fill Monitor"
+# ============================================================
+# v7.31 - SIMPLE PUBLIC UI FOR SIGNALS + DEMO TRADING
+# ============================================================
+# Keep analytics/backtest/WFO/testnet machinery available internally, but expose
+# only signal, auto-signal settings and demo trading to the Telegram user.
+
+_base_async_handle_update_v730 = async_handle_update
+_base_async_auto_signal_loop_v730 = async_auto_signal_loop
+_base_build_auto_task_message_v730 = build_auto_task_message
+
+SIMPLE_PUBLIC_AUTO_TASKS_V731 = {"signals", "paper_trader"}
+SIMPLE_HIDDEN_AUTO_TASKS_V731 = {"heatmap", "fear_greed", "backtest", "wfo"}
+_simple_defaults_applied_v731 = set()
+
+
+def simple_public_mode_enabled():
+    return True
+
+
+def _simple_sync_public_auto_settings(chat_id):
+    chat_id = _normalize_chat_id_v78(chat_id)
+    _ensure_auto_task_defaults(chat_id)
+    for task_key in SIMPLE_HIDDEN_AUTO_TASKS_V731:
+        if task_key in AUTO_TASKS:
+            _get_auto_task_settings(chat_id, task_key)["enabled"] = False
+    if "signals" in AUTO_TASKS:
+        st = _get_auto_task_settings(chat_id, "signals")
+        st["enabled"] = bool(st.get("enabled", True))
+        if st.get("send_interval") not in AUTO_SEND_INTERVALS:
+            st["send_interval"] = "30m"
+        if st.get("tf") not in INTERVALS:
+            st["tf"] = "30m"
+    if "paper_trader" in AUTO_TASKS:
+        st = _get_auto_task_settings(chat_id, "paper_trader")
+        st["enabled"] = bool(st.get("enabled", True))
+        st["send_interval"] = "15m"
+        st["tf"] = None
+    if chat_id not in _simple_defaults_applied_v731:
+        auto_chat_ids.add(chat_id)
+        seen_chat_ids.add(chat_id)
+        _simple_defaults_applied_v731.add(chat_id)
+
+
+def _simple_demo_status():
+    info = execution_mode()
+    real_submit = _testnet_real_submit_enabled_v729() if "_testnet_real_submit_enabled_v729" in globals() else False
+    ready = bool(info.get("mode") == "testnet" and info.get("testnet_keys_present") and real_submit)
+    return "ON" if ready else "OFF"
+
+
+def _simple_signal_decision(data):
+    direction = _ui_signal_direction(data)
+    plan = data.get("entry_plan") or {}
+    status = _ui_status_plain(plan.get("status"))
+    if status == "READY" and direction in {"LONG", "SHORT"}:
+        return direction
+    return "WAIT"
+
+
+def _simple_entry_action(data):
+    plan = data.get("entry_plan") or {}
+    status = _ui_status_plain(plan.get("status"))
+    entry_now = int(plan.get("entry_now_score", plan.get("score", 0)) or 0)
+    if status == "READY":
+        return f"можно рассматривать вход маленьким риском | EntryNow {entry_now}/100"
+    if status == "WAIT RETEST":
+        return f"ждать ретест / лучшую цену | EntryNow {entry_now}/100"
+    if status == "WAIT CONFIRM":
+        return f"ждать подтверждение | EntryNow {entry_now}/100"
+    return f"не входить сейчас | EntryNow {entry_now}/100"
+
+
+def _simple_risk_levels(data):
+    plan = data.get("entry_plan") or {}
+    risk = data.get("risk_levels") or {}
+    return {
+        "entry": data.get("price"),
+        "sl": plan.get("sl") or risk.get("sl"),
+        "tp1": plan.get("tp1") or risk.get("tp1"),
+        "tp2": plan.get("tp2") or risk.get("tp2"),
+        "rr": _safe_float(plan.get("rr_now"), 0) or _safe_float(risk.get("rr_ratio"), 0) or 0,
+        "zone_low": plan.get("entry_zone_low"),
+        "zone_high": plan.get("entry_zone_high"),
+    }
+
+
+def format_main_status(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    positions = len(_paper_positions(chat_id)) if "_paper_positions" in globals() else 0
+    auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
+    sig = _get_auto_task_settings(chat_id, "signals")
+    paper = _get_auto_task_settings(chat_id, "paper_trader")
+    return "\n".join([
+        "🏠 <b>Главное меню</b>",
+        "",
+        f"Сигнал: <b>{_ui_ticker_short(ticker)}USDT</b> | TF <b>{_ui_tf_short(interval)}</b>",
+        f"Авто: <b>{auto_state}</b> | Demo Testnet: <b>{_simple_demo_status()}</b>",
+        f"Позиции: <b>{positions}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        "",
+        "<b>Уведомления:</b>",
+        f"• Сигналы: <b>{'ON' if sig.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | { _ui_tf_short(sig.get('send_interval')) } | TF { _ui_tf_short(sig.get('tf') or '30m') }",
+        f"• Демо-бот: <b>{'ON' if paper.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | каждые 15м",
+    ])
+
+
+def main_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "📡 Сигнал", "callback_data": "menu_signal"},
+            {"text": "🤖 Демо-бот", "callback_data": "menu_autobot"},
+        ],
+        [
+            {"text": "⚙️ Уведомления", "callback_data": "auto_settings"},
+            {"text": "🏠 Обновить меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def signal_menu_keyboard(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    return {"inline_keyboard": [
+        [{"text": f"📡 Сигнал: {_ui_ticker_short(ticker)}USDT / {_ui_tf_short(interval)}", "callback_data": "get_signal"}],
+        [
+            {"text": "🪙 Актив", "callback_data": "sig_change_ticker"},
+            {"text": "⏱ TF", "callback_data": "sig_change_interval"},
+        ],
+        [{"text": "⚙️ Уведомления", "callback_data": "auto_settings"}],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def format_signal_menu_text(chat_id):
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    return "\n".join([
+        "📡 <b>Сигнал</b>",
+        "",
+        f"Актив: <b>{_ui_ticker_short(ticker)}USDT</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b>",
+        "",
+        "Бот даст только главное: LONG / SHORT / WAIT, вход сейчас или ждать, SL/TP и короткие причины.",
+    ])
+
+
+def compact_signal_keyboard(open_callback=None):
+    return {"inline_keyboard": [
+        [{"text": "🔄 Обновить сигнал", "callback_data": "get_signal"}],
+        [
+            {"text": "🪙 Актив", "callback_data": "sig_change_ticker"},
+            {"text": "⏱ TF", "callback_data": "sig_change_interval"},
+        ],
+        [{"text": "◀️ Назад к сигналу", "callback_data": "menu_signal"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def entry_detail_keyboard(open_callback=None):
+    return compact_signal_keyboard()
+
+
+def entry_analysis_keyboard():
+    return compact_signal_keyboard()
+
+
+def format_signal_summary(data, ticker, interval):
+    decision = _simple_signal_decision(data)
+    idea = _ui_signal_direction(data)
+    plan = data.get("entry_plan") or {}
+    levels = _simple_risk_levels(data)
+    confidence = int(data.get("confidence") or 0)
+    prob = _prob_value_v712(data.get("prob")) if "_prob_value_v712" in globals() else data.get("prob")
+    prob_text = f"{prob * 100:.1f}%" if isinstance(prob, (int, float)) and prob > 0 else "n/a"
+    support, risks = _ui_directional_lists(data, idea.lower(), 2)
+    status = _ui_status_plain(plan.get("status"))
+
+    lines = [
+        f"📡 <b>{_ui_ticker_short(ticker)}USDT — {decision}</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b> | идея: <b>{idea}</b>",
+        "",
+        "<b>Решение:</b>",
+        f"• Сейчас: <b>{'вход возможен' if decision in {'LONG', 'SHORT'} else 'ждать'}</b>",
+        f"• Причина: {_ui_short_text(_simple_entry_action(data), 120)}",
+        f"• Confidence: <b>{confidence}/100</b> | Вероятность: <b>{prob_text}</b>",
+        "",
+        "<b>Вход и риск:</b>",
+        f"• Цена: <b>{fmt_price(levels.get('entry'), ticker)}</b>",
+    ]
+    if levels.get("zone_low") and levels.get("zone_high"):
+        lines.append(f"• Зона: <b>{fmt_price(levels.get('zone_low'), ticker)} — {fmt_price(levels.get('zone_high'), ticker)}</b>")
+    lines += [
+        f"• SL: <b>{fmt_price(levels.get('sl'), ticker)}</b>",
+        f"• TP1: <b>{fmt_price(levels.get('tp1'), ticker)}</b>",
+        f"• TP2: <b>{fmt_price(levels.get('tp2'), ticker)}</b>",
+        f"• RR: <b>{levels.get('rr', 0):.2f}x</b>",
+    ]
+    if support:
+        lines += ["", "<b>За идею:</b>"]
+        lines += [f"• {_ui_short_text(x, 90)}" for x in support]
+    if risks:
+        lines += ["", "<b>Риски:</b>"]
+        lines += [f"• {_ui_short_text(x, 90)}" for x in risks]
+    if status != "READY":
+        lines += ["", "Итог: не догонять цену. Лучше пропустить вход, чем открыть плохую сделку."]
+    else:
+        lines += ["", "Итог: даже при READY риск держать маленьким. Это статистика, не гарантия."]
+    return "\n".join(lines)
+
+
+def format_msg(data, ticker, interval):
+    return format_signal_summary(data, ticker, interval)
+
+
+def _simple_paper_stats(chat_id):
+    trades = _paper_closed_trades(chat_id)
+    wins = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) > 0]
+    losses = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) < 0]
+    wr = (len(wins) / len(trades) * 100.0) if trades else 0.0
+    net = sum(_safe_float(t.get("net_usd"), 0) or 0 for t in trades)
+    return trades, wins, losses, wr, net
+
+
+def _simple_latest_analysis(chat_id):
+    positions = _paper_positions(chat_id)
+    if positions:
+        pos = positions[-1]
+        return f"Открыта {_ui_ticker_short(pos.get('ticker'))} {str(pos.get('direction')).upper()} | причина: {_ui_short_text(pos.get('reason'), 120)}"
+    trades = _paper_closed_trades(chat_id)
+    if trades:
+        tr = trades[-1]
+        return f"Последняя закрытая: {_ui_ticker_short(tr.get('ticker'))} {str(tr.get('direction')).upper()} | {tr.get('exit_reason')} | {tr.get('net_usd', 0):+.3f} USDT"
+    return "Пока сделок нет. Бот ждёт setup, который пройдёт фильтры."
+
+
+def format_autobot_menu(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    positions = _paper_positions(chat_id)
+    trades, wins, losses, wr, net = _simple_paper_stats(chat_id)
+    paper_enabled = chat_id in auto_chat_ids and bool(_get_auto_task_settings(chat_id, "paper_trader").get("enabled"))
+    return "\n".join([
+        "🤖 <b>Демо-бот</b>",
+        "",
+        f"Статус: <b>{'ON' if paper_enabled else 'OFF'}</b> | Demo Testnet: <b>{_simple_demo_status()}</b>",
+        "Частота: <b>каждые 15 минут</b> | TF выбирает бот",
+        "",
+        "<b>Статистика:</b>",
+        f"• Открытые: <b>{len(positions)}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"• Закрытые: <b>{len(trades)}</b>",
+        f"• Winrate: <b>{wr:.1f}%</b> | Win/Loss: <b>{len(wins)}/{len(losses)}</b>",
+        f"• Net PnL: <b>{net:+.3f} USDT</b>",
+        "",
+        "<b>Краткий анализ:</b>",
+        _simple_latest_analysis(chat_id),
+    ])
+
+
+def autobot_keyboard(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    return {"inline_keyboard": [
+        [
+            {"text": "▶️ Скан сейчас", "callback_data": "paper_run_now"},
+            {"text": "🟢 Открытые", "callback_data": "paper_open_positions"},
+        ],
+        [
+            {"text": "📕 Закрытые", "callback_data": "paper_closed_menu"},
+            {"text": "⚙️ Уведомления", "callback_data": "auto_settings"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+def auto_settings_text(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    paper = _get_auto_task_settings(chat_id, "paper_trader")
+    return "\n".join([
+        "⚙️ <b>Уведомления</b>",
+        "",
+        f"Общий статус: <b>{'ON' if chat_id in auto_chat_ids else 'OFF'}</b>",
+        f"• Авто-сигналы: <b>{'ON' if sig.get('enabled') else 'OFF'}</b> | { _ui_tf_short(sig.get('send_interval')) } | TF { _ui_tf_short(sig.get('tf') or '30m') }",
+        f"• Демо-бот: <b>{'ON' if paper.get('enabled') else 'OFF'}</b> | 15м | TF выбирает сам",
+        "",
+        "Остальная аналитика остаётся внутри бота и не отправляется отдельными сообщениями.",
+    ])
+
+
+def auto_settings_keyboard(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    paper = _get_auto_task_settings(chat_id, "paper_trader")
+    return {"inline_keyboard": [
+        [{"text": "⛔ Отключить всё" if chat_id in auto_chat_ids else "✅ Включить всё", "callback_data": "toggle_auto"}],
+        [{"text": f"📡 Авто-сигналы: {'ON' if sig.get('enabled') else 'OFF'}", "callback_data": "auto_task_signals"}],
+        [{"text": f"🤖 Демо-бот: {'ON' if paper.get('enabled') else 'OFF'}", "callback_data": "auto_task_paper_trader"}],
+        [{"text": "◀️ Демо-бот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def auto_task_keyboard(chat_id, task_key):
+    _simple_sync_public_auto_settings(chat_id)
+    if task_key not in SIMPLE_PUBLIC_AUTO_TASKS_V731:
+        return auto_settings_keyboard(chat_id)
+    st = _get_auto_task_settings(chat_id, task_key)
+    rows = [[{"text": "⛔ Выключить" if st.get("enabled") else "✅ Включить", "callback_data": f"auto_tog_{task_key}"}]]
+    if task_key == "signals":
+        rows.append([{"text": f"⏰ Частота: {_ui_tf_short(st.get('send_interval'))}", "callback_data": f"auto_choose_iv_{task_key}"}])
+        rows.append([{"text": f"📊 TF: {_ui_tf_short(st.get('tf') or '30m')}", "callback_data": f"auto_choose_tf_{task_key}"}])
+    rows += [
+        [{"text": "◀️ Уведомления", "callback_data": "auto_settings"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]
+    return {"inline_keyboard": rows}
+
+
+def build_auto_task_message(chat_id, task_key):
+    _simple_sync_public_auto_settings(chat_id)
+    if task_key not in SIMPLE_PUBLIC_AUTO_TASKS_V731:
+        return None
+    return _base_build_auto_task_message_v730(chat_id, task_key)
+
+
+def _simple_format_open_positions(chat_id):
+    positions = _paper_positions(chat_id)
+    lines = ["🟢 <b>Открытые демо-позиции</b>", ""]
+    if not positions:
+        lines.append("Открытых позиций нет.")
+        return "\n".join(lines)
+    for pos in positions[-5:]:
+        lines += [
+            f"<b>{_ui_ticker_short(pos.get('ticker'))} {str(pos.get('direction')).upper()}</b> | TF {_ui_tf_short(pos.get('interval'))}",
+            f"Entry {fmt_price(pos.get('entry_price'), pos.get('ticker'))} | SL {fmt_price(pos.get('sl'), pos.get('ticker'))} | TP1 {fmt_price(pos.get('tp1'), pos.get('ticker'))}",
+            f"Причина: {_ui_short_text(pos.get('reason'), 120)}",
+            "",
+        ]
+    return "\n".join(lines).rstrip()
+
+
+def _simple_format_closed_positions(chat_id):
+    trades = _paper_closed_trades(chat_id)
+    lines = ["📕 <b>Закрытые демо-сделки</b>", ""]
+    if not trades:
+        lines.append("Закрытых сделок пока нет.")
+        return "\n".join(lines)
+    for tr in trades[-8:][::-1]:
+        lines.append(
+            f"• {_fmt_dt_short(tr.get('opened_at'))} | {_ui_ticker_short(tr.get('ticker'))} "
+            f"{str(tr.get('direction')).upper()} | {_ui_tf_short(tr.get('interval'))} | "
+            f"{tr.get('exit_reason')} | {tr.get('net_usd', 0):+.3f} USDT"
+        )
+    return "\n".join(lines)
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _simple_sync_public_auto_settings(chat_id)
+    _paper_load_state()
+    closed = _paper_manage_open_positions(chat_id)
+    open_positions = _paper_positions(chat_id)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d • %H:%M UTC")
+    lines = [
+        "🤖 <b>Демо-бот: цикл 15м</b>",
+        now,
+        "",
+        f"Позиции: <b>{len(open_positions)}/{PAPER_TRADER_MAX_POSITIONS}</b> | Сегодня: <b>{_paper_today_open_count(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+        f"Demo Testnet: <b>{_simple_demo_status()}</b>",
+    ]
+    if closed:
+        lines += ["", "<b>Закрыто:</b>"]
+        for trade in closed[-2:]:
+            lines.append(f"• {_ui_ticker_short(trade.get('ticker'))} {str(trade.get('direction')).upper()} | {trade.get('exit_reason')} | {trade.get('net_usd', 0):+.3f} USDT")
+    if _paper_today_open_count(chat_id) >= PAPER_TRADER_MAX_TRADES_PER_DAY:
+        lines += ["", "<b>Решение:</b>", "Сделка не открыта: дневной лимит достигнут."]
+        return "\n".join(lines)
+    candidate, tried = paper_select_trade_candidate(chat_id)
+    if not candidate:
+        lines += ["", "<b>Решение:</b>", "Сделка не открыта.", "Лучший сетап не прошёл фильтры."]
+        best = _format_scan_rows(tried)
+        if best:
+            lines += ["", "<b>Лучшие проверки:</b>"] + best[:3]
+        return "\n".join(lines)
+    pos, err = _paper_open_candidate(chat_id, candidate)
+    if err:
+        lines += ["", "<b>Решение:</b>", "Сделка не открыта.", _ui_short_text(err, 160)]
+        best = _format_scan_rows(tried)
+        if best:
+            lines += ["", "<b>Лучшие проверки:</b>"] + best[:3]
+        return "\n".join(lines)
+    lines += [
+        "",
+        "<b>Решение:</b>",
+        "Открыта демо-сделка.",
+        "",
+        f"<b>{_ui_ticker_short(pos.get('ticker'))} {str(pos.get('direction')).upper()}</b> | TF {_ui_tf_short(pos.get('interval'))}",
+        f"Entry: <b>{fmt_price(pos.get('entry_price'), pos.get('ticker'))}</b>",
+        f"SL: <b>{fmt_price(pos.get('sl'), pos.get('ticker'))}</b> | TP1: <b>{fmt_price(pos.get('tp1'), pos.get('ticker'))}</b>",
+        f"Причина: {_ui_short_text(pos.get('reason'), 140)}",
+    ]
+    return "\n".join(lines)
+
+
+async def async_auto_signal_loop(session):
+    print("  [async] auto loop v7.31 started: simple public tasks only")
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next_minute())
+            now = datetime.now(timezone.utc)
+            if not auto_chat_ids or now.second > 3:
+                continue
+            for chat_id in list(auto_chat_ids):
+                _simple_sync_public_auto_settings(chat_id)
+                for task_key in ("signals", "paper_trader"):
+                    st = _get_auto_task_settings(chat_id, task_key)
+                    if not st.get("enabled"):
+                        continue
+                    send_iv = st.get("send_interval", DEFAULT_AUTO_SEND_INTERVAL)
+                    if not _is_aligned_time(now, send_iv):
+                        continue
+                    slot = _slot_id(now, send_iv)
+                    last_key = f"{chat_id}:{task_key}:{send_iv}:{now.date().isoformat()}"
+                    if _auto_task_last_slot.get(last_key) == slot:
+                        continue
+                    _auto_task_last_slot[last_key] = slot
+                    msg = await asyncio.to_thread(build_auto_task_message, chat_id, task_key)
+                    if msg:
+                        await async_send(session, chat_id, msg, main_keyboard())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  [async_auto_v731] error: {e}")
+            await asyncio.sleep(10)
+
+
+def _simple_hidden_callback_v731(data):
+    if not data:
+        return False
+    hidden_exact = {
+        "menu_analytics", "menu_positions", "menu_flow", "menu_learn",
+        "get_fg", "get_price", "entry_point", "sig_analysis", "sig_entry",
+        "sig_entry_why", "sig_futures", "run_backtest", "run_wfo",
+        "market_heatmap", "monte_carlo", "signal_clusters", "signal_stats",
+        "oos_report", "orderflow", "liquidations", "footprint",
+        "storage_status", "explain", "bot_quality", "setup_analytics",
+        "prob_calibration", "execution_status", "testnet_status",
+        "testnet_journal", "testnet_reconcile", "safety_status",
+        "market_opportunities", "performance_today", "performance_week",
+        "live_readiness", "migration_checklist", "paper_report",
+        "paper_report_autobot",
+    }
+    if data in hidden_exact:
+        return True
+    hidden_prefix = ("learn_", "explain_", "paper_detail_", "open_pos_", "confirm_pos_", "edit_pos_", "close_pos_", "tp1_hit_")
+    if data.startswith(hidden_prefix):
+        return True
+    for task_key in SIMPLE_HIDDEN_AUTO_TASKS_V731:
+        if data.endswith("_" + task_key) or ("_" + task_key + "_") in data:
+            return True
+    return False
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _simple_sync_public_auto_settings(chat_id)
+            if _simple_hidden_callback_v731(data):
+                await async_answer_callback(session, callback_id, "Раздел скрыт")
+                await async_send(session, chat_id, format_main_status(chat_id), main_keyboard())
+                return
+            if data in {"menu_autobot", "paper_trader"}:
+                await async_answer_callback(session, callback_id, "Демо-бот")
+                await async_send(session, chat_id, format_autobot_menu(chat_id), autobot_keyboard(chat_id))
+                return
+            if data in {"menu_settings", "auto_settings"}:
+                await async_answer_callback(session, callback_id, "Уведомления")
+                await async_send(session, chat_id, auto_settings_text(chat_id), auto_settings_keyboard(chat_id))
+                return
+            if data == "toggle_auto":
+                if chat_id in auto_chat_ids:
+                    auto_chat_ids.discard(chat_id)
+                    text = "⛔ Авто-уведомления отключены.\n\n" + auto_settings_text(chat_id)
+                else:
+                    auto_chat_ids.add(chat_id)
+                    text = "✅ Авто-уведомления включены.\n\n" + auto_settings_text(chat_id)
+                await async_answer_callback(session, callback_id, "OK")
+                await async_send(session, chat_id, text, auto_settings_keyboard(chat_id))
+                return
+            if data == "paper_run_now":
+                await async_answer_callback(session, callback_id, "Скан")
+                msg = await asyncio.to_thread(paper_trader_cycle, chat_id, True)
+                await async_send_plain_v76(session, chat_id, msg, autobot_keyboard(chat_id))
+                return
+            if data == "paper_open_positions":
+                await async_answer_callback(session, callback_id, "Открытые")
+                await async_send_plain_v76(session, chat_id, _simple_format_open_positions(chat_id), autobot_keyboard(chat_id))
+                return
+            if data in {"paper_closed_menu", "paper_closed_win", "paper_closed_loss"}:
+                await async_answer_callback(session, callback_id, "Закрытые")
+                await async_send_plain_v76(session, chat_id, _simple_format_closed_positions(chat_id), autobot_keyboard(chat_id))
+                return
+        await _base_async_handle_update_v730(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v731] error: {e}")
+
+
+BOT_VERSION_LABEL = "v7.31 Simple Public Signals + Demo Trading UI"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -18167,6 +18681,7 @@ RUNTIME_LAYERS = [
     ("v7.28", "Telegram UI polish for main menu, signal cards, Autobot and market scan"),
     ("v7.29", "Real Binance Futures Testnet entry/protection orders behind explicit flags and clean journal reset"),
     ("v7.30", "Testnet position/fill monitor for positions and reduce-only protection"),
+    ("v7.31", "simple public Telegram UI for signals, auto-signals and demo trading"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -18244,6 +18759,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_market_opportunities": format_market_opportunities,
     "format_period_performance_report": format_period_performance_report,
     "reset_demo_journals": reset_demo_journals,
+    "simple_public_mode_enabled": simple_public_mode_enabled,
     "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
@@ -18370,6 +18886,8 @@ def validate_runtime_architecture():
         errors.append("testnet position monitor runner is missing")
     if not callable(globals().get("format_testnet_position_monitor_report")):
         errors.append("testnet position monitor report is missing")
+    if not callable(globals().get("simple_public_mode_enabled")):
+        errors.append("simple public UI mode helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):

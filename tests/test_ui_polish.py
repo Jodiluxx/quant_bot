@@ -13,39 +13,18 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_main_keyboard_keeps_expected_callbacks(self) -> None:
         rows = self.bot.main_keyboard()["inline_keyboard"]
         callbacks = {button["callback_data"] for row in rows for button in row}
-        for callback in {
-            "menu_signal",
-            "menu_autobot",
-            "menu_analytics",
-            "menu_positions",
-            "menu_settings",
-            "menu_learn",
-            "menu_flow",
-            "get_fg",
-            "get_price",
-            "entry_point",
-        }:
+        for callback in {"menu_signal", "menu_autobot", "auto_settings", "back_main"}:
             self.assertIn(callback, callbacks)
+        for hidden in {"menu_analytics", "menu_positions", "menu_learn", "menu_flow", "get_fg", "entry_point"}:
+            self.assertNotIn(hidden, callbacks)
 
     def test_autobot_keyboard_uses_existing_callbacks(self) -> None:
         rows = self.bot.autobot_keyboard(987654321)["inline_keyboard"]
         callbacks = {button["callback_data"] for row in rows for button in row}
-        for callback in {
-            "paper_run_now",
-            "paper_open_positions",
-            "paper_closed_menu",
-            "paper_report_autobot",
-            "setup_analytics",
-            "prob_calibration",
-            "bot_quality",
-            "execution_status",
-            "safety_status",
-            "market_opportunities",
-            "performance_today",
-            "live_readiness",
-            "back_main",
-        }:
+        for callback in {"paper_run_now", "paper_open_positions", "paper_closed_menu", "auto_settings", "back_main"}:
             self.assertIn(callback, callbacks)
+        for hidden in {"setup_analytics", "prob_calibration", "bot_quality", "execution_status", "live_readiness"}:
+            self.assertNotIn(hidden, callbacks)
 
     def test_signal_card_is_compact_and_html_escapes_dynamic_text(self) -> None:
         text = self.bot.format_signal_summary(
@@ -74,17 +53,24 @@ class TelegramUiPolishTests(unittest.TestCase):
             "BTCUSDT",
             "15m",
         )
-        self.assertIn("📡 <b>BTCUSDT • LONG</b>", text)
-        self.assertIn("WAIT RETEST", text)
-        self.assertIn("Pullback &lt;test&gt;", text)
+        self.assertIn("📡 <b>BTCUSDT — WAIT</b>", text)
+        self.assertIn("идея: <b>LONG</b>", text)
+        self.assertIn("ждать ретест", text)
         self.assertIn("Цена &lt; EMA200", text)
-        self.assertLessEqual(len(text.splitlines()), 32)
+        self.assertLessEqual(len(text.splitlines()), 28)
 
     def test_scan_rows_are_limited_and_readable(self) -> None:
         rows = [{"ticker": "ETHUSDT", "tf": "30m", "status": "WAIT_RETEST", "entry_now": n, "setup": n, "rr": 1.67} for n in range(10)]
         lines = self.bot._format_scan_rows(rows)
         self.assertEqual(len(lines), 5)
         self.assertIn("WAIT RETEST", lines[0])
+
+    def test_simple_mode_blocks_hidden_old_callbacks(self) -> None:
+        self.assertTrue(self.bot.simple_public_mode_enabled())
+        for callback in {"menu_analytics", "execution_status", "sig_analysis", "market_heatmap"}:
+            self.assertTrue(self.bot._simple_hidden_callback_v731(callback))
+        for callback in {"menu_signal", "menu_autobot", "paper_run_now", "auto_settings"}:
+            self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
 
 if __name__ == "__main__":
