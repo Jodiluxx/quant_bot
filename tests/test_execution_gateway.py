@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from quant_bot.execution_gateway import (
+    evaluate_position_monitor,
     event_status,
     execution_plan_view,
     protection_status,
@@ -38,6 +39,35 @@ class ExecutionGatewayTests(unittest.TestCase):
         view = execution_plan_view({"entry_order": {"quantity_est": 0.123456789, "notional_est": "25.5"}})
         self.assertEqual(view["quantity_text"], "0.123457")
         self.assertEqual(view["notional"], 25.5)
+
+    def test_position_monitor_accepts_protected_long(self) -> None:
+        plan = {"ticker": "BTCUSDT", "api_symbol": "BTCUSDT", "direction": "long"}
+        positions = [{"symbol": "BTCUSDT", "positionAmt": "0.010", "entryPrice": "100", "markPrice": "101"}]
+        orders = [
+            {"symbol": "BTCUSDT", "type": "STOP_MARKET", "side": "SELL", "reduceOnly": True},
+            {"symbol": "BTCUSDT", "type": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True},
+            {"symbol": "BTCUSDT", "type": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True},
+        ]
+        result = evaluate_position_monitor(plan, positions, orders)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "PROTECTED")
+        self.assertEqual(result["sl_count"], 1)
+        self.assertEqual(result["tp_count"], 2)
+
+    def test_position_monitor_flags_unprotected_position(self) -> None:
+        plan = {"ticker": "ETHUSDT", "api_symbol": "ETHUSDT", "direction": "short"}
+        positions = [{"symbol": "ETHUSDT", "positionAmt": "-0.5", "entryPrice": "2000", "markPrice": "1990"}]
+        result = evaluate_position_monitor(plan, positions, [])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "UNPROTECTED")
+        self.assertIn("missing reduceOnly STOP_MARKET SL", result["blockers"])
+        self.assertIn("missing reduceOnly TAKE_PROFIT_MARKET TP", result["blockers"])
+
+    def test_position_monitor_treats_absent_position_as_closed(self) -> None:
+        plan = {"ticker": "SOLUSDT", "api_symbol": "SOLUSDT", "direction": "long"}
+        result = evaluate_position_monitor(plan, [], [])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "NO_POSITION")
 
 
 if __name__ == "__main__":

@@ -80,9 +80,17 @@ def event_status(event: dict[str, Any] | None) -> str:
 def testnet_event_view(event: dict[str, Any] | None) -> dict[str, Any]:
     event = event or {}
     request = event.get("request") or {}
+    kind_labels = {
+        "entry": "ENTRY",
+        "protection": "PROTECT",
+        "real_entry": "REAL ENTRY",
+        "real_protection": "REAL PROTECT",
+        "real_emergency_close": "EMERGENCY CLOSE",
+        "position_monitor": "POSITION MONITOR",
+    }
     return {
         "ts": event.get("ts"),
-        "kind": "ENTRY" if event.get("kind") == "entry" else "PROTECT",
+        "kind": kind_labels.get(str(event.get("kind") or ""), str(event.get("kind") or "EVENT").upper()),
         "status": event_status(event),
         "ticker": event.get("ticker") or "?",
         "direction": str(event.get("direction") or "?").upper(),
@@ -180,4 +188,119 @@ def reconcile_testnet_plan(plan: dict[str, Any] | None, events: Iterable[dict[st
         "entry_event": entry,
         "protection_event": protection,
         "reasons": reasons,
+    }
+
+
+def _as_list(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if payload is None:
+        return []
+    return [payload]
+
+
+def _truthy_order_flag(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"} or value is True
+
+
+def selected_position(position_payload: Any, symbol: str | None = None) -> dict[str, Any] | None:
+    symbol_text = str(symbol or "").upper()
+    for row in _as_list(position_payload):
+        if not isinstance(row, dict):
+            continue
+        if symbol_text and str(row.get("symbol") or "").upper() != symbol_text:
+            continue
+        if abs(safe_float(row.get("positionAmt"), 0.0)) > 0:
+            return row
+    return None
+
+
+def protection_orders(open_orders_payload: Any, plan: dict[str, Any] | None) -> dict[str, Any]:
+    plan = plan or {}
+    symbol = str(plan.get("api_symbol") or plan.get("ticker") or "").upper()
+    direction = str(plan.get("direction") or "").lower()
+    close_side = "SELL" if direction == "long" else ("BUY" if direction == "short" else "")
+    orders = []
+    sl_orders = []
+    tp_orders = []
+    bad_orders = []
+    for row in _as_list(open_orders_payload):
+        if not isinstance(row, dict):
+            continue
+        if symbol and str(row.get("symbol") or "").upper() != symbol:
+            continue
+        typ = str(row.get("type") or "").upper()
+        side = str(row.get("side") or "").upper()
+        reduce_only = _truthy_order_flag(row.get("reduceOnly"))
+        is_expected_side = not close_side or side == close_side
+        if typ in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            orders.append(row)
+            if not reduce_only or not is_expected_side:
+                bad_orders.append(row)
+        if typ == "STOP_MARKET" and reduce_only and is_expected_side:
+            sl_orders.append(row)
+        if typ == "TAKE_PROFIT_MARKET" and reduce_only and is_expected_side:
+            tp_orders.append(row)
+    return {
+        "all": orders,
+        "sl": sl_orders,
+        "tp": tp_orders,
+        "bad": bad_orders,
+        "has_sl": bool(sl_orders),
+        "tp_count": len(tp_orders),
+        "has_tp": bool(tp_orders),
+    }
+
+
+def evaluate_position_monitor(
+    plan: dict[str, Any] | None,
+    position_payload: Any,
+    open_orders_payload: Any,
+) -> dict[str, Any]:
+    plan = plan or {}
+    symbol = plan.get("api_symbol") or plan.get("ticker")
+    direction = str(plan.get("direction") or "").lower()
+    position = selected_position(position_payload, symbol)
+    protections = protection_orders(open_orders_payload, plan)
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    if not position:
+        status = "NO_POSITION"
+        warnings.append("Testnet position is not open or already closed")
+        position_amt = 0.0
+        direction_ok = None
+    else:
+        position_amt = safe_float(position.get("positionAmt"), 0.0)
+        direction_ok = (direction == "long" and position_amt > 0) or (direction == "short" and position_amt < 0)
+        if not direction_ok:
+            blockers.append("position direction does not match the plan")
+        if not protections["has_sl"]:
+            blockers.append("missing reduceOnly STOP_MARKET SL")
+        if not protections["has_tp"]:
+            blockers.append("missing reduceOnly TAKE_PROFIT_MARKET TP")
+        if protections["bad"]:
+            blockers.append("some protective orders have wrong side or reduceOnly=false")
+        if protections["has_tp"] and protections["tp_count"] < 2:
+            warnings.append("only one take-profit order is visible")
+        if blockers:
+            status = "UNPROTECTED" if any("missing" in item for item in blockers) else "MISMATCH"
+        else:
+            status = "PROTECTED"
+
+    return {
+        "status": status,
+        "ok": status in {"PROTECTED", "NO_POSITION"},
+        "has_position": bool(position),
+        "position_amt": position_amt,
+        "entry_price": safe_float((position or {}).get("entryPrice"), 0.0),
+        "mark_price": safe_float((position or {}).get("markPrice"), 0.0),
+        "unrealized_pnl": safe_float((position or {}).get("unRealizedProfit"), 0.0),
+        "direction_ok": direction_ok,
+        "sl_count": len(protections["sl"]),
+        "tp_count": protections["tp_count"],
+        "bad_protection_count": len(protections["bad"]),
+        "open_protection_count": len(protections["all"]),
+        "blockers": blockers,
+        "warnings": warnings,
     }

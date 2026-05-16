@@ -132,6 +132,12 @@ If a real Testnet entry is accepted but protective SL/TP orders fail, the bot
 attempts an emergency reduce-only market close and records the event in the
 Testnet journal. Mainnet/live order submission remains blocked by code.
 
+Testnet Position Monitor v7.30 is read-only. It checks accepted real Testnet
+entries against `/fapi/v2/positionRisk` and `/fapi/v1/openOrders`, then reports
+whether the position exists, direction matches the plan, and reduce-only
+`STOP_MARKET`/`TAKE_PROFIT_MARKET` protection is visible. It does not enable
+mainnet trading and does not silently change strategy decisions.
+
 Live Readiness Checklist v7.22 adds a go/no-go report in Autobot. It checks
 whether there are enough paper trades, independent setup statistics, accepted
 Testnet reconciliations, daily loss limits, position limits and kill-switch

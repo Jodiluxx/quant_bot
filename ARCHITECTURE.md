@@ -45,7 +45,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.29 Real Testnet Orders + Clean Journals`.
+Current active runtime is `v7.30 Testnet Position / Fill Monitor`.
 
 Layer summary:
 
@@ -83,6 +83,8 @@ Layer summary:
     Autobot/PaperTrader screen, market scan card and position update card
 27. v7.29: real Binance Futures Testnet entry/protection orders behind
     explicit local flags, plus clean demo journal reset with local backups
+28. v7.30: read-only Testnet position/fill monitor checks accepted Testnet
+    entries, position direction, open reduce-only SL and TP protection orders
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

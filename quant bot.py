@@ -17785,7 +17785,332 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.29 Real Testnet Orders + Clean Journals"
+# ============================================================
+# v7.30 - TESTNET POSITION / FILL MONITOR
+# ============================================================
+# Read-only Testnet reconciliation: checks whether a real Testnet entry is
+# visible as a position and whether reduce-only SL/TP protection is present.
+
+from quant_bot.execution_gateway import (
+    evaluate_position_monitor as _evaluate_position_monitor_v730,
+)
+
+_base_format_execution_status_v729 = format_execution_status
+_base_format_testnet_status_v729 = format_testnet_status
+_base_execution_status_keyboard_v729 = execution_status_keyboard_v715
+_base_async_handle_update_v729 = async_handle_update
+
+TESTNET_POSITION_RISK_PATH = "/fapi/v2/positionRisk"
+TESTNET_OPEN_ORDERS_PATH = "/fapi/v1/openOrders"
+TESTNET_MONITOR_EVENTS_FILE_KIND = "testnet_position_monitor"
+
+
+def _testnet_get_signed_v730(path, params=None):
+    api_key, secret = _testnet_keys_v719()
+    if not api_key or not secret:
+        return {"ok": False, "skipped": True, "reason": "testnet API key/secret не заданы"}
+    signed, _ = _testnet_signed_payload_v719(params or {}, secret)
+    url = BINANCE_FUTURES_TESTNET_REST.rstrip("/") + path
+    try:
+        response = _session.get(
+            url,
+            params=signed,
+            headers={"X-MBX-APIKEY": api_key},
+            timeout=15,
+        )
+        payload = response.json() if response.text else {}
+        return {
+            "ok": response.status_code < 400,
+            "status_code": response.status_code,
+            "payload": payload,
+            "headers": {
+                "used_weight_1m": response.headers.get("X-MBX-USED-WEIGHT-1M"),
+            },
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _testnet_monitor_read_guard_v730():
+    info = execution_mode()
+    blockers = []
+    if info.get("mode") != "testnet":
+        blockers.append("BOT_EXECUTION_MODE должен быть testnet")
+    if not info.get("testnet_keys_present"):
+        blockers.append("Binance Futures Testnet API key/secret не заданы")
+    return blockers
+
+
+def _real_entry_plan_ids_v730(chat_id=None, limit=20):
+    events = [
+        e for e in (_execution_load_state_v715().get("events") or [])
+        if e.get("type") == TESTNET_REAL_EVENTS_FILE_KIND
+        and e.get("kind") == "real_entry"
+        and e.get("ok")
+        and e.get("plan_id")
+    ]
+    if chat_id is not None:
+        key = _paper_chat_key(chat_id)
+        events = [e for e in events if str(e.get("chat_id")) == key]
+    events.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    seen = set()
+    plan_ids = []
+    for event in events:
+        plan_id = event.get("plan_id")
+        if plan_id in seen:
+            continue
+        seen.add(plan_id)
+        plan_ids.append(plan_id)
+        if len(plan_ids) >= int(limit):
+            break
+    return plan_ids
+
+
+def _execution_plan_by_id_v730(plan_id):
+    for plan in _execution_load_state_v715().get("plans") or []:
+        if plan.get("plan_id") == plan_id:
+            return plan
+    return None
+
+
+def fetch_testnet_position_snapshot(plan):
+    plan = plan or {}
+    guard = _testnet_monitor_read_guard_v730()
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "ticker": plan.get("ticker"),
+        "api_symbol": plan.get("api_symbol") or plan.get("ticker"),
+        "submitted": False,
+        "ok": False,
+    }
+    if guard:
+        result["skipped"] = True
+        result["reason"] = "; ".join(guard)
+        return result
+    params = {"symbol": plan.get("api_symbol") or plan.get("ticker")}
+    position_response = _testnet_get_signed_v730(TESTNET_POSITION_RISK_PATH, params)
+    orders_response = _testnet_get_signed_v730(TESTNET_OPEN_ORDERS_PATH, params)
+    result.update({
+        "submitted": not position_response.get("skipped", False) and not orders_response.get("skipped", False),
+        "position_status_code": position_response.get("status_code"),
+        "orders_status_code": orders_response.get("status_code"),
+        "position_response": position_response.get("payload"),
+        "orders_response": orders_response.get("payload"),
+        "position_error": position_response.get("reason") or position_response.get("error"),
+        "orders_error": orders_response.get("reason") or orders_response.get("error"),
+    })
+    result["ok"] = bool(position_response.get("ok") and orders_response.get("ok"))
+    if not result["ok"]:
+        result["reason"] = result.get("position_error") or result.get("orders_error") or "position/openOrders fetch failed"
+    return result
+
+
+def _record_testnet_monitor_result_v730(plan, snapshot, evaluation):
+    plan = plan or {}
+    snapshot = snapshot or {}
+    evaluation = evaluation or {}
+    event = {
+        "type": TESTNET_MONITOR_EVENTS_FILE_KIND,
+        "kind": "position_monitor",
+        "ts": snapshot.get("ts") or datetime.now(timezone.utc).isoformat(),
+        "chat_id": plan.get("chat_id"),
+        "plan_id": plan.get("plan_id"),
+        "ticker": plan.get("ticker"),
+        "interval": plan.get("interval"),
+        "direction": plan.get("direction"),
+        "submitted": snapshot.get("submitted"),
+        "ok": evaluation.get("ok") if snapshot.get("ok") else False,
+        "status": evaluation.get("status") if snapshot.get("ok") else "FETCH_FAILED",
+        "reason": snapshot.get("reason") or "; ".join((evaluation.get("blockers") or [])[:3]),
+        "snapshot_ok": snapshot.get("ok"),
+        "evaluation": evaluation,
+    }
+    with _execution_lock_v715:
+        state = _execution_load_state_v715()
+        state.setdefault("events", []).append(event)
+        _execution_save_state_v715(state)
+    try:
+        _testnet_journal_record_v721("position_monitor", plan, {
+            "ts": event["ts"],
+            "submitted": event.get("submitted"),
+            "ok": event.get("ok"),
+            "reason": event.get("reason"),
+            "response": {
+                "status": event.get("status"),
+                "evaluation": evaluation,
+            },
+        })
+    except Exception as e:
+        print(f"  [testnet_monitor_v730] journal record error: {e}")
+    return event
+
+
+def run_testnet_position_monitor(chat_id=None, limit=10):
+    guard = _testnet_monitor_read_guard_v730()
+    if guard:
+        return {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "ok": False,
+            "skipped": True,
+            "reason": "; ".join(guard),
+            "rows": [],
+        }
+    rows = []
+    plan_ids = _real_entry_plan_ids_v730(chat_id, limit)
+    for plan_id in plan_ids:
+        plan = _execution_plan_by_id_v730(plan_id)
+        if not plan:
+            rows.append({"plan_id": plan_id, "status": "PLAN_MISSING", "ok": False, "reason": "execution plan not found"})
+            continue
+        snapshot = fetch_testnet_position_snapshot(plan)
+        if snapshot.get("ok"):
+            evaluation = _evaluate_position_monitor_v730(
+                plan,
+                snapshot.get("position_response"),
+                snapshot.get("orders_response"),
+            )
+        else:
+            evaluation = {"status": "FETCH_FAILED", "ok": False, "blockers": [snapshot.get("reason") or "fetch failed"], "warnings": []}
+        event = _record_testnet_monitor_result_v730(plan, snapshot, evaluation)
+        rows.append({
+            "plan_id": plan_id,
+            "ticker": plan.get("ticker"),
+            "direction": plan.get("direction"),
+            "interval": plan.get("interval"),
+            "snapshot_ok": snapshot.get("ok"),
+            "event": event,
+            **evaluation,
+        })
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "ok": all(row.get("ok") for row in rows) if rows else True,
+        "plan_count": len(plan_ids),
+        "rows": rows,
+    }
+
+
+def _recent_testnet_monitor_events_v730(chat_id=None, limit=6):
+    events = [
+        e for e in (_execution_load_state_v715().get("events") or [])
+        if e.get("type") == TESTNET_MONITOR_EVENTS_FILE_KIND
+    ]
+    if chat_id is not None:
+        key = _paper_chat_key(chat_id)
+        events = [e for e in events if str(e.get("chat_id")) == key]
+    events.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    return events[: int(limit)]
+
+
+def _testnet_monitor_status_icon_v730(status):
+    status = str(status or "")
+    if status == "PROTECTED":
+        return "🟢"
+    if status == "NO_POSITION":
+        return "⚪"
+    if status in {"UNPROTECTED", "MISMATCH"}:
+        return "🔴"
+    return "🟡"
+
+
+def format_testnet_position_monitor_report(chat_id, run_now=False):
+    if run_now:
+        result = run_testnet_position_monitor(chat_id)
+        if result.get("skipped"):
+            return "\n".join([
+                "🩺 <b>Testnet Position Monitor</b>",
+                "",
+                "Проверка не выполнена.",
+                "Причина: " + _ui_html(result.get("reason")),
+            ])
+    events = _recent_testnet_monitor_events_v730(chat_id, 8)
+    lines = [
+        "🩺 <b>Testnet Position Monitor</b>",
+        "",
+        "Проверяет: entry fill, позицию, SL/TP и reduceOnly защиту.",
+    ]
+    if not events:
+        plan_ids = _real_entry_plan_ids_v730(chat_id, 5)
+        if not plan_ids:
+            lines += ["", "Пока нет real Testnet entry, который нужно сверять."]
+        else:
+            lines += ["", "Есть real Testnet entry, но монитор ещё не запускался."]
+        lines.append("Нажми «Монитор позиции» после первой testnet-сделки.")
+        return "\n".join(lines)
+    lines += ["", "<b>Последние сверки:</b>"]
+    for event in events:
+        ev = event.get("evaluation") or {}
+        status = event.get("status") or ev.get("status")
+        icon = _testnet_monitor_status_icon_v730(status)
+        lines.append(
+            f"{icon} {_fmt_dt_short(event.get('ts'))} | {_ui_ticker_short(event.get('ticker'))} "
+            f"{str(event.get('direction') or '').upper()} | <b>{_ui_html(status)}</b>"
+        )
+        if ev.get("has_position"):
+            lines.append(
+                f"  pos={ev.get('position_amt'):+.6f} | SL {ev.get('sl_count', 0)} | "
+                f"TP {ev.get('tp_count', 0)} | PnL {ev.get('unrealized_pnl', 0):+.4f}"
+            )
+        reason = event.get("reason")
+        warnings = ev.get("warnings") or []
+        if reason:
+            lines.append("  риск: " + _ui_short_text(reason, 120))
+        elif warnings:
+            lines.append("  заметка: " + _ui_short_text("; ".join(warnings[:2]), 120))
+    lines += [
+        "",
+        "Если статус UNPROTECTED, новые входы лучше остановить и сначала проверить SL/TP.",
+    ]
+    return "\n".join(lines)
+
+
+def format_testnet_status(chat_id):
+    text = _base_format_testnet_status_v729(chat_id)
+    events = _recent_testnet_monitor_events_v730(chat_id, 1)
+    status = events[0].get("status") if events else "нет сверок"
+    return text + "\n\nPosition Monitor v7.30:\n• последняя сверка: " + str(status)
+
+
+def format_execution_status(chat_id):
+    text = _base_format_execution_status_v729(chat_id)
+    events = _recent_testnet_monitor_events_v730(chat_id, 1)
+    status = events[0].get("status") if events else "нет сверок"
+    return text + "\n• position monitor: " + str(status)
+
+
+def execution_status_keyboard_v715():
+    kb = _base_execution_status_keyboard_v729()
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 2)
+    rows.insert(insert_at, [{"text": "🩺 Монитор позиции", "callback_data": "testnet_monitor"}])
+    return {"inline_keyboard": rows}
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data == "testnet_monitor":
+                await async_answer_callback(session, callback_id, "Monitor")
+                msg = await asyncio.to_thread(format_testnet_position_monitor_report, chat_id, True)
+                await async_send_plain_v76(session, chat_id, msg, execution_status_keyboard_v715())
+                return
+        await _base_async_handle_update_v729(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v730] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Position Monitor</b> — сверка testnet-факта после входа: есть ли позиция, совпадает ли направление и стоят ли reduce-only SL/TP ордера. Это защита от ситуации “вход есть, защиты нет”.
+"""
+
+
+BOT_VERSION_LABEL = "v7.30 Testnet Position / Fill Monitor"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -17841,6 +18166,7 @@ RUNTIME_LAYERS = [
     ("v7.27", "Probability calibration math extracted to analytics reports module"),
     ("v7.28", "Telegram UI polish for main menu, signal cards, Autobot and market scan"),
     ("v7.29", "Real Binance Futures Testnet entry/protection orders behind explicit flags and clean journal reset"),
+    ("v7.30", "Testnet position/fill monitor for positions and reduce-only protection"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -17900,6 +18226,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "submit_testnet_real_entry_order": submit_testnet_real_entry_order,
     "submit_testnet_real_protection_orders": submit_testnet_real_protection_orders,
     "submit_testnet_emergency_close_order": submit_testnet_emergency_close_order,
+    "fetch_testnet_position_snapshot": fetch_testnet_position_snapshot,
+    "run_testnet_position_monitor": run_testnet_position_monitor,
+    "format_testnet_position_monitor_report": format_testnet_position_monitor_report,
     "validate_protection_order_geometry": validate_protection_order_geometry,
     "format_testnet_status": format_testnet_status,
     "testnet_event_line": _testnet_event_line_v721,
@@ -18035,6 +18364,12 @@ def validate_runtime_architecture():
         errors.append("real testnet protection submitter is missing")
     if not callable(globals().get("submit_testnet_emergency_close_order")):
         errors.append("real testnet emergency close helper is missing")
+    if not callable(globals().get("fetch_testnet_position_snapshot")):
+        errors.append("testnet position snapshot fetcher is missing")
+    if not callable(globals().get("run_testnet_position_monitor")):
+        errors.append("testnet position monitor runner is missing")
+    if not callable(globals().get("format_testnet_position_monitor_report")):
+        errors.append("testnet position monitor report is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):
