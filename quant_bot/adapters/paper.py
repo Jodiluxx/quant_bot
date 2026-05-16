@@ -22,5 +22,17 @@ def format_paper_report(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_paper_report", *args, **kwargs)
 
 
+def paper_positions(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_paper_positions", *args, **kwargs)
+
+
+def paper_closed_trades(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_paper_closed_trades", *args, **kwargs)
+
+
+def paper_today_open_count(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_paper_today_open_count", *args, **kwargs)
+
+
 def paper_data_quality_summary(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("paper_data_quality_summary", *args, **kwargs)

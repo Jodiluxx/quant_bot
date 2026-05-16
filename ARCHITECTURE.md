@@ -27,6 +27,7 @@ quant_bot/
   safety.py                pure safety calculation helpers
   analytics_reports.py     pure analytics/report calculation helpers
   live_readiness.py        pure live-readiness checklist helpers
+  paper_trader.py          pure Paper Trader state/statistics helpers
   adapters/
     market_data.py         candles, price, futures context
     signals.py             signal engine and message formatting
@@ -43,7 +44,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.22 Live Readiness Checklist`.
+Current active runtime is `v7.23 Paper Trader State Extraction`.
 
 Layer summary:
 
@@ -68,6 +69,7 @@ Layer summary:
 19. v7.21: Testnet journal, reconciliation report and first package helpers
 20. v7.22: live-readiness checklist for paper evidence, testnet checks,
     safety limits, kill switch and setup statistics
+21. v7.23: Paper Trader state helpers extracted into `quant_bot.paper_trader`
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

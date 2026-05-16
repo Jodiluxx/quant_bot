@@ -123,12 +123,18 @@ Testnet reconciliations, daily loss limits, position limits and kill-switch
 controls. It does not enable live trading; mainnet order submission remains
 blocked by code.
 
+Paper Trader State Extraction v7.23 moves state filtering and data-quality
+helpers into `quant_bot/paper_trader.py`: open positions, closed trades, daily
+trade count, independent setup count and duplicate-row diagnostics. Strategy
+logic remains in the legacy runtime for now.
+
 The first real extraction helpers now live in:
 
 - `quant_bot/execution_gateway.py`
 - `quant_bot/safety.py`
 - `quant_bot/analytics_reports.py`
 - `quant_bot/live_readiness.py`
+- `quant_bot/paper_trader.py`
 
 Safety Kill Switch v7.16 adds an Autobot safety screen. It can pause new paper
 entries, turn on observe-only mode, block after daily limits, and cool down

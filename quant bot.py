@@ -16408,7 +16408,72 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.22 Live Readiness Checklist"
+# ============================================================
+# v7.23 — PAPER TRADER STATE HELPER EXTRACTION
+# ============================================================
+# First real Paper Trader extraction: state filtering, daily counts and data
+# quality calculations now live in quant_bot.paper_trader.
+
+from quant_bot.paper_trader import (
+    closed_trades_for_chat as _paper_closed_trades_from_state_v723,
+    data_quality_summary as _paper_data_quality_summary_from_state_v723,
+    independent_market_setup_count as _paper_independent_market_count_v723,
+    independent_setup_count as _paper_independent_count_v723,
+    interval_minutes as _paper_interval_minutes_helper_v723,
+    parse_dt as _paper_parse_dt_helper_v723,
+    positions_for_chat as _paper_positions_from_state_v723,
+    setup_slot as _paper_setup_slot_helper_v723,
+    today_open_count as _paper_today_open_count_from_state_v723,
+)
+
+
+def _paper_positions(chat_id=None):
+    _paper_load_state()
+    return _paper_positions_from_state_v723(_paper_state, chat_id)
+
+
+def _paper_closed_trades(chat_id=None):
+    _paper_load_state()
+    return _paper_closed_trades_from_state_v723(_paper_state, chat_id)
+
+
+def _paper_today_open_count(chat_id):
+    _paper_load_state()
+    return _paper_today_open_count_from_state_v723(_paper_state, chat_id, datetime.now(timezone.utc))
+
+
+def _paper_interval_minutes_v79(interval):
+    return _paper_interval_minutes_helper_v723(interval, AUTO_SEND_INTERVALS)
+
+
+def _paper_parse_dt_v79(value):
+    return _paper_parse_dt_helper_v723(value)
+
+
+def _paper_setup_slot_v79(interval, value=None):
+    return _paper_setup_slot_helper_v723(interval, value, AUTO_SEND_INTERVALS)
+
+
+def _paper_independent_setup_count_v79(items):
+    return _paper_independent_count_v723(items, AUTO_SEND_INTERVALS)
+
+
+def _paper_independent_market_setup_count_v79(items):
+    return _paper_independent_market_count_v723(items, AUTO_SEND_INTERVALS)
+
+
+def paper_data_quality_summary(chat_id=None):
+    _paper_load_state()
+    return _paper_data_quality_summary_from_state_v723(_paper_state, chat_id, AUTO_SEND_INTERVALS)
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Модуль Paper Trader</b> — отдельный файл с чистыми функциями для paper-state: открытые позиции, закрытые сделки, дневной лимит и качество данных. Это не новая стратегия, а архитектурное разделение, чтобы большой файл постепенно уменьшался.
+"""
+
+
+BOT_VERSION_LABEL = "v7.23 Paper Trader State Extraction"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -16457,6 +16522,7 @@ RUNTIME_LAYERS = [
     ("v7.20", "Testnet STOP_MARKET/TAKE_PROFIT_MARKET protection order validation"),
     ("v7.21", "Testnet journal, reconciliation report and package helper extraction"),
     ("v7.22", "live readiness checklist for paper, testnet, safety and setup evidence"),
+    ("v7.23", "Paper Trader state helpers extracted into quant_bot.paper_trader"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -16491,6 +16557,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "paper_select_trade_candidate": paper_select_trade_candidate,
     "paper_trader_scan_tickers": paper_trader_scan_tickers,
     "format_paper_report": format_paper_report,
+    "_paper_positions": _paper_positions,
+    "_paper_closed_trades": _paper_closed_trades,
+    "_paper_today_open_count": _paper_today_open_count,
     "paper_data_quality_summary": paper_data_quality_summary,
     "format_bot_quality_report": format_bot_quality_report,
     "format_setup_analytics_report": format_setup_analytics_report,
@@ -16568,6 +16637,12 @@ def validate_runtime_architecture():
         errors.append("risk manager decision helper is missing")
     if not callable(globals().get("paper_data_quality_summary")):
         errors.append("paper data quality summary is missing")
+    if not callable(globals().get("_paper_positions")):
+        errors.append("paper positions helper is missing")
+    if not callable(globals().get("_paper_closed_trades")):
+        errors.append("paper closed-trades helper is missing")
+    if not callable(globals().get("_paper_today_open_count")):
+        errors.append("paper daily count helper is missing")
     if not callable(globals().get("_paper_duplicate_reason_v79")):
         errors.append("paper duplicate guard is missing")
     if not callable(globals().get("format_bot_quality_report")):
