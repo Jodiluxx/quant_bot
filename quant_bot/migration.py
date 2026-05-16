@@ -33,8 +33,8 @@ MIGRATION_AREAS: list[dict[str, Any]] = [
         "area": "Analytics reports",
         "status": "partial",
         "modules": ["quant_bot.analytics_reports"],
-        "legacy": "bot quality, setup analytics, calibration and period reports still mostly in quant bot.py",
-        "next": "move calculation functions before moving Telegram formatting",
+        "legacy": "bot quality, setup analytics, report formatting and period reports still mostly in quant bot.py",
+        "next": "continue moving setup/report calculations before moving Telegram formatting",
         "risk": "medium",
     },
     {

@@ -145,6 +145,11 @@ break-even SL, max-hold timing, price exit signals and close-trade accounting.
 The legacy runtime still owns state mutation, price fetching and Telegram side
 effects.
 
+Analytics Reports Extraction v7.27 moves probability-calibration math into
+`quant_bot/analytics_reports.py`: probability normalization, probability
+buckets, calibration stats and grouped ECE. The Telegram report text still
+lives in the legacy runtime until the calculation layer has more tests.
+
 The first real extraction helpers now live in:
 
 - `quant_bot/execution_gateway.py`

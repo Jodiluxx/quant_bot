@@ -3,6 +3,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..analytics_reports import (
+    calibration_group,
+    calibration_stats,
+    probability_bucket,
+    probability_value,
+)
 from ..legacy import call_legacy
 
 

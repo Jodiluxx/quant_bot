@@ -16809,7 +16809,43 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.26 Paper Trader Engine Extraction Phase 1"
+# ============================================================
+# v7.27 - ANALYTICS REPORTS EXTRACTION PHASE 1
+# ============================================================
+# Move probability-calibration math to quant_bot.analytics_reports. The legacy
+# runtime still owns journal loading and Telegram report formatting.
+
+from quant_bot.analytics_reports import (
+    calibration_group as _analytics_calibration_group_v727,
+    calibration_stats as _analytics_calibration_stats_v727,
+    probability_bucket as _analytics_probability_bucket_v727,
+    probability_value as _analytics_probability_value_v727,
+)
+
+
+def _prob_value_v712(value):
+    return _analytics_probability_value_v727(value)
+
+
+def _prob_bucket_v712(prob, step=5):
+    return _analytics_probability_bucket_v727(prob, step)
+
+
+def _calibration_stats_v712(rows):
+    return _analytics_calibration_stats_v727(rows)
+
+
+def _calibration_group_v712(rows, key_fn, min_n=20):
+    return _analytics_calibration_group_v727(rows, key_fn, min_n)
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Probability calibration engine</b> - pure calculation layer for checking whether the bot's stated probabilities match real outcomes. It does not open trades; it only measures honesty of the forecast.
+"""
+
+
+BOT_VERSION_LABEL = "v7.27 Analytics Reports Extraction Phase 1"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -16862,6 +16898,7 @@ RUNTIME_LAYERS = [
     ("v7.24", "Paper journal and execution view helpers extracted to package modules"),
     ("v7.25", "migration checklist report and unittest foundation"),
     ("v7.26", "Paper Trader engine math extracted for fills, TP1, BE and exits"),
+    ("v7.27", "Probability calibration math extracted to analytics reports module"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -16908,6 +16945,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_bot_quality_report": format_bot_quality_report,
     "format_setup_analytics_report": format_setup_analytics_report,
     "format_probability_calibration_report": format_probability_calibration_report,
+    "probability_value": _prob_value_v712,
+    "calibration_stats": _calibration_stats_v712,
+    "calibration_group": _calibration_group_v712,
     "tf_quality_summary": tf_quality_summary_v713,
     "execution_mode": execution_mode,
     "build_execution_order_plan": build_execution_order_plan,
@@ -17003,6 +17043,10 @@ def validate_runtime_architecture():
         errors.append("setup analytics report is missing")
     if not callable(globals().get("format_probability_calibration_report")):
         errors.append("probability calibration report is missing")
+    if not callable(globals().get("_calibration_stats_v712")):
+        errors.append("probability calibration stats helper is missing")
+    if not callable(globals().get("_calibration_group_v712")):
+        errors.append("probability calibration group helper is missing")
     if not callable(globals().get("tf_quality_summary_v713")):
         errors.append("timeframe quality summary is missing")
     if not callable(globals().get("_paper_take_partial_tp1_v714")):
