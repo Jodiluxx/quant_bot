@@ -153,3 +153,61 @@ def data_quality_summary(
         "market_open_duplicate_rows": max(0, len(positions) - open_market_setups),
         "data_quality_version": "v7.9",
     }
+
+
+def short_text(value: Any, limit: int = 115) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if len(text) <= int(limit):
+        return text
+    return text[: max(0, int(limit) - 1)].rstrip() + "…"
+
+
+def pnl_label(item: dict[str, Any]) -> str:
+    net = safe_float(item.get("net_usd"), 0.0)
+    pct = safe_float(item.get("net_pct_balance"), 0.0)
+    icon = "✅" if net > 0 else ("❌" if net < 0 else "⚪")
+    return f"{icon} {net:+.3f} USDT ({pct:+.2f}%)"
+
+
+def exit_badge(item: dict[str, Any]) -> str:
+    reason = str(item.get("exit_reason") or "closed").upper()
+    if "TP" in reason:
+        return "✅ TP1"
+    if "SL" in reason:
+        return "❌ SL"
+    return f"⚪ {reason}"
+
+
+def strategy_lines(trades: list[dict[str, Any]], limit: int = 4) -> list[str]:
+    by_strategy: dict[str, dict[str, Any]] = {}
+    for trade in trades or []:
+        name = str(trade.get("strategy") or "unknown")
+        row = by_strategy.setdefault(name, {"n": 0, "w": 0, "net": 0.0})
+        row["n"] += 1
+        net = safe_float(trade.get("net_usd"), 0.0)
+        row["net"] += net
+        row["w"] += 1 if net > 0 else 0
+    lines: list[str] = []
+    rows = sorted(by_strategy.items(), key=lambda kv: kv[1]["net"], reverse=True)
+    for name, row in rows[: int(limit)]:
+        wr = row["w"] / row["n"] * 100 if row["n"] else 0.0
+        lines.append(f"• {name}: {row['n']} сдел. | WR {wr:.0f}% | {row['net']:+.3f} USDT")
+    return lines
+
+
+def directional_factors(item: dict[str, Any], limit: int = 95) -> tuple[list[str], list[str]]:
+    decision = item.get("decision") or {}
+    direction = str(item.get("direction") or "").lower()
+    bull = [short_text(value, limit) for value in (decision.get("bull_factors") or []) if value]
+    bear = [short_text(value, limit) for value in (decision.get("bear_factors") or []) if value]
+    warnings = [short_text(value, limit) for value in (decision.get("warnings") or []) if value]
+    if direction == "short":
+        support = bear
+        risks = bull + warnings
+    elif direction == "long":
+        support = bull
+        risks = bear + warnings
+    else:
+        support = bull + bear
+        risks = warnings
+    return support[:2], risks[:2]

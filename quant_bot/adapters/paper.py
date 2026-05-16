@@ -36,3 +36,11 @@ def paper_today_open_count(*args: Any, **kwargs: Any) -> Any:
 
 def paper_data_quality_summary(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("paper_data_quality_summary", *args, **kwargs)
+
+
+def paper_strategy_lines(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_strategy_lines_v77", *args, **kwargs)
+
+
+def paper_directional_factors(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_directional_factors_v77", *args, **kwargs)

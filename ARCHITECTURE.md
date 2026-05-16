@@ -44,7 +44,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.23 Paper Trader State Extraction`.
+Current active runtime is `v7.24 Paper Journal + Execution View Helpers`.
 
 Layer summary:
 
@@ -70,6 +70,8 @@ Layer summary:
 20. v7.22: live-readiness checklist for paper evidence, testnet checks,
     safety limits, kill switch and setup statistics
 21. v7.23: Paper Trader state helpers extracted into `quant_bot.paper_trader`
+22. v7.24: Paper journal helpers and execution/testnet view helpers extracted
+    into package modules
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

@@ -16473,7 +16473,90 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.23 Paper Trader State Extraction"
+# ============================================================
+# v7.24 — PAPER JOURNAL + EXECUTION VIEW HELPERS
+# ============================================================
+# Extract more presentation helpers while keeping strategy and Telegram routing
+# inside the legacy runtime for now.
+
+from quant_bot.execution_gateway import (
+    execution_plan_view as _execution_plan_view_v724,
+    format_execution_qty as _format_execution_qty_v724,
+    testnet_event_view as _testnet_event_view_v724,
+)
+from quant_bot.paper_trader import (
+    directional_factors as _paper_directional_factors_v724,
+    exit_badge as _paper_exit_badge_v724,
+    pnl_label as _paper_pnl_label_v724,
+    short_text as _paper_short_text_v724,
+    strategy_lines as _paper_strategy_lines_v724,
+)
+
+
+def _short_text_v77(value, limit=115):
+    plain = _plain_report_text_v76(str(value or ""))
+    return _paper_short_text_v724(plain, limit)
+
+
+def _pnl_label_v77(item):
+    return _paper_pnl_label_v724(item)
+
+
+def _exit_badge_v77(item):
+    return _paper_exit_badge_v724(item)
+
+
+def _strategy_lines_v77(trades):
+    return _paper_strategy_lines_v724(trades)
+
+
+def _directional_factors_v77(item):
+    return _paper_directional_factors_v724(item, limit=95)
+
+
+def _fmt_execution_qty_v715(value):
+    return _format_execution_qty_v724(value)
+
+
+def _execution_plan_line_v715(plan):
+    view = _execution_plan_view_v724(plan)
+    ticker = view.get("ticker")
+    label = TICKERS.get(ticker, {}).get("label", ticker)
+    tf = INTERVALS.get(view.get("interval"), {}).get("label", view.get("interval"))
+    return (
+        f"• {_fmt_dt_short(view.get('created_at'))} | {label} {view.get('direction')} | {tf}\n"
+        f"  {view.get('status')} | qty≈{view.get('quantity_text')} | notional≈{view.get('notional', 0):.2f} USDT"
+    )
+
+
+def _testnet_status_word_v721(event):
+    return _testnet_event_view_v724(event).get("status")
+
+
+def _testnet_event_line_v721(event):
+    view = _testnet_event_view_v724(event)
+    bits = [f"{view.get('kind')} {view.get('status')}", str(view.get("ticker") or "?"), str(view.get("direction") or "?")]
+    if view.get("type"):
+        bits.append(str(view.get("type")))
+    if view.get("side"):
+        bits.append(str(view.get("side")))
+    if view.get("quantity"):
+        bits.append(f"qty={view.get('quantity')}")
+    if view.get("stop_price"):
+        bits.append(f"stop={view.get('stop_price')}")
+    line = f"• {_fmt_dt_short(view.get('ts'))} | " + " | ".join(bits)
+    if view.get("reason"):
+        line += f"\n  причина: {view.get('reason')}"
+    return line
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>View helper</b> — маленькая функция, которая превращает сырые данные сделки/ордера в удобную форму для отчёта. Это не торговая логика: она не решает, входить или нет, а только помогает честно и одинаково показывать журнал.
+"""
+
+
+BOT_VERSION_LABEL = "v7.24 Paper Journal + Execution View Helpers"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -16523,6 +16606,7 @@ RUNTIME_LAYERS = [
     ("v7.21", "Testnet journal, reconciliation report and package helper extraction"),
     ("v7.22", "live readiness checklist for paper, testnet, safety and setup evidence"),
     ("v7.23", "Paper Trader state helpers extracted into quant_bot.paper_trader"),
+    ("v7.24", "Paper journal and execution view helpers extracted to package modules"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -16557,6 +16641,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "paper_select_trade_candidate": paper_select_trade_candidate,
     "paper_trader_scan_tickers": paper_trader_scan_tickers,
     "format_paper_report": format_paper_report,
+    "paper_strategy_lines": _strategy_lines_v77,
+    "paper_directional_factors": _directional_factors_v77,
     "_paper_positions": _paper_positions,
     "_paper_closed_trades": _paper_closed_trades,
     "_paper_today_open_count": _paper_today_open_count,
@@ -16567,11 +16653,13 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "tf_quality_summary": tf_quality_summary_v713,
     "execution_mode": execution_mode,
     "build_execution_order_plan": build_execution_order_plan,
+    "execution_plan_line": _execution_plan_line_v715,
     "format_execution_status": format_execution_status,
     "submit_testnet_order_test": submit_testnet_order_test,
     "submit_testnet_protection_order_tests": submit_testnet_protection_order_tests,
     "validate_protection_order_geometry": validate_protection_order_geometry,
     "format_testnet_status": format_testnet_status,
+    "testnet_event_line": _testnet_event_line_v721,
     "format_testnet_journal_report": format_testnet_journal_report,
     "format_testnet_reconciliation_report": format_testnet_reconciliation_report,
     "build_live_readiness_checklist": build_live_readiness_checklist,
@@ -16637,6 +16725,10 @@ def validate_runtime_architecture():
         errors.append("risk manager decision helper is missing")
     if not callable(globals().get("paper_data_quality_summary")):
         errors.append("paper data quality summary is missing")
+    if not callable(globals().get("_strategy_lines_v77")):
+        errors.append("paper strategy-lines helper is missing")
+    if not callable(globals().get("_directional_factors_v77")):
+        errors.append("paper directional-factors helper is missing")
     if not callable(globals().get("_paper_positions")):
         errors.append("paper positions helper is missing")
     if not callable(globals().get("_paper_closed_trades")):
@@ -16661,6 +16753,8 @@ def validate_runtime_architecture():
         errors.append("execution order plan builder is missing")
     if not callable(globals().get("format_execution_status")):
         errors.append("execution status report is missing")
+    if not callable(globals().get("_execution_plan_line_v715")):
+        errors.append("execution plan line helper is missing")
     if not callable(globals().get("build_safety_decision")):
         errors.append("safety decision helper is missing")
     if not callable(globals().get("format_safety_status")):
@@ -16675,6 +16769,8 @@ def validate_runtime_architecture():
         errors.append("testnet order test submitter is missing")
     if not callable(globals().get("format_testnet_status")):
         errors.append("testnet status report is missing")
+    if not callable(globals().get("_testnet_event_line_v721")):
+        errors.append("testnet event line helper is missing")
     if not callable(globals().get("validate_protection_order_geometry")):
         errors.append("protection geometry validator is missing")
     if not callable(globals().get("submit_testnet_protection_order_tests")):

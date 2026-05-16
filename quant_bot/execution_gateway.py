@@ -22,6 +22,39 @@ def format_decimal(value: Any, max_decimals: int = 8) -> str:
     return f"{number:.{int(max_decimals)}f}".rstrip("0").rstrip(".") or "0"
 
 
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def format_execution_qty(value: Any) -> str:
+    try:
+        number = float(value)
+        if number >= 100:
+            return f"{number:.2f}"
+        if number >= 1:
+            return f"{number:.4f}"
+        return f"{number:.6f}"
+    except Exception:
+        return "—"
+
+
+def execution_plan_view(plan: dict[str, Any] | None) -> dict[str, Any]:
+    plan = plan or {}
+    order = plan.get("entry_order") or {}
+    return {
+        "created_at": plan.get("created_at"),
+        "ticker": plan.get("ticker"),
+        "interval": plan.get("interval"),
+        "direction": str(plan.get("direction") or "").upper(),
+        "status": plan.get("status") or "—",
+        "quantity_text": format_execution_qty(order.get("quantity_est")),
+        "notional": safe_float(order.get("notional_est"), 0.0),
+    }
+
+
 def response_reason(payload: Any) -> str:
     if isinstance(payload, dict):
         code = payload.get("code")
@@ -42,6 +75,23 @@ def event_status(event: dict[str, Any] | None) -> str:
     if event:
         return "REJECTED"
     return "MISSING"
+
+
+def testnet_event_view(event: dict[str, Any] | None) -> dict[str, Any]:
+    event = event or {}
+    request = event.get("request") or {}
+    return {
+        "ts": event.get("ts"),
+        "kind": "ENTRY" if event.get("kind") == "entry" else "PROTECT",
+        "status": event_status(event),
+        "ticker": event.get("ticker") or "?",
+        "direction": str(event.get("direction") or "?").upper(),
+        "type": request.get("type"),
+        "side": request.get("side"),
+        "quantity": request.get("quantity"),
+        "stop_price": request.get("stopPrice"),
+        "reason": event.get("reason"),
+    }
 
 
 def protection_status(event: dict[str, Any] | None) -> str:

@@ -14,6 +14,10 @@ def build_execution_order_plan(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("build_execution_order_plan", *args, **kwargs)
 
 
+def execution_plan_line(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_execution_plan_line_v715", *args, **kwargs)
+
+
 def format_execution_status(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_execution_status", *args, **kwargs)
 
@@ -32,6 +36,10 @@ def submit_testnet_protection_order_tests(*args: Any, **kwargs: Any) -> Any:
 
 def format_testnet_status(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("format_testnet_status", *args, **kwargs)
+
+
+def testnet_event_line(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_testnet_event_line_v721", *args, **kwargs)
 
 
 def format_testnet_journal_report(*args: Any, **kwargs: Any) -> Any:

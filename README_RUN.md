@@ -128,6 +128,12 @@ helpers into `quant_bot/paper_trader.py`: open positions, closed trades, daily
 trade count, independent setup count and duplicate-row diagnostics. Strategy
 logic remains in the legacy runtime for now.
 
+Paper Journal + Execution View Helpers v7.24 moves another safe layer out of
+the legacy runtime: Paper journal labels/factors/strategy summaries now live in
+`quant_bot/paper_trader.py`, and execution/testnet display helpers live in
+`quant_bot/execution_gateway.py`. These helpers format reports only; they do
+not change entry rules or live-trading permissions.
+
 The first real extraction helpers now live in:
 
 - `quant_bot/execution_gateway.py`
