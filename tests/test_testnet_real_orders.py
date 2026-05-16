@@ -41,6 +41,7 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
         env = {
             "BOT_EXECUTION_MODE": "testnet",
             "BINANCE_TESTNET_ORDER_SUBMIT": "1",
+            "BINANCE_TESTNET_REAL_ORDER_SUBMIT": "0",
             "BINANCE_FUTURES_TESTNET_API_KEY": "key",
             "BINANCE_FUTURES_TESTNET_API_SECRET": "secret",
         }
