@@ -45,7 +45,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.27 Analytics Reports Extraction Phase 1`.
+Current active runtime is `v7.28 Telegram UI Polish Phase 1`.
 
 Layer summary:
 
@@ -79,6 +79,8 @@ Layer summary:
 25. v7.27: probability calibration math extracted into
     `quant_bot.analytics_reports` while Telegram report formatting stays in
     the legacy runtime
+26. v7.28: Telegram UI polish for the main menu, compact signal card,
+    Autobot/PaperTrader screen, market scan card and position update card
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

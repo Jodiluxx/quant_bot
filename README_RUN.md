@@ -150,6 +150,11 @@ Analytics Reports Extraction v7.27 moves probability-calibration math into
 buckets, calibration stats and grouped ECE. The Telegram report text still
 lives in the legacy runtime until the calculation layer has more tests.
 
+Telegram UI Polish v7.28 keeps trading logic unchanged and only improves
+presentation: compact main menu, shorter signal cards, cleaner
+Autobot/PaperTrader buttons, compact market scan cards and readable position
+updates. Existing `callback_data` values are preserved.
+
 The first real extraction helpers now live in:
 
 - `quant_bot/execution_gateway.py`

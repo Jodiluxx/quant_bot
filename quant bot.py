@@ -16845,7 +16845,508 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.27 Analytics Reports Extraction Phase 1"
+# ============================================================
+# v7.28 - TELEGRAM UI POLISH PHASE 1
+# ============================================================
+# Presentation-only layer: compact Telegram cards and cleaner keyboards.
+# Trading calculations, filters, risk gates and exchange logic are unchanged.
+
+def _ui_html(value):
+    text = str(value or "")
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _ui_short_text(value, limit=96):
+    text = " ".join(str(value or "").replace("\n", " ").split())
+    if len(text) <= int(limit):
+        return _ui_html(text)
+    return _ui_html(text[: max(0, int(limit) - 1)].rstrip() + "…")
+
+
+def _ui_tf_short(interval):
+    text = str(interval or "")
+    if text.endswith("m"):
+        return text[:-1] + "м"
+    if text.endswith("h"):
+        return text[:-1] + "ч"
+    if text.endswith("d"):
+        return text[:-1] + "д"
+    label = str(INTERVALS.get(text, {}).get("label") or AUTO_SEND_INTERVALS.get(text, {}).get("label") or text)
+    return label.replace(" минут", "м").replace(" минута", "м").replace(" мин", "м").replace(" часа", "ч").replace(" час", "ч")
+
+
+def _ui_ticker_short(ticker):
+    symbol = futures_api_symbol(ticker) if "futures_api_symbol" in globals() else str(ticker or "")
+    return str(symbol or ticker).replace("USDT", "")
+
+
+def _ui_task_name(task_key):
+    return {
+        "signals": "Сигнал",
+        "heatmap": "Heatmap",
+        "fear_greed": "Fear & Greed",
+        "backtest": "Backtest",
+        "wfo": "Walk-Forward",
+        "paper_trader": "Paper Trader",
+    }.get(task_key, str(task_key))
+
+
+def _ui_task_line(chat_id, task_key):
+    st = _get_auto_task_settings(chat_id, task_key)
+    global_on = chat_id in auto_chat_ids
+    state = "ON" if global_on and st.get("enabled") else "OFF"
+    interval = _ui_tf_short(st.get("send_interval"))
+    return f"• {_ui_task_name(task_key)} — <b>{state}</b> | {interval}"
+
+
+def _ui_signal_direction(data):
+    direction = data.get("direction") or _signal_direction_from_text(data.get("signal"))
+    if direction in {"long", "short"}:
+        return direction.upper()
+    return "WAIT"
+
+
+def _ui_status_plain(status):
+    return {
+        "ENTER_NOW": "READY",
+        "WAIT_RETEST": "WAIT RETEST",
+        "WAIT_CONFIRMATION": "WAIT CONFIRM",
+        "NO_ENTRY": "BLOCKED",
+        "NO_SETUP": "WAIT",
+        "TP1_PARTIAL": "TP1",
+        "SL_BE": "BE STOP",
+    }.get(str(status or "").upper(), str(status or "WAIT").replace("_", " "))
+
+
+def _ui_status_emoji(status):
+    plain = _ui_status_plain(status)
+    if plain == "READY":
+        return "🟢 READY"
+    if plain.startswith("WAIT"):
+        return "🟡 " + plain
+    if plain == "BLOCKED":
+        return "🔴 BLOCKED"
+    return "⚪ " + plain
+
+
+def _ui_regime_text(data):
+    regime = str(data.get("micro_regime") or data.get("regime") or "neutral").upper()
+    return regime.replace("_", " ")
+
+
+def _ui_volume_text(data):
+    vol = data.get("vol_ratio")
+    if isinstance(vol, (int, float)):
+        if vol >= 1.3:
+            return f"confirmed ({vol:.1f}x)"
+        if vol < 0.7:
+            return f"weak ({vol:.1f}x)"
+        return f"normal ({vol:.1f}x)"
+    return "n/a"
+
+
+def _ui_directional_lists(data, direction, limit=3):
+    if str(direction).lower() == "short":
+        support = data.get("bear_args") or []
+        risk = list(data.get("bull_args") or []) + list(data.get("risk_warnings") or [])
+    elif str(direction).lower() == "long":
+        support = data.get("bull_args") or []
+        risk = list(data.get("bear_args") or []) + list(data.get("risk_warnings") or [])
+    else:
+        support = list(data.get("bull_args") or []) + list(data.get("bear_args") or [])
+        risk = list(data.get("risk_warnings") or []) + list(data.get("neutral") or [])
+    return support[:limit], risk[:limit]
+
+
+def format_main_status(chat_id):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    manual_positions = len(get_user_positions(chat_id))
+    paper_positions = len(_paper_positions(chat_id)) if "_paper_positions" in globals() else 0
+    auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
+    lines = [
+        "🏠 <b>Главное меню</b>",
+        "",
+        f"Актив: <b>{_ui_ticker_short(ticker)}</b> | TF: <b>{_ui_tf_short(interval)}</b>",
+        f"Авто: <b>{auto_state}</b> | Позиции: <b>{manual_positions + paper_positions}</b>",
+        "",
+        "<b>Авто-задачи:</b>",
+    ]
+    for key in ("signals", "heatmap", "fear_greed", "backtest", "wfo", "paper_trader"):
+        if key in AUTO_TASKS:
+            lines.append(_ui_task_line(chat_id, key))
+    return "\n".join(lines)
+
+
+def main_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "📡 Сигнал", "callback_data": "menu_signal"},
+            {"text": "🤖 Автобот", "callback_data": "menu_autobot"},
+        ],
+        [
+            {"text": "📈 Аналитика", "callback_data": "menu_analytics"},
+            {"text": "💼 Позиции", "callback_data": "menu_positions"},
+        ],
+        [
+            {"text": "⚙️ Настройки", "callback_data": "menu_settings"},
+            {"text": "📚 Обучение", "callback_data": "menu_learn"},
+        ],
+        [
+            {"text": "🌊 Market Flow", "callback_data": "menu_flow"},
+            {"text": "😱 Fear & Greed", "callback_data": "get_fg"},
+        ],
+        [
+            {"text": "💰 Цена", "callback_data": "get_price"},
+            {"text": "🎯 Вход", "callback_data": "entry_point"},
+        ],
+    ]}
+
+
+def format_signal_summary(data, ticker, interval):
+    direction = _ui_signal_direction(data)
+    plan = data.get("entry_plan") or {}
+    status = plan.get("status") or ("ENTER_NOW" if direction in {"LONG", "SHORT"} else "NO_SETUP")
+    tf = _ui_tf_short(interval)
+    strategy = data.get("strategy") or plan.get("strategy") or "Signal engine"
+    price = data.get("price")
+    confidence = int(data.get("confidence") or 0)
+    prob = _prob_value_v712(data.get("prob")) if "_prob_value_v712" in globals() else data.get("prob")
+    prob_text = f"{prob * 100:.1f}%" if isinstance(prob, (int, float)) and prob > 0 else "n/a"
+    entry_now = int(plan.get("entry_now_score", plan.get("score", 0)) or 0)
+    setup_score = int(plan.get("setup_score", plan.get("score", 0)) or 0)
+    risk = data.get("risk_levels") or {}
+    rr = _safe_float(plan.get("rr_now"), None)
+    if rr is None or rr <= 0:
+        rr = _safe_float(risk.get("rr_ratio"), 0) or 0
+    support, risks = _ui_directional_lists(data, direction.lower(), 3)
+
+    lines = [
+        f"📡 <b>{_ui_ticker_short(ticker)}USDT • {direction}</b>",
+        f"TF: <b>{tf}</b> | Strategy: <b>{_ui_html(strategy)}</b>",
+        "",
+        "<b>Статус:</b>",
+        f"{_ui_status_emoji(status)}",
+        f"Confidence: <b>{confidence}/100</b> | Probability: <b>{prob_text}</b>",
+        f"Цена: <b>{fmt_price(price, ticker)}</b>",
+    ]
+
+    if data.get("anomaly_reason"):
+        lines += [
+            "",
+            "<b>Риск:</b>",
+            _ui_short_text(data.get("anomaly_reason"), 120),
+            "Не входить, пока данные выглядят аномально.",
+        ]
+        return "\n".join(lines)
+
+    if risk:
+        lines += [
+            "",
+            "<b>Вход:</b>",
+            f"• Entry: <b>{fmt_price(price, ticker)}</b>",
+            f"• Stop: <b>{fmt_price(risk.get('sl'), ticker)}</b>",
+            f"• TP1: <b>{fmt_price(risk.get('tp1'), ticker)}</b>",
+            f"• TP2: <b>{fmt_price(risk.get('tp2'), ticker)}</b>",
+            f"• RR: <b>{rr:.2f}x</b>",
+        ]
+
+    lines += [
+        "",
+        "<b>Оценка:</b>",
+        f"• EntryNow: <b>{entry_now}/100</b> | Setup: <b>{setup_score}/100</b>",
+        f"• Score: <b>{_format_signal_score(data)}</b>",
+        "",
+        "<b>Контекст:</b>",
+        f"• Trend: <b>{_ui_html(_ui_regime_text(data))}</b>",
+        f"• Volume: <b>{_ui_html(_ui_volume_text(data))}</b>",
+        f"• Market Flow: <b>{_ui_html((plan.get('orderflow_state') or 'n/a'))}</b>",
+    ]
+
+    if support:
+        lines += ["", "<b>Почему идея есть:</b>"]
+        lines += [f"• {_ui_short_text(item)}" for item in support[:3]]
+    if risks:
+        lines += ["", "<b>Что может сломать:</b>"]
+        lines += [f"• {_ui_short_text(item)}" for item in risks[:3]]
+
+    risk_note = "не входить повышенным размером; риск на сделку держать маленьким."
+    if _ui_status_plain(status) != "READY":
+        risk_note = "вход сейчас может быть поздним; лучше дождаться условий из кнопки «Вход»."
+    lines += ["", "<b>Риск:</b>", risk_note]
+    return "\n".join(lines)
+
+
+def format_msg(data, ticker, interval):
+    return format_signal_summary(data, ticker, interval)
+
+
+def _format_scan_rows(tried):
+    ranked = sorted(
+        [x for x in tried if not x.get("error")],
+        key=lambda x: (x.get("entry_now", 0), x.get("setup", 0), x.get("rr", 0)),
+        reverse=True,
+    )
+    lines = []
+    for idx, row in enumerate(ranked[:5], 1):
+        ticker = row.get("ticker")
+        status = _ui_status_plain(row.get("status"))
+        lines.append(
+            f"{idx}) {_ui_ticker_short(ticker)} {_ui_tf_short(row.get('tf'))} — <b>{_ui_html(status)}</b>\n"
+            f"   Entry: {row.get('entry_now', 0)}/100 | Setup: {row.get('setup', 0)}/100 | RR: {row.get('rr', 0):.2f}x"
+        )
+    errors = [x for x in tried if x.get("error")]
+    if errors:
+        lines.append(f"• Ошибок данных: {len(errors)}")
+    return lines
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _paper_load_state()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d • %H:%M UTC")
+    closed = _paper_manage_open_positions(chat_id)
+    open_positions = _paper_positions(chat_id)
+    lines = [
+        "🤖 <b>Market Scan</b>",
+        now,
+        "",
+        "<b>Статус:</b>",
+        f"• Активов: <b>{len(PAPER_TRADER_SCAN_TICKERS)}</b>",
+        f"• Таймфреймов: <b>{len(PAPER_TRADER_TFS)}</b>",
+        f"• Позиции: <b>{len(open_positions)}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"• Сегодня: <b>{_paper_today_open_count(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+    ]
+    if closed:
+        lines += ["", "<b>Закрыто в этом цикле:</b>"]
+        for trade in closed[-2:]:
+            lines.append(
+                f"• {_ui_ticker_short(trade.get('ticker'))} {str(trade.get('direction')).upper()} "
+                f"{_ui_html(trade.get('exit_reason'))} | {trade.get('net_usd', 0):+.3f} USDT"
+            )
+
+    if _paper_today_open_count(chat_id) >= PAPER_TRADER_MAX_TRADES_PER_DAY:
+        lines += [
+            "",
+            "<b>Решение:</b>",
+            "Сделка не открыта.",
+            "Дневной лимит сделок достигнут. Это защита от overtrading.",
+        ]
+        return "\n".join(lines)
+
+    candidate, tried = paper_select_trade_candidate(chat_id)
+    if not candidate:
+        lines += [
+            "",
+            "<b>Решение:</b>",
+            "Сделка не открыта.",
+            "Подходящий сетап не прошёл фильтры.",
+            "",
+            "<b>Топ сетапы:</b>",
+        ]
+        lines.extend(_format_scan_rows(tried) or ["• Данных для сравнения нет."])
+        lines += ["", "<b>Примечание:</b>", "Бот сканирует рынок, но не обязан открывать сделку каждый цикл."]
+        return "\n".join(lines)
+
+    pos, err = _paper_open_candidate(chat_id, candidate)
+    if err:
+        lines += [
+            "",
+            "<b>Решение:</b>",
+            "Сделка не открыта.",
+            _ui_short_text(err, 180),
+            "",
+            "<b>Топ сетапы:</b>",
+        ]
+        lines.extend(_format_scan_rows(tried) or ["• Данных для сравнения нет."])
+        return "\n".join(lines)
+
+    lines += [
+        "",
+        "<b>Решение:</b>",
+        "Открыта paper-позиция.",
+        "",
+        f"<b>{_ui_ticker_short(pos['ticker'])} • {pos['direction'].upper()}</b>",
+        f"TF: <b>{_ui_tf_short(pos['interval'])}</b> | Strategy: <b>{_ui_html(pos.get('strategy'))}</b>",
+        f"Entry: <b>{fmt_price(pos['entry_price'], pos['ticker'])}</b>",
+        f"SL: <b>{fmt_price(pos['sl'], pos['ticker'])}</b> | TP1: <b>{fmt_price(pos['tp1'], pos['ticker'])}</b>",
+        f"Margin: <b>{pos['margin']:.2f} USDT</b> | x{pos['leverage']} | Risk: <b>{pos['risk_pct']:.2f}%</b>",
+        "",
+        "<b>Почему:</b>",
+        f"• {_ui_short_text(pos.get('reason'), 140)}",
+        "",
+        "<b>Важно:</b>",
+        "Paper mode: реальных ордеров на Binance нет.",
+    ]
+    return "\n".join(lines)
+
+
+def format_autobot_menu(chat_id):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+    positions = _paper_positions(chat_id)
+    trades = _paper_closed_trades(chat_id)
+    wins = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) > 0]
+    losses = [t for t in trades if (_safe_float(t.get("net_usd"), 0) or 0) < 0]
+    net = sum(_safe_float(t.get("net_usd"), 0) or 0 for t in trades)
+    paper_enabled = chat_id in auto_chat_ids and bool(_get_auto_task_settings(chat_id, "paper_trader").get("enabled"))
+    lines = [
+        "🤖 <b>Автобот / PaperTrader</b>",
+        "",
+        f"Paper mode: <b>{'ON' if paper_enabled else 'OFF'}</b>",
+        "Реальных ордеров: <b>нет</b>",
+        "",
+        "<b>Статистика:</b>",
+        f"• Открытые позиции: <b>{len(positions)}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"• Сделок сегодня: <b>{_paper_today_open_count(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+        f"• Закрыто: <b>{len(trades)}</b>",
+        f"• Win / Loss: <b>{len(wins)} / {len(losses)}</b>",
+        f"• Net PnL: <b>{net:+.3f} USDT</b>",
+        "",
+        "<b>Разделы:</b>",
+        "• paper-позиции и журнал",
+        "• ручной market scan",
+        "• качество, safety и testnet",
+    ]
+    return "\n".join(lines)
+
+
+def autobot_keyboard(chat_id):
+    _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+    return {"inline_keyboard": [
+        [
+            {"text": "▶️ Скан", "callback_data": "paper_run_now"},
+            {"text": "🟢 Открытые", "callback_data": "paper_open_positions"},
+        ],
+        [
+            {"text": "📕 Закрытые", "callback_data": "paper_closed_menu"},
+            {"text": "📒 Журнал", "callback_data": "paper_report_autobot"},
+        ],
+        [
+            {"text": "📊 Статистика", "callback_data": "setup_analytics"},
+            {"text": "🎯 Вероятности", "callback_data": "prob_calibration"},
+        ],
+        [
+            {"text": "✅ Quality", "callback_data": "bot_quality"},
+            {"text": "🧪 Execution", "callback_data": "execution_status"},
+        ],
+        [
+            {"text": "🧨 Safety", "callback_data": "safety_status"},
+            {"text": "🏁 Топ сетапы", "callback_data": "market_opportunities"},
+        ],
+        [
+            {"text": "📅 День/неделя", "callback_data": "performance_today"},
+            {"text": "🚦 Readiness", "callback_data": "live_readiness"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+def _opportunity_brief_line_v717(candidate, idx):
+    ticker = candidate.get("ticker")
+    tf = _ui_tf_short(candidate.get("interval"))
+    opp = candidate.get("opportunity") or {}
+    direction = str(candidate.get("direction") or "").upper()
+    status = "READY" if candidate.get("tradable") else "BLOCKED"
+    entry = int(opp.get("entry_now") or 0)
+    setup = int(opp.get("setup") or 0)
+    rr = _safe_float(opp.get("rr"), 0) or 0
+    line = (
+        f"{idx}) {_ui_ticker_short(ticker)} {tf} — <b>{direction} / {status}</b>\n"
+        f"   Entry: {entry}/100 | Setup: {setup}/100 | RR: {rr:.2f}x"
+    )
+    if candidate.get("blocked_reason"):
+        line += f"\n   Block: {_ui_short_text(candidate.get('blocked_reason'), 90)}"
+    return line
+
+
+def format_market_opportunities(chat_id):
+    candidates, tried = market_opportunity_scan(chat_id)
+    tradable = [c for c in candidates if c.get("tradable")]
+    blocked = [c for c in candidates if not c.get("tradable")]
+    lines = [
+        "🤖 <b>Market Scan</b>",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d • %H:%M UTC"),
+        "",
+        "<b>Статус:</b>",
+        f"• Активов: <b>{len(PAPER_TRADER_SCAN_TICKERS)}</b>",
+        f"• Таймфреймов: <b>{len(PAPER_TRADER_TFS)}</b>",
+        f"• Позиции: <b>{len(_paper_positions(chat_id))}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        "",
+        "<b>Решение:</b>",
+    ]
+    if tradable:
+        lines += ["Есть кандидаты, которые прошли фильтры."]
+    else:
+        lines += ["Сделка не открыта.", "Подходящий сетап не прошёл фильтры."]
+
+    shown = (tradable + blocked)[:7]
+    lines += ["", "<b>Топ сетапы:</b>"]
+    if shown:
+        for idx, cand in enumerate(shown, 1):
+            lines.append(_opportunity_brief_line_v717(cand, idx))
+    else:
+        lines.extend(_format_scan_rows(tried) or ["• Данных для сравнения нет."])
+    lines += ["", "<b>Примечание:</b>", "Market scan помогает выбрать, но не заставляет входить."]
+    return "\n".join(lines)
+
+
+def opportunity_report_keyboard_v717():
+    return {"inline_keyboard": [
+        [{"text": "▶️ Скан", "callback_data": "paper_run_now"}],
+        [{"text": "◀️ Автобот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def format_position_update(pos, current_price, advice, reason, urgency):
+    direction = pos["direction"]
+    entry = pos["entry_price"]
+    ticker = pos["ticker"]
+    interval = pos["interval"]
+    pnl_pct = (current_price - entry) / entry * 100 if direction == "long" else (entry - current_price) / entry * 100
+    status = {
+        "critical": "закрыть / сократить риск",
+        "warning": "внимание",
+        "info": "держать / ждать",
+    }.get(urgency, "ждать")
+    reason_lines = [x for x in str(reason or "").split("\n") if x.strip()][:3]
+    lines = [
+        f"💼 <b>{_ui_ticker_short(ticker)}USDT • {direction.upper()}</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b>",
+        "",
+        "<b>PnL:</b>",
+        f"• Сейчас: <b>{pnl_pct:+.2f}%</b>",
+        f"• Entry: <b>{fmt_price(entry, ticker)}</b>",
+        f"• Price: <b>{fmt_price(current_price, ticker)}</b>",
+        "",
+        "<b>Уровни:</b>",
+        f"• SL: <b>{fmt_price(pos.get('sl'), ticker)}</b>",
+        f"• TP1: <b>{fmt_price(pos.get('tp1'), ticker)}</b>",
+    ]
+    if pos.get("tp2"):
+        lines.append(f"• TP2: <b>{fmt_price(pos.get('tp2'), ticker)}</b>")
+    lines += [
+        "",
+        "<b>Статус:</b>",
+        _ui_html(status),
+        "",
+        "<b>Причина:</b>",
+    ]
+    lines.extend(f"• {_ui_short_text(item, 120)}" for item in (reason_lines or ["нет новой причины"]))
+    return "\n".join(lines)
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Telegram UI card</b> - compact bot message that keeps the decision, risk and next action visible without hiding them inside a long technical report.
+"""
+
+
+BOT_VERSION_LABEL = "v7.28 Telegram UI Polish Phase 1"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -16899,6 +17400,7 @@ RUNTIME_LAYERS = [
     ("v7.25", "migration checklist report and unittest foundation"),
     ("v7.26", "Paper Trader engine math extracted for fills, TP1, BE and exits"),
     ("v7.27", "Probability calibration math extracted to analytics reports module"),
+    ("v7.28", "Telegram UI polish for main menu, signal cards, Autobot and market scan"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
