@@ -27,6 +27,7 @@ quant_bot/
   safety.py                pure safety calculation helpers
   analytics_reports.py     pure analytics/report calculation helpers
   live_readiness.py        pure live-readiness checklist helpers
+  migration.py             migration status and next-step checklist
   paper_trader.py          pure Paper Trader state/statistics helpers
   adapters/
     market_data.py         candles, price, futures context
@@ -44,7 +45,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.24 Paper Journal + Execution View Helpers`.
+Current active runtime is `v7.25 Migration Checklist + Tests Foundation`.
 
 Layer summary:
 
@@ -72,6 +73,7 @@ Layer summary:
 21. v7.23: Paper Trader state helpers extracted into `quant_bot.paper_trader`
 22. v7.24: Paper journal helpers and execution/testnet view helpers extracted
     into package modules
+23. v7.25: migration checklist report and first unittest foundation
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.
@@ -81,6 +83,13 @@ Use this to check the architecture without starting the bot:
 ```powershell
 cd "D:\Trading project"
 .\run_bot.bat -CheckOnly
+```
+
+Run the focused unit tests directly:
+
+```powershell
+cd "D:\Trading project"
+python -m unittest discover -s tests
 ```
 
 Use this to start the bot:

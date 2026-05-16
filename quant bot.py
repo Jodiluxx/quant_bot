@@ -16556,7 +16556,112 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.24 Paper Journal + Execution View Helpers"
+# ============================================================
+# v7.25 — MIGRATION CHECKLIST + TEST FOUNDATION
+# ============================================================
+# This layer adds an architecture migration report and a test foundation. It
+# does not change strategy, risk gates, Testnet submission, or live permissions.
+
+from quant_bot.migration import checklist_payload as _migration_checklist_payload_v725
+
+_base_autobot_keyboard_v724 = autobot_keyboard
+_base_async_handle_update_v724 = async_handle_update
+
+
+def build_migration_checklist():
+    return _migration_checklist_payload_v725(BOT_VERSION_LABEL, RUNTIME_LAYERS, ACTIVE_RUNTIME_FUNCTIONS)
+
+
+def _migration_status_icon_v725(status):
+    status = str(status or "pending")
+    if status == "done":
+        return "✅"
+    if status == "partial":
+        return "🟡"
+    return "⚪"
+
+
+def format_migration_checklist():
+    data = build_migration_checklist()
+    summary = data.get("summary") or {}
+    lines = [
+        "🧭 Migration Checklist v7.25",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Runtime: {data.get('runtime_version')}",
+        f"Layers: {data.get('runtime_layers')} | Active functions: {data.get('active_functions')}",
+        f"Progress: {summary.get('progress', 0):.1f}% | done {summary.get('done', 0)} / partial {summary.get('partial', 0)} / pending {summary.get('pending', 0)}",
+        "",
+        "Что уже вынесено / что осталось:",
+    ]
+    for row in data.get("areas") or []:
+        modules = ", ".join(row.get("modules") or []) or "пока нет"
+        lines += [
+            "",
+            f"{_migration_status_icon_v725(row.get('status'))} {row.get('area')} — {row.get('status')}",
+            f"  modules: {modules}",
+            f"  legacy: {row.get('legacy')}",
+            f"  next: {row.get('next')}",
+            f"  risk: {row.get('risk')}",
+        ]
+    lines += ["", "Ближайшие безопасные шаги:"]
+    for step in data.get("next_steps") or []:
+        lines.append("• " + step)
+    lines += [
+        "",
+        "Торговый смысл: сначала переносим и покрываем тестами расчёты. Только потом трогаем исполнение ордеров. Так мы не превращаем рефакторинг в скрытую смену стратегии.",
+    ]
+    return "\n".join(lines)
+
+
+def migration_checklist_keyboard_v725():
+    return {"inline_keyboard": [
+        [
+            {"text": "📈 Качество бота", "callback_data": "bot_quality"},
+            {"text": "🚦 Live readiness", "callback_data": "live_readiness"},
+        ],
+        [{"text": "◀️ Назад", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def autobot_keyboard(chat_id):
+    kb = _base_autobot_keyboard_v724(chat_id)
+    rows = list(kb.get("inline_keyboard") or [])
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [{"text": "🧭 Migration checklist", "callback_data": "migration_checklist"}])
+    return {"inline_keyboard": rows}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _apply_auto_defaults_v78(chat_id, force=False, enable_global=True)
+            if data == "migration_checklist":
+                await async_answer_callback(session, callback_id, "Migration")
+                await async_send_plain_v76(session, chat_id, format_migration_checklist(), migration_checklist_keyboard_v725())
+                return
+        await _base_async_handle_update_v724(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v725] error: {e}")
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Migration checklist</b> — карта переноса кода из большого файла в нормальные модули. Она нужна, чтобы не переписывать всё хаотично и не менять торговую логику случайно.
+
+<b>Unit test</b> — маленькая автоматическая проверка одной функции. В quant-боте тесты нужны не для красоты, а чтобы риск-логика, SL/TP и статистика не ломались после новых правок.
+"""
+
+
+BOT_VERSION_LABEL = "v7.25 Migration Checklist + Tests Foundation"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -16607,6 +16712,7 @@ RUNTIME_LAYERS = [
     ("v7.22", "live readiness checklist for paper, testnet, safety and setup evidence"),
     ("v7.23", "Paper Trader state helpers extracted into quant_bot.paper_trader"),
     ("v7.24", "Paper journal and execution view helpers extracted to package modules"),
+    ("v7.25", "migration checklist report and unittest foundation"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -16664,6 +16770,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_testnet_reconciliation_report": format_testnet_reconciliation_report,
     "build_live_readiness_checklist": build_live_readiness_checklist,
     "format_live_readiness_checklist": format_live_readiness_checklist,
+    "build_migration_checklist": build_migration_checklist,
+    "format_migration_checklist": format_migration_checklist,
     "build_safety_decision": build_safety_decision,
     "format_safety_status": format_safety_status,
     "market_opportunity_scan": market_opportunity_scan,
@@ -16783,6 +16891,10 @@ def validate_runtime_architecture():
         errors.append("live readiness checklist builder is missing")
     if not callable(globals().get("format_live_readiness_checklist")):
         errors.append("live readiness checklist report is missing")
+    if not callable(globals().get("build_migration_checklist")):
+        errors.append("migration checklist builder is missing")
+    if not callable(globals().get("format_migration_checklist")):
+        errors.append("migration checklist report is missing")
     mode = _execution_mode_v715()
     if mode not in EXECUTION_ALLOWED_MODES:
         errors.append(f"invalid execution mode: {mode}")

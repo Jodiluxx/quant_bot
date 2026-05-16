@@ -9,12 +9,14 @@ import importlib.util
 import os
 import py_compile
 import sys
+import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 BOT_FILE = ROOT / "quant bot.py"
 RUNTIME_FILE = ROOT / "bot_runtime.py"
 PACKAGE_DIR = ROOT / "quant_bot"
+TESTS_DIR = ROOT / "tests"
 REQUIRED_MODULES = ["requests", "numpy", "scipy", "aiohttp", "asyncpg"]
 
 
@@ -34,6 +36,12 @@ def package_python_files() -> list[Path]:
     if not PACKAGE_DIR.exists():
         return []
     return sorted(PACKAGE_DIR.rglob("*.py"))
+
+
+def test_python_files() -> list[Path]:
+    if not TESTS_DIR.exists():
+        return []
+    return sorted(TESTS_DIR.rglob("*.py"))
 
 
 def main() -> int:
@@ -72,6 +80,11 @@ def main() -> int:
             py_compile.compile(str(path), doraise=True)
         if package_files:
             ok(f"quant_bot package syntax compiles ({len(package_files)} files)")
+        test_files = test_python_files()
+        for path in test_files:
+            py_compile.compile(str(path), doraise=True)
+        if test_files:
+            ok(f"tests syntax compiles ({len(test_files)} files)")
     except Exception as exc:
         fail(f"Syntax/import compile error: {exc}")
         return 1
@@ -99,6 +112,19 @@ def main() -> int:
     except Exception as exc:
         fail(f"Safe import failed: {exc}")
         errors += 1
+
+    if TESTS_DIR.exists():
+        try:
+            suite = unittest.defaultTestLoader.discover(str(TESTS_DIR), pattern="test*.py")
+            result = unittest.TextTestRunner(verbosity=0).run(suite)
+            if result.wasSuccessful():
+                ok(f"unit tests pass ({result.testsRun} tests)")
+            else:
+                fail(f"unit tests failed: failures={len(result.failures)} errors={len(result.errors)}")
+                errors += 1
+        except Exception as exc:
+            fail(f"unit test discovery failed: {exc}")
+            errors += 1
 
     if errors:
         fail(f"Setup check finished with {errors} problem(s)")

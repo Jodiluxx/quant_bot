@@ -134,12 +134,18 @@ the legacy runtime: Paper journal labels/factors/strategy summaries now live in
 `quant_bot/execution_gateway.py`. These helpers format reports only; they do
 not change entry rules or live-trading permissions.
 
+Migration Checklist + Tests Foundation v7.25 adds an Autobot migration report
+and a first `unittest` suite for Paper Trader state, Live Readiness,
+Execution/Testnet reconciliation, migration status, protection geometry and
+probability calibration.
+
 The first real extraction helpers now live in:
 
 - `quant_bot/execution_gateway.py`
 - `quant_bot/safety.py`
 - `quant_bot/analytics_reports.py`
 - `quant_bot/live_readiness.py`
+- `quant_bot/migration.py`
 - `quant_bot/paper_trader.py`
 
 Safety Kill Switch v7.16 adds an Autobot safety screen. It can pause new paper
@@ -150,6 +156,13 @@ Optional forced observe-only mode:
 
 ```powershell
 $env:BOT_OBSERVE_ONLY="1"
+```
+
+Run the unit tests without starting Telegram:
+
+```powershell
+cd "D:\Trading project"
+python -m unittest discover -s tests
 ```
 
 Smart Opportunity Ranking v7.17 adds a best-setups report in Autobot. It ranks
