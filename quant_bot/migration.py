@@ -55,10 +55,10 @@ MIGRATION_AREAS: list[dict[str, Any]] = [
     },
     {
         "area": "Paper Trader engine",
-        "status": "pending",
-        "modules": [],
-        "legacy": "candidate selection, opening, SL/TP/BE/max-hold/stale exits remain in quant bot.py",
-        "next": "extract pure position-management functions first",
+        "status": "partial",
+        "modules": ["quant_bot.paper_trader"],
+        "legacy": "candidate selection, opening side effects, price fetching and state mutation still remain in quant bot.py",
+        "next": "extract candidate scoring and a state-store boundary after more tests",
         "risk": "high",
     },
     {

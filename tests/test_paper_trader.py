@@ -4,9 +4,13 @@ import unittest
 from datetime import datetime, timezone
 
 from quant_bot.paper_trader import (
+    apply_partial_tp1,
+    close_position_trade,
     data_quality_summary,
     directional_factors,
+    fill_price,
     positions_for_chat,
+    price_exit_signal,
     today_open_count,
 )
 
@@ -52,6 +56,63 @@ class PaperTraderStateTests(unittest.TestCase):
         support, risks = directional_factors(item)
         self.assertEqual(support, ["lower low"])
         self.assertEqual(risks, ["price above ema", "low volume"])
+
+    def test_fill_price_applies_worse_execution(self) -> None:
+        self.assertAlmostEqual(fill_price(100, "long", "entry", 10), 100.1)
+        self.assertAlmostEqual(fill_price(100, "long", "exit", 10), 99.9)
+        self.assertAlmostEqual(fill_price(100, "short", "entry", 10), 99.9)
+        self.assertAlmostEqual(fill_price(100, "short", "exit", 10), 100.1)
+
+    def test_partial_tp1_moves_stop_to_break_even(self) -> None:
+        pos = {
+            "direction": "long",
+            "entry_price": 100.0,
+            "sl": 95.0,
+            "remaining_notional": 100.0,
+            "original_notional": 100.0,
+            "partials": [],
+        }
+        partial = apply_partial_tp1(
+            pos,
+            110.0,
+            now=datetime(2026, 5, 16, tzinfo=timezone.utc),
+            fee_rate=0.001,
+            slippage_bps=0.0,
+            tp1_close_pct=50.0,
+            breakeven_buffer_bps=0.0,
+        )
+        self.assertIsNotNone(partial)
+        self.assertTrue(pos["tp1_done"])
+        self.assertEqual(pos["remaining_notional"], 50.0)
+        self.assertEqual(pos["sl"], 100.0)
+
+    def test_price_exit_signal_understands_tp1_and_be_stop(self) -> None:
+        pos = {"direction": "long", "sl": 95, "tp1": 110, "tp2": 120, "tp1_done": False}
+        self.assertEqual(price_exit_signal(pos, 111), "TP1_PARTIAL")
+        pos.update({"tp1_done": True, "breakeven_active": True, "sl": 100})
+        self.assertEqual(price_exit_signal(pos, 99), "SL_BE")
+
+    def test_close_position_trade_combines_partial_and_final_pnl(self) -> None:
+        pos = {
+            "direction": "long",
+            "entry_price": 100.0,
+            "original_notional": 100.0,
+            "remaining_notional": 50.0,
+            "entry_fee_usd": 0.1,
+            "balance": 1000.0,
+            "partials": [{"pnl_usd": 5.0, "fee_usd": 0.05}],
+        }
+        trade = close_position_trade(
+            pos,
+            120.0,
+            "TP2",
+            now=datetime(2026, 5, 16, tzinfo=timezone.utc),
+            fee_rate=0.001,
+            default_balance=1000.0,
+        )
+        self.assertAlmostEqual(trade["pnl_usd"], 15.0)
+        self.assertAlmostEqual(trade["fee_usd"], 0.2)
+        self.assertAlmostEqual(trade["net_usd"], 14.8)
 
 
 if __name__ == "__main__":

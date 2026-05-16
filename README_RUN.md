@@ -139,6 +139,12 @@ and a first `unittest` suite for Paper Trader state, Live Readiness,
 Execution/Testnet reconciliation, migration status, protection geometry and
 probability calibration.
 
+Paper Trader Engine Extraction v7.26 moves the core paper position-management
+math into `quant_bot/paper_trader.py`: worse fill prices, partial TP1,
+break-even SL, max-hold timing, price exit signals and close-trade accounting.
+The legacy runtime still owns state mutation, price fetching and Telegram side
+effects.
+
 The first real extraction helpers now live in:
 
 - `quant_bot/execution_gateway.py`

@@ -16661,7 +16661,155 @@ LEARN_TEXTS["learn_new_terms"] += """
 """
 
 
-BOT_VERSION_LABEL = "v7.25 Migration Checklist + Tests Foundation"
+# ============================================================
+# v7.26 — PAPER TRADER ENGINE EXTRACTION PHASE 1
+# ============================================================
+# Move pure position-management math to quant_bot.paper_trader while the legacy
+# runtime still owns state locks, price fetching and Telegram/event side effects.
+
+from quant_bot.paper_trader import (
+    apply_partial_tp1 as _paper_apply_partial_tp1_v726,
+    breakeven_sl as _paper_breakeven_sl_helper_v726,
+    close_position_trade as _paper_close_trade_helper_v726,
+    ensure_position_defaults as _paper_position_defaults_helper_v726,
+    fill_price as _paper_fill_price_helper_v726,
+    hold_minutes as _paper_hold_minutes_helper_v726,
+    max_hold_minutes as _paper_max_hold_minutes_helper_v726,
+    pnl_usd as _paper_pnl_usd_helper_v726,
+    price_exit_signal as _paper_price_exit_signal_v726,
+)
+
+
+def _paper_max_hold_minutes_v714(interval):
+    return _paper_max_hold_minutes_helper_v726(interval, PAPER_MAX_HOLD_MINUTES, AUTO_SEND_INTERVALS)
+
+
+def _paper_fill_price_v714(price, direction, action):
+    return _paper_fill_price_helper_v726(price, direction, action, PAPER_SLIPPAGE_BPS)
+
+
+def _paper_breakeven_sl_v714(entry, direction):
+    return _paper_breakeven_sl_helper_v726(entry, direction, PAPER_BREAKEVEN_BUFFER_BPS)
+
+
+def _paper_position_defaults_v714(pos):
+    return _paper_position_defaults_helper_v726(
+        pos,
+        fee_rate=BACKTEST_FEE_RATE,
+        slippage_bps=PAPER_SLIPPAGE_BPS,
+        tp1_close_pct=PAPER_TP1_CLOSE_PCT,
+        max_hold=_paper_max_hold_minutes_v714(pos.get("interval")),
+    )
+
+
+def _paper_pnl_usd_v714(direction, entry, exit_price, notional):
+    return _paper_pnl_usd_helper_v726(direction, entry, exit_price, notional)
+
+
+def _paper_take_partial_tp1_v714(pos, market_price):
+    _paper_position_defaults_v714(pos)
+    partial = _paper_apply_partial_tp1_v726(
+        pos,
+        market_price,
+        fee_rate=BACKTEST_FEE_RATE,
+        slippage_bps=PAPER_SLIPPAGE_BPS,
+        tp1_close_pct=PAPER_TP1_CLOSE_PCT,
+        breakeven_buffer_bps=PAPER_BREAKEVEN_BUFFER_BPS,
+    )
+    if partial:
+        pos["journal_note"] = (pos.get("journal_note") or pos.get("reason") or "") + " | TP1 partial taken, SL moved to BE"
+    return partial
+
+
+def _paper_close_position_realism_v726(pos_id, exit_price, reason):
+    _paper_load_state()
+    with _paper_lock:
+        pos = (_paper_state.get("positions") or {}).pop(pos_id, None)
+        if not pos:
+            _paper_save_state()
+            return None
+        _paper_position_defaults_v714(pos)
+        trade = _paper_close_trade_helper_v726(
+            pos,
+            exit_price,
+            reason,
+            fee_rate=BACKTEST_FEE_RATE,
+            default_balance=DEFAULT_BALANCE,
+        )
+        _paper_state.setdefault("trades", []).append(trade)
+        _paper_state["trades"] = _paper_state["trades"][-1000:]
+        _paper_save_state()
+        return trade
+
+
+def _paper_close_position(pos_id, exit_price, reason):
+    trade = _paper_close_position_realism_v726(pos_id, exit_price, reason)
+    if trade:
+        try:
+            _safety_auto_cooldown_if_needed_v716(trade.get("chat_id"), _safety_consecutive_sl_v716(trade.get("chat_id")))
+        except Exception as e:
+            print(f"  [paper_engine_v726] safety close hook error: {e}")
+    return trade
+
+
+def _paper_record_partial_tp1_event_v726(live, pos_id, partial):
+    _paper_state.setdefault("events", []).append({
+        "type": "paper_partial_tp1",
+        "chat_id": live.get("chat_id"),
+        "pos_id": pos_id,
+        "ts": partial.get("ts"),
+        "ticker": live.get("ticker"),
+        "interval": live.get("interval"),
+        "direction": live.get("direction"),
+        "net_usd": partial.get("net_usd"),
+    })
+    _paper_state["events"] = _paper_state["events"][-1000:]
+    _paper_save_state()
+
+
+def _paper_manage_open_positions(chat_id):
+    closed = []
+    _paper_load_state()
+    for pos in list(_paper_positions(chat_id)):
+        try:
+            ticker = pos.get("ticker")
+            price = get_price(ticker)
+            pos_id = pos.get("pos_id")
+            hit = _paper_price_exit_signal_v726(pos, price)
+            if hit == "TP1_PARTIAL":
+                with _paper_lock:
+                    live = (_paper_state.get("positions") or {}).get(pos_id)
+                    if live is not None:
+                        _paper_position_defaults_v714(live)
+                        partial = _paper_take_partial_tp1_v714(live, price)
+                        if partial:
+                            _paper_record_partial_tp1_event_v726(live, pos_id, partial)
+                continue
+
+            if not hit:
+                hold_min = _paper_hold_minutes_helper_v726(pos)
+                if hold_min >= _paper_max_hold_minutes_v714(pos.get("interval")):
+                    hit = "MAX_HOLD"
+            if not hit and _paper_should_stale_exit_v714(pos):
+                hit = "STALE_SIGNAL"
+
+            if hit:
+                fill = _paper_fill_price_v714(price, pos.get("direction"), "exit")
+                trade = _paper_close_position(pos_id, fill, hit)
+                if trade:
+                    closed.append(trade)
+        except Exception as e:
+            print(f"  [paper_engine_v726] manage error: {e}")
+    return closed
+
+
+LEARN_TEXTS["learn_new_terms"] += """
+
+<b>Paper Trader engine</b> — часть бота, которая сопровождает paper-позицию после входа: проверяет SL/TP, частичный TP1, перенос SL в безубыток, max hold и устаревание setup. В v7.26 мы вынесли расчёты, но не меняли торговые правила.
+"""
+
+
+BOT_VERSION_LABEL = "v7.26 Paper Trader Engine Extraction Phase 1"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -16713,6 +16861,7 @@ RUNTIME_LAYERS = [
     ("v7.23", "Paper Trader state helpers extracted into quant_bot.paper_trader"),
     ("v7.24", "Paper journal and execution view helpers extracted to package modules"),
     ("v7.25", "migration checklist report and unittest foundation"),
+    ("v7.26", "Paper Trader engine math extracted for fills, TP1, BE and exits"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -16744,6 +16893,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "build_auto_task_message": build_auto_task_message,
     "paper_trader_cycle": paper_trader_cycle,
     "paper_manage_open_positions": _paper_manage_open_positions,
+    "paper_fill_price": _paper_fill_price_v714,
+    "paper_take_partial_tp1": _paper_take_partial_tp1_v714,
+    "paper_close_position": _paper_close_position,
     "paper_select_trade_candidate": paper_select_trade_candidate,
     "paper_trader_scan_tickers": paper_trader_scan_tickers,
     "format_paper_report": format_paper_report,
@@ -16855,6 +17007,10 @@ def validate_runtime_architecture():
         errors.append("timeframe quality summary is missing")
     if not callable(globals().get("_paper_take_partial_tp1_v714")):
         errors.append("paper partial TP1 helper is missing")
+    if not callable(globals().get("_paper_fill_price_v714")):
+        errors.append("paper fill-price helper is missing")
+    if not callable(globals().get("_paper_close_position")):
+        errors.append("paper close-position helper is missing")
     if not callable(globals().get("_paper_manage_open_positions")):
         errors.append("paper realism position manager is missing")
     if not callable(globals().get("build_execution_order_plan")):

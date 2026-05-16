@@ -45,7 +45,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.25 Migration Checklist + Tests Foundation`.
+Current active runtime is `v7.26 Paper Trader Engine Extraction Phase 1`.
 
 Layer summary:
 
@@ -74,6 +74,8 @@ Layer summary:
 22. v7.24: Paper journal helpers and execution/testnet view helpers extracted
     into package modules
 23. v7.25: migration checklist report and first unittest foundation
+24. v7.26: Paper Trader engine math for fills, partial TP1, break-even stop,
+    max-hold timing and close-trade accounting extracted into package helpers
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

@@ -34,6 +34,22 @@ def paper_today_open_count(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("_paper_today_open_count", *args, **kwargs)
 
 
+def paper_manage_open_positions(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_paper_manage_open_positions", *args, **kwargs)
+
+
+def paper_fill_price(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_paper_fill_price_v714", *args, **kwargs)
+
+
+def paper_take_partial_tp1(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_paper_take_partial_tp1_v714", *args, **kwargs)
+
+
+def paper_close_position(*args: Any, **kwargs: Any) -> Any:
+    return call_legacy("_paper_close_position", *args, **kwargs)
+
+
 def paper_data_quality_summary(*args: Any, **kwargs: Any) -> Any:
     return call_legacy("paper_data_quality_summary", *args, **kwargs)
 
