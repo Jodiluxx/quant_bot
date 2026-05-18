@@ -144,6 +144,7 @@ MIN_CONFIDENCE_FOR_ACTION = 58
 
 WEIGHTS_FILE   = "indicator_weights.json"
 POSITIONS_FILE = "positions.json"
+USER_STATE_FILE = "user_state.json"  # персистентное состояние пользователей
 
 CORR_PAIRS = [("BTCUSDT", "ETHUSDT")]
 CORR_THRESHOLD = 0.90
@@ -178,7 +179,12 @@ _fear_greed_cache    = {"value": None, "label": None, "ts": 0, "history": []}
 _indicator_weights   = {}
 _weights_last_update = 0
 _last_signal_cache   = {}
+_signal_cache_lock   = threading.Lock()  # защита от race condition
 
+# ── OHLCV кэш с TTL (снижает нагрузку на Binance API) ──────
+_ohlcv_cache     = {}   # key → (timestamp, data)
+_ohlcv_cache_lock = threading.Lock()
+OHLCV_CACHE_TTL  = 55   # секунд: чуть меньше минуты, чтобы не отстать от рынка
 
 # ============================================================
 # ФОРМАТИРОВАНИЕ ЦЕН
@@ -235,6 +241,58 @@ def format_main_status(chat_id):
         f"  📊 TF анализа: <b>{INTERVALS[tf]['label']}</b>\n"
         f"Позиции: <b>{n_pos}</b>"
     )
+
+# ============================================================
+# ПЕРСИСТЕНТНОЕ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ
+# ============================================================
+_user_state_lock = threading.Lock()
+
+def save_user_state():
+    """Сохраняет настройки всех пользователей в JSON.
+    Вызывать при каждом изменении настроек — данные не теряются при перезапуске.
+    """
+    state = {
+        "user_intervals":          {str(k): v for k, v in user_intervals.items()},
+        "user_tickers":            {str(k): v for k, v in user_tickers.items()},
+        "auto_chat_ids":           [str(c) for c in auto_chat_ids],
+        "user_auto_send_interval": {str(k): v for k, v in user_auto_send_interval.items()},
+        "user_auto_tf":            {str(k): v for k, v in user_auto_tf.items()},
+        "user_balance":            {str(k): v for k, v in user_balance.items()},
+        "user_leverage":           {str(k): v for k, v in user_leverage.items()},
+        "user_size_pct":           {str(k): v for k, v in user_size_pct.items()},
+    }
+    try:
+        with _user_state_lock:
+            with open(USER_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [state] Ошибка сохранения: {e}")
+
+
+def load_user_state():
+    """Загружает настройки пользователей из JSON при старте бота."""
+    global user_intervals, user_tickers, user_auto_send_interval
+    global user_auto_tf, user_balance, user_leverage, user_size_pct
+    if not os.path.exists(USER_STATE_FILE):
+        return
+    try:
+        with open(USER_STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        def _ikeys(d):
+            return {int(k): v for k, v in d.items()}
+        user_intervals          = _ikeys(state.get("user_intervals", {}))
+        user_tickers            = _ikeys(state.get("user_tickers", {}))
+        user_auto_send_interval = _ikeys(state.get("user_auto_send_interval", {}))
+        user_auto_tf            = _ikeys(state.get("user_auto_tf", {}))
+        user_balance            = _ikeys(state.get("user_balance", {}))
+        user_leverage           = _ikeys(state.get("user_leverage", {}))
+        user_size_pct           = _ikeys(state.get("user_size_pct", {}))
+        for cid in state.get("auto_chat_ids", []):
+            auto_chat_ids.add(int(cid))
+        print(f"  [state] Загружено состояние для {len(user_intervals)} пользователей")
+    except Exception as e:
+        print(f"  [state] Ошибка загрузки: {e}")
+
 
 # ============================================================
 # МЕНЕДЖЕР ПОЗИЦИЙ
@@ -772,7 +830,18 @@ def ticker_keyboard():
 # ДАННЫЕ (только Binance)
 # ============================================================
 def get_ohlcv(ticker, interval):
-    return _binance_ohlcv(ticker, interval)
+    """Возвращает OHLCV с кэшем TTL=55с — снижает нагрузку на Binance API."""
+    key = f"{ticker}_{interval}"
+    now = time.time()
+    with _ohlcv_cache_lock:
+        if key in _ohlcv_cache:
+            ts, data = _ohlcv_cache[key]
+            if now - ts < OHLCV_CACHE_TTL:
+                return data
+    data = _binance_ohlcv(ticker, interval)
+    with _ohlcv_cache_lock:
+        _ohlcv_cache[key] = (now, data)
+    return data
 
 def _binance_ohlcv(symbol, interval):
     if symbol not in TICKERS:
@@ -819,13 +888,15 @@ def get_price(ticker):
 # COOLDOWN (адаптивный — равен интервалу рассылки пользователя)
 # ============================================================
 def should_send_signal(ticker, interval, new_signal, cooldown_seconds=300, group_key=""):
+    """Thread-safe cooldown проверка сигналов."""
     key = f"{group_key}_{ticker}_{interval}"
-    prev = _last_signal_cache.get(key, {})
     now_ts = time.time()
-    if (prev.get("signal") == new_signal and
-            now_ts - prev.get("ts", 0) < cooldown_seconds):
-        return False
-    _last_signal_cache[key] = {"signal": new_signal, "ts": now_ts}
+    with _signal_cache_lock:
+        prev = _last_signal_cache.get(key, {})
+        if (prev.get("signal") == new_signal and
+                now_ts - prev.get("ts", 0) < cooldown_seconds):
+            return False
+        _last_signal_cache[key] = {"signal": new_signal, "ts": now_ts}
     return True
 
 
@@ -1042,7 +1113,10 @@ DEFAULT_WEIGHTS = {
     "macd": 1.0, "bollinger": 1.0, "supertrend": 1.2, "obv": 0.9,
     "ichimoku": 1.1, "sr_level": 0.8, "volume": 0.8, "mtf": 1.3,
     "fg_index": 0.7, "seasonality": 0.5,
-    "candle": 0.9,   # свечные паттерны — обновляется WFO
+    "candle": 0.9,        # свечные паттерны — обновляется WFO
+    "vwap": 0.9,          # VWAP — отдельный индикатор, не смешивается с EMA
+    "rsi_divergence": 0.8, # RSI дивергенция — отдельно от обычного RSI
+    "ema_slope": 0.7,     # наклон EMA20 — отдельно от позиции EMA
 }
 
 def load_weights():
@@ -1839,18 +1913,32 @@ def calc_atr(highs, lows, closes, period=14):
     return sum(trs[-period:]) / period
 
 def calc_stoch_rsi(closes, rsi_period=14, stoch_period=14, smooth_k=3, smooth_d=3):
-    if len(closes) < rsi_period + stoch_period + smooth_k + smooth_d:
+    """
+    Оптимизированный StochRSI — O(n) вместо O(n²).
+    Строит RSI-серию одним инкрементальным проходом.
+    """
+    n = len(closes)
+    if n < rsi_period + stoch_period + smooth_k + smooth_d:
         return None, None
-    rsi_series = [r for r in
-                  [calc_rsi(closes[:i], rsi_period) for i in range(rsi_period + 1, len(closes) + 1)]
-                  if r is not None]
+    # Шаг 1: RSI-серия O(n)
+    deltas = [closes[i] - closes[i-1] for i in range(1, n)]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
+    avg_g = sum(gains[:rsi_period]) / rsi_period
+    avg_l = sum(losses[:rsi_period]) / rsi_period
+    rsi_series = []
+    for i in range(rsi_period, len(gains)):
+        avg_g = (avg_g * (rsi_period - 1) + gains[i]) / rsi_period
+        avg_l = (avg_l * (rsi_period - 1) + losses[i]) / rsi_period
+        rsi_series.append(100.0 if avg_l == 0 else 100.0 - 100.0 / (1.0 + avg_g / avg_l))
     if len(rsi_series) < stoch_period:
         return None, None
+    # Шаг 2: Stoch(%K)
     raw_k = []
     for i in range(stoch_period, len(rsi_series) + 1):
         w = rsi_series[i - stoch_period:i]
         lo, hi = min(w), max(w)
-        raw_k.append((rsi_series[i-1] - lo) / (hi - lo) * 100 if hi != lo else 50.0)
+        raw_k.append((rsi_series[i-1] - lo) / (hi - lo) * 100.0 if hi != lo else 50.0)
     if len(raw_k) < smooth_k:
         return None, None
     smooth_K = [sum(raw_k[i - smooth_k:i]) / smooth_k for i in range(smooth_k, len(raw_k) + 1)]
@@ -2094,45 +2182,46 @@ def detect_candle_patterns(opens, highs, lows, closes):
 
 def detect_rsi_divergence(closes, highs, lows, lookback=30):
     """
-    Дивергенция RSI.
-    Бычья: цена делает более низкий минимум, RSI — более высокий (потенциальный разворот вверх).
+    Дивергенция RSI — оптимизирована до O(n) (было O(n²)).
+    Строит полную RSI-серию одним инкрементальным проходом.
+    Бычья: цена делает более низкий минимум, RSI — более высокий.
     Медвежья: цена делает более высокий максимум, RSI — более низкий.
     """
-    if len(closes) < lookback + 15:
+    n = len(closes)
+    if n < lookback + 15:
         return 0, None
-
     half = lookback // 2
-
-    # RSI-серия для последних lookback свечей
-    rsi_vals = []
-    base = len(closes) - lookback
-    for i in range(base, len(closes)):
-        r = calc_rsi(closes[:i+1])
-        rsi_vals.append(r if r is not None else 50.0)
-
-    if len(rsi_vals) < lookback:
+    rsi_period = 14
+    if n < rsi_period + 1:
         return 0, None
-
+    # O(n): строим RSI-серию инкрементально
+    deltas = [closes[i] - closes[i-1] for i in range(1, n)]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
+    avg_g = sum(gains[:rsi_period]) / rsi_period
+    avg_l = sum(losses[:rsi_period]) / rsi_period
+    full_rsi = []
+    for i in range(rsi_period, len(gains)):
+        avg_g = (avg_g * (rsi_period - 1) + gains[i]) / rsi_period
+        avg_l = (avg_l * (rsi_period - 1) + losses[i]) / rsi_period
+        full_rsi.append(100.0 if avg_l == 0 else 100.0 - 100.0 / (1.0 + avg_g / avg_l))
+    if len(full_rsi) < lookback:
+        return 0, None
+    rsi_vals = full_rsi[-lookback:]
     rsi_first  = rsi_vals[:half]
     rsi_second = rsi_vals[half:]
-    price_highs_first  = highs[-(lookback):-(half)]
-    price_highs_second = highs[-(half):]
-    price_lows_first   = lows[-(lookback):-(half)]
-    price_lows_second  = lows[-(half):]
-
+    price_highs_first  = highs[-lookback:-half]
+    price_highs_second = highs[-half:]
+    price_lows_first   = lows[-lookback:-half]
+    price_lows_second  = lows[-half:]
     if not price_highs_first or not price_highs_second:
         return 0, None
-
-    # Медвежья дивергенция
     if (max(price_highs_second) > max(price_highs_first) and
             max(rsi_second) < max(rsi_first) - 3):
         return -1, "🔻 Медвежья дивергенция RSI (цена ↑↑, RSI ↓)"
-
-    # Бычья дивергенция
     if (min(price_lows_second) < min(price_lows_first) and
             min(rsi_second) > min(rsi_first) + 3):
         return +1, "🔺 Бычья дивергенция RSI (цена ↓↓, RSI ↑)"
-
     return 0, None
 
 
@@ -2475,12 +2564,12 @@ def full_analyze(ticker, interval):
     else:
         neutral.append("MTF: нейтрально")
 
-    # ── VWAP ──────────────────────────────────────────────
+    # ── VWAP (собственный ключ в WFO, не смешивается с EMA) ───────
     if vwap is not None:
         if price > vwap * 1.002:
-            add_bull(f"Цена выше VWAP ({vwap:,.4f}) — покупатели контролируют", "ema")
+            add_bull(f"Цена выше VWAP ({vwap:,.4f}) — покупатели контролируют", "vwap")
         elif price < vwap * 0.998:
-            add_bear(f"Цена ниже VWAP ({vwap:,.4f}) — продавцы контролируют", "ema")
+            add_bear(f"Цена ниже VWAP ({vwap:,.4f}) — продавцы контролируют", "vwap")
         else:
             neutral.append(f"Цена у VWAP ({vwap:,.4f}) — нейтральная зона")
 
@@ -2544,17 +2633,17 @@ def full_analyze(ticker, interval):
         combined_label = " + ".join(_candle_bear_labels)
         bear_votes.append((f"Свечи: {combined_label}", _candle_bear_score))
 
-    # ── RSI дивергенция ───────────────────────────────────
+    # ── RSI дивергенция (отдельный ключ — не смешивается с RSI) ───
     if div_score == +1 and div_reason:
-        add_bull(div_reason, "rsi")
+        add_bull(div_reason, "rsi_divergence")
     elif div_score == -1 and div_reason:
-        add_bear(div_reason, "rsi")
+        add_bear(div_reason, "rsi_divergence")
 
-    # ── Наклон EMA20 ──────────────────────────────────────
+    # ── Наклон EMA20 (отдельный ключ — не смешивается с EMA позицией)
     if ema20_slope == +1:
-        add_bull("EMA20 растёт — восходящий импульс", "ema")
+        add_bull("EMA20 растёт — восходящий импульс", "ema_slope")
     elif ema20_slope == -1:
-        add_bear("EMA20 падает — нисходящий импульс", "ema")
+        add_bear("EMA20 падает — нисходящий импульс", "ema_slope")
 
     if fg_score != 0 and fg_reason:
         if fg_score > 0: bull_votes.append((fg_reason, weights.get("fg_index", 0.7) * fg_weight))
@@ -4253,6 +4342,7 @@ def handle_update(update):
             iv_key = data.replace("auto_send_iv_", "")
             if iv_key in AUTO_SEND_INTERVALS:
                 user_auto_send_interval[chat_id] = iv_key
+                save_user_state()
                 answer_callback(cb["id"], f"✅ Рассылка: {AUTO_SEND_INTERVALS[iv_key]['label']}")
                 send(chat_id,
                      f"✅ Интервал рассылки установлен: <b>{AUTO_SEND_INTERVALS[iv_key]['label']}</b>",
@@ -4272,6 +4362,7 @@ def handle_update(update):
             tf_key = data.replace("auto_tf_", "")
             if tf_key in INTERVALS:
                 user_auto_tf[chat_id] = tf_key
+                save_user_state()
                 answer_callback(cb["id"], f"✅ TF анализа: {INTERVALS[tf_key]['label']}")
                 send(chat_id,
                      f"✅ Таймфрейм анализа установлен: <b>{INTERVALS[tf_key]['label']}</b>",
@@ -4509,12 +4600,14 @@ def handle_update(update):
         elif data.startswith("ticker_"):
             tk = data.replace("ticker_", "")
             user_tickers[chat_id] = tk
+            save_user_state()
             answer_callback(cb["id"], f"✅ {TICKERS[tk]['label']}")
             send(chat_id, f"✅ Актив: <b>{TICKERS[tk]['label']}</b>", main_keyboard())
 
         elif data.startswith("interval_"):
             iv = data.replace("interval_", "")
             user_intervals[chat_id] = iv
+            save_user_state()
             answer_callback(cb["id"], f"✅ {INTERVALS[iv]['label']}")
             send(chat_id, f"✅ Таймфрейм: <b>{INTERVALS[iv]['label']}</b>", main_keyboard())
 
@@ -4616,9 +4709,11 @@ def handle_update(update):
             answer_callback(cb["id"])
             if chat_id in auto_chat_ids:
                 auto_chat_ids.discard(chat_id)
+                save_user_state()
                 send(chat_id, "🔕 <b>Авто-сигналы отключены.</b>", main_keyboard())
             else:
                 auto_chat_ids.add(chat_id)
+                save_user_state()
                 si = user_auto_send_interval.get(chat_id, DEFAULT_AUTO_SEND_INTERVAL)
                 tf = user_auto_tf.get(chat_id, DEFAULT_AUTO_TF)
                 send(chat_id,
@@ -4670,6 +4765,7 @@ def handle_update(update):
         elif data.startswith("lev_"):
             lev_val = int(data.replace("lev_", ""))
             user_leverage[chat_id] = lev_val
+            save_user_state()
             answer_callback(cb["id"], f"✅ Плечо x{lev_val}")
             rec = recommend_size_pct(None, "neutral", lev_val)
             bal = user_balance.get(chat_id, DEFAULT_BALANCE)
@@ -4695,6 +4791,7 @@ def handle_update(update):
         elif data.startswith("size_"):
             size_val = float(data.replace("size_", ""))
             user_size_pct[chat_id] = size_val
+            save_user_state()
             answer_callback(cb["id"], f"✅ Размер {size_val}%")
             bal = user_balance.get(chat_id, DEFAULT_BALANCE)
             lev = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
@@ -4844,6 +4941,7 @@ def handle_update(update):
             if new_bal <= 0:
                 raise ValueError("отрицательный баланс")
             user_balance[chat_id] = new_bal
+            save_user_state()
             lev = user_leverage.get(chat_id, DEFAULT_LEVERAGE)
             pct = user_size_pct.get(chat_id, DEFAULT_SIZE_PCT)
             margin  = new_bal * pct / 100
@@ -18624,7 +18722,306 @@ async def async_handle_update(session, update, sem):
         print(f"  [async_update_v731] error: {e}")
 
 
-BOT_VERSION_LABEL = "v7.31 Simple Public Signals + Demo Trading UI"
+# ============================================================
+# v7.32 - SINGLE-MESSAGE TELEGRAM NAVIGATION
+# ============================================================
+# Raw Telegram Bot API equivalent of InlineKeyboardMarkup + CallbackQueryHandler:
+# callbacks are acknowledged with answerCallbackQuery and menu/card navigation
+# edits the current message instead of creating a new one.
+
+_base_async_handle_update_v731 = async_handle_update
+
+
+def _callback_message_ref_v732(update):
+    cb = (update or {}).get("callback_query") or {}
+    message = cb.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
+    if chat_id is None or message_id is None:
+        return None, None
+    return _normalize_chat_id_v78(chat_id), message_id
+
+
+async def async_edit_message_text(session, chat_id, message_id, text, reply_markup=None, parse_mode="HTML"):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    res = await async_telegram_api(session, "editMessageText", payload)
+    if res.get("ok"):
+        return res
+    desc = str(res.get("description") or "")
+    if "message is not modified" in desc.lower():
+        return {"ok": True, "description": desc}
+    if parse_mode:
+        plain_payload = dict(payload)
+        plain_payload.pop("parse_mode", None)
+        plain_payload["text"] = _plain_report_text_v76(text) if "_plain_report_text_v76" in globals() else str(text)
+        retry = await async_telegram_api(session, "editMessageText", plain_payload)
+        retry_desc = str(retry.get("description") or "")
+        if retry.get("ok") or "message is not modified" in retry_desc.lower():
+            return retry if retry.get("ok") else {"ok": True, "description": retry_desc}
+    print(f"  [telegram_edit_v732] edit failed: {res}")
+    return res
+
+
+async def send_or_edit(session, update, text, reply_markup=None, parse_mode="HTML"):
+    if (update or {}).get("callback_query"):
+        chat_id, message_id = _callback_message_ref_v732(update)
+        if chat_id is not None and message_id is not None:
+            res = await async_edit_message_text(session, chat_id, message_id, text, reply_markup, parse_mode=parse_mode)
+            if res.get("ok"):
+                return res
+            # Telegram can refuse editing older/non-bot messages. Fallback is a new message.
+            return await async_send(session, chat_id, text, reply_markup)
+    message = (update or {}).get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is not None:
+        return await async_send(session, _normalize_chat_id_v78(chat_id), text, reply_markup)
+    return {"ok": False, "description": "no chat/message target for send_or_edit"}
+
+
+async def _answer_callback_once_v732(session, callback_id, text=""):
+    if not callback_id:
+        return {"ok": False, "description": "missing callback_id"}
+    return await async_answer_callback(session, callback_id, text)
+
+
+def _auto_task_card_v732(chat_id, task_key):
+    _simple_sync_public_auto_settings(chat_id)
+    if task_key == "signals":
+        st = _get_auto_task_settings(chat_id, "signals")
+        return "\n".join([
+            "📡 <b>Авто-сигналы</b>",
+            "",
+            f"Статус: <b>{'ON' if st.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b>",
+            f"Частота: <b>{_ui_tf_short(st.get('send_interval'))}</b>",
+            f"TF анализа: <b>{_ui_tf_short(st.get('tf') or '30m')}</b>",
+            "",
+            "Бот присылает короткий LONG / SHORT / WAIT с риском и точкой входа.",
+        ])
+    if task_key == "paper_trader":
+        st = _get_auto_task_settings(chat_id, "paper_trader")
+        return "\n".join([
+            "🤖 <b>Демо-бот</b>",
+            "",
+            f"Статус: <b>{'ON' if st.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b>",
+            "Частота: <b>15м</b>",
+            "TF сделки: <b>выбирает бот</b>",
+            "",
+            "Он сканирует все доступные активы и открывает демо-сделку только если фильтры риска разрешают вход.",
+        ])
+    return auto_settings_text(chat_id)
+
+
+def _hidden_callback_text_v732():
+    return "\n".join([
+        "🏠 <b>Главное меню</b>",
+        "",
+        "Этот раздел скрыт из публичного интерфейса.",
+        "Бот всё ещё использует внутреннюю аналитику для сигналов и демо-торговли.",
+    ])
+
+
+async def _render_signal_v732(session, update, chat_id):
+    interval = user_intervals.get(chat_id, "15m")
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    loading = "\n".join([
+        "📡 <b>Сигнал</b>",
+        "",
+        f"Актив: <b>{_ui_ticker_short(ticker)}USDT</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b>",
+        "",
+        "Анализирую рынок...",
+    ])
+    await send_or_edit(session, update, loading, compact_signal_keyboard())
+    try:
+        data = await asyncio.to_thread(full_analyze, ticker, interval)
+        _cache_signal_data(chat_id, ticker, interval, data)
+        await send_or_edit(session, update, format_msg(data, ticker, interval), compact_signal_keyboard())
+    except Exception as e:
+        import traceback
+        print(f"  [signal_v732] error: {traceback.format_exc()}")
+        await send_or_edit(session, update, f"❌ Ошибка анализа: {_ui_html(e)}", signal_menu_keyboard(chat_id))
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            _simple_sync_public_auto_settings(chat_id)
+            seen_chat_ids.add(chat_id)
+
+            if _simple_hidden_callback_v731(data):
+                await _answer_callback_once_v732(session, callback_id, "Раздел скрыт")
+                await send_or_edit(session, update, _hidden_callback_text_v732() + "\n\n" + format_main_status(chat_id), main_keyboard())
+                return
+
+            if data == "back_main":
+                await _answer_callback_once_v732(session, callback_id, "Главное меню")
+                await send_or_edit(session, update, format_main_status(chat_id), main_keyboard())
+                return
+
+            if data == "menu_signal":
+                await _answer_callback_once_v732(session, callback_id, "Сигнал")
+                await send_or_edit(session, update, format_signal_menu_text(chat_id), signal_menu_keyboard(chat_id))
+                return
+
+            if data == "get_signal":
+                await _answer_callback_once_v732(session, callback_id, "Сигнал")
+                await _render_signal_v732(session, update, chat_id)
+                return
+
+            if data in {"sig_change_ticker", "change_ticker"}:
+                await _answer_callback_once_v732(session, callback_id, "Актив")
+                await send_or_edit(session, update, "🪙 <b>Выбери актив для сигнала:</b>", signal_ticker_keyboard())
+                return
+
+            if data in {"sig_change_interval", "change_interval"}:
+                await _answer_callback_once_v732(session, callback_id, "TF")
+                await send_or_edit(session, update, "⏱ <b>Выбери таймфрейм для сигнала:</b>", signal_interval_keyboard())
+                return
+
+            if data.startswith("sig_ticker_"):
+                ticker = data.replace("sig_ticker_", "", 1)
+                if ticker in TICKERS:
+                    user_tickers[chat_id] = ticker
+                    _clear_signal_cache(chat_id)
+                    save_user_state()
+                    await _answer_callback_once_v732(session, callback_id, TICKERS[ticker]["label"])
+                    await send_or_edit(session, update, format_signal_menu_text(chat_id), signal_menu_keyboard(chat_id))
+                    return
+
+            if data.startswith("sig_interval_"):
+                interval = data.replace("sig_interval_", "", 1)
+                if interval in INTERVALS:
+                    user_intervals[chat_id] = interval
+                    _clear_signal_cache(chat_id)
+                    save_user_state()
+                    await _answer_callback_once_v732(session, callback_id, INTERVALS[interval]["label"])
+                    await send_or_edit(session, update, format_signal_menu_text(chat_id), signal_menu_keyboard(chat_id))
+                    return
+
+            if data in {"menu_autobot", "paper_trader"}:
+                await _answer_callback_once_v732(session, callback_id, "Демо-бот")
+                await send_or_edit(session, update, format_autobot_menu(chat_id), autobot_keyboard(chat_id))
+                return
+
+            if data in {"menu_settings", "auto_settings"}:
+                await _answer_callback_once_v732(session, callback_id, "Уведомления")
+                await send_or_edit(session, update, auto_settings_text(chat_id), auto_settings_keyboard(chat_id))
+                return
+
+            if data == "toggle_auto":
+                if chat_id in auto_chat_ids:
+                    auto_chat_ids.discard(chat_id)
+                    prefix = "⛔ Авто-уведомления отключены."
+                else:
+                    auto_chat_ids.add(chat_id)
+                    prefix = "✅ Авто-уведомления включены."
+                save_user_state()
+                await _answer_callback_once_v732(session, callback_id, "OK")
+                await send_or_edit(session, update, prefix + "\n\n" + auto_settings_text(chat_id), auto_settings_keyboard(chat_id))
+                return
+
+            if data.startswith("auto_task_"):
+                task_key = data.replace("auto_task_", "", 1)
+                if task_key in SIMPLE_PUBLIC_AUTO_TASKS_V731:
+                    await _answer_callback_once_v732(session, callback_id, AUTO_TASKS.get(task_key, {}).get("label", "Авто"))
+                    await send_or_edit(session, update, _auto_task_card_v732(chat_id, task_key), auto_task_keyboard(chat_id, task_key))
+                    return
+
+            if data.startswith("auto_tog_"):
+                task_key = data.replace("auto_tog_", "", 1)
+                if task_key in SIMPLE_PUBLIC_AUTO_TASKS_V731:
+                    st = _get_auto_task_settings(chat_id, task_key)
+                    st["enabled"] = not bool(st.get("enabled"))
+                    save_user_state()
+                    await _answer_callback_once_v732(session, callback_id, "ON" if st["enabled"] else "OFF")
+                    await send_or_edit(session, update, _auto_task_card_v732(chat_id, task_key), auto_task_keyboard(chat_id, task_key))
+                    return
+
+            if data.startswith("auto_choose_iv_"):
+                task_key = data.replace("auto_choose_iv_", "", 1)
+                if task_key in SIMPLE_PUBLIC_AUTO_TASKS_V731:
+                    await _answer_callback_once_v732(session, callback_id, "Частота")
+                    await send_or_edit(
+                        session,
+                        update,
+                        f"⏰ <b>Частота уведомлений</b>\n\nРаздел: <b>{_ui_html(AUTO_TASKS[task_key]['label'])}</b>",
+                        auto_task_interval_keyboard(task_key),
+                    )
+                    return
+
+            if data.startswith("auto_choose_tf_"):
+                task_key = data.replace("auto_choose_tf_", "", 1)
+                if task_key == "signals":
+                    await _answer_callback_once_v732(session, callback_id, "TF")
+                    await send_or_edit(session, update, "📊 <b>TF анализа для авто-сигналов</b>", auto_task_tf_keyboard(task_key))
+                    return
+
+            if data.startswith("auto_set_iv_"):
+                rest = data.replace("auto_set_iv_", "", 1)
+                task_key, iv_key = rest.rsplit("_", 1)
+                if task_key in SIMPLE_PUBLIC_AUTO_TASKS_V731 and iv_key in AUTO_SEND_INTERVALS:
+                    st = _get_auto_task_settings(chat_id, task_key)
+                    st["send_interval"] = iv_key
+                    if task_key == "signals":
+                        user_auto_send_interval[chat_id] = iv_key
+                    for key in list(_auto_task_last_slot.keys()):
+                        if key.startswith(f"{chat_id}:{task_key}:"):
+                            _auto_task_last_slot.pop(key, None)
+                    save_user_state()
+                    await _answer_callback_once_v732(session, callback_id, AUTO_SEND_INTERVALS[iv_key]["label"])
+                    await send_or_edit(session, update, _auto_task_card_v732(chat_id, task_key), auto_task_keyboard(chat_id, task_key))
+                    return
+
+            if data.startswith("auto_set_tf_"):
+                rest = data.replace("auto_set_tf_", "", 1)
+                task_key, tf_key = rest.rsplit("_", 1)
+                if task_key == "signals" and tf_key in INTERVALS:
+                    st = _get_auto_task_settings(chat_id, task_key)
+                    st["tf"] = tf_key
+                    user_auto_tf[chat_id] = tf_key
+                    save_user_state()
+                    await _answer_callback_once_v732(session, callback_id, INTERVALS[tf_key]["label"])
+                    await send_or_edit(session, update, _auto_task_card_v732(chat_id, task_key), auto_task_keyboard(chat_id, task_key))
+                    return
+
+            if data == "paper_run_now":
+                await _answer_callback_once_v732(session, callback_id, "Скан")
+                await send_or_edit(session, update, "🤖 <b>Демо-бот</b>\n\nСканирую рынок и проверяю риск-фильтры...", autobot_keyboard(chat_id))
+                msg = await asyncio.to_thread(paper_trader_cycle, chat_id, True)
+                await send_or_edit(session, update, msg, autobot_keyboard(chat_id))
+                return
+
+            if data == "paper_open_positions":
+                await _answer_callback_once_v732(session, callback_id, "Открытые")
+                await send_or_edit(session, update, _simple_format_open_positions(chat_id), autobot_keyboard(chat_id))
+                return
+
+            if data in {"paper_closed_menu", "paper_closed_win", "paper_closed_loss"}:
+                await _answer_callback_once_v732(session, callback_id, "Закрытые")
+                await send_or_edit(session, update, _simple_format_closed_positions(chat_id), autobot_keyboard(chat_id))
+                return
+
+            await _answer_callback_once_v732(session, callback_id, "")
+        await _base_async_handle_update_v731(session, update, sem)
+    except Exception as e:
+        print(f"  [async_update_v732] error: {e}")
+
+BOT_VERSION_LABEL = "v7.32 Single-Message Telegram Navigation"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -18682,6 +19079,7 @@ RUNTIME_LAYERS = [
     ("v7.29", "Real Binance Futures Testnet entry/protection orders behind explicit flags and clean journal reset"),
     ("v7.30", "Testnet position/fill monitor for positions and reduce-only protection"),
     ("v7.31", "simple public Telegram UI for signals, auto-signals and demo trading"),
+    ("v7.32", "single-message Telegram navigation with editMessageText and callback acknowledgements"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -18707,6 +19105,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_autobot_menu": format_autobot_menu,
     "auto_settings_keyboard": auto_settings_keyboard,
     "async_handle_update": async_handle_update,
+    "async_edit_message_text": async_edit_message_text,
+    "send_or_edit": send_or_edit,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,
@@ -18888,6 +19288,10 @@ def validate_runtime_architecture():
         errors.append("testnet position monitor report is missing")
     if not callable(globals().get("simple_public_mode_enabled")):
         errors.append("simple public UI mode helper is missing")
+    if not callable(globals().get("async_edit_message_text")):
+        errors.append("telegram edit helper is missing")
+    if not callable(globals().get("send_or_edit")):
+        errors.append("telegram send_or_edit helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):
@@ -18912,6 +19316,7 @@ def validate_runtime_architecture():
 
 def run_async():
     try:
+        load_user_state()   # восстанавливаем настройки пользователей из JSON
         validate_runtime_architecture()
         print(runtime_architecture_report())
         asyncio.run(async_bootstrap())

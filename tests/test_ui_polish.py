@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import unittest
 
 from quant_bot.legacy import load_bot_module
@@ -71,6 +73,41 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertTrue(self.bot._simple_hidden_callback_v731(callback))
         for callback in {"menu_signal", "menu_autobot", "paper_run_now", "auto_settings"}:
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
+
+    def test_single_message_navigation_helpers_are_registered(self) -> None:
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.32 Single-Message Telegram Navigation")
+        self.assertTrue(callable(self.bot.async_edit_message_text))
+        self.assertTrue(callable(self.bot.send_or_edit))
+        self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("send_or_edit", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
+
+    def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
+        calls = []
+
+        async def fake_api(session, method, payload=None):
+            calls.append((method, payload or {}))
+            return {"ok": True}
+
+        old_api = self.bot.async_telegram_api
+        self.bot.async_telegram_api = fake_api
+        try:
+            result = asyncio.run(self.bot.async_edit_message_text(
+                object(),
+                123,
+                456,
+                "<b>menu</b>",
+                {"inline_keyboard": []},
+            ))
+        finally:
+            self.bot.async_telegram_api = old_api
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls[0][0], "editMessageText")
+        self.assertEqual(calls[0][1]["chat_id"], 123)
+        self.assertEqual(calls[0][1]["message_id"], 456)
+        self.assertEqual(calls[0][1]["parse_mode"], "HTML")
+        self.assertIn("reply_markup", calls[0][1])
 
 
 if __name__ == "__main__":

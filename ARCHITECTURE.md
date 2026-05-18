@@ -45,7 +45,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.31 Simple Public Signals + Demo Trading UI`.
+Current active runtime is `v7.32 Single-Message Telegram Navigation`.
 
 Layer summary:
 
@@ -87,6 +87,8 @@ Layer summary:
     entries, position direction, open reduce-only SL and TP protection orders
 29. v7.31: simplified public Telegram UI exposes only signals, notification
     settings and demo trading while internal analytics remain available to code
+30. v7.32: Telegram callback navigation edits the current message with
+    `editMessageText` via `send_or_edit`, while scheduled notifications remain separate
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

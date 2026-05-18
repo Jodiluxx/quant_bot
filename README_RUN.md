@@ -186,6 +186,12 @@ the public interface shows only manual signals, auto-signal notification
 settings, and demo trading status. The demo bot sends a 15-minute cycle report
 that says whether a trade was opened or skipped, while choosing its own
 timeframe.
+Single-message Telegram navigation v7.32 keeps the public UI inside one Telegram
+card where possible. Callback buttons are acknowledged with `answerCallbackQuery`
+and visible menu/card transitions use `editMessageText` through `send_or_edit`,
+so tapping Signal, Demo bot, Notifications, ticker/TF selectors or manual scan
+updates the current message instead of flooding the chat. Scheduled auto reports
+and true errors can still be sent as separate messages.
 
 The first real extraction helpers now live in:
 
