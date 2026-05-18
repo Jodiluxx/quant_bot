@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
 
 import unittest
 
@@ -75,7 +77,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.35 No-Paper Testnet Demo Bot")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.36 Compact User Cards + Local Demo Analytics")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -84,7 +86,9 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.35" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.36" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
@@ -160,6 +164,36 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_open_positions_v734 = old_open
             self.bot._testnet_today_real_entry_count_v734 = old_count
             self.bot._build_testnet_trade_plan_v734 = old_plan
+
+    def test_demo_analytics_store_details_not_user_card(self) -> None:
+        row = {
+            "ticker": "BTCUSDT",
+            "tf": "15m",
+            "status": "ENTER_NOW",
+            "entry_now": 88,
+            "setup": 88,
+            "rr": 1.67,
+            "testnet_gate": "подробная техническая причина для локального анализа",
+        }
+        visible = "\n".join(self.bot._format_scan_rows([row]))
+        self.assertIn("Entry: 88/100", visible)
+        self.assertNotIn("подробная техническая причина", visible)
+
+        old_file = self.bot.DEMO_ANALYTICS_STATE_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            self.bot.DEMO_ANALYTICS_STATE_FILE = os.path.join(tmp, "demo_analysis_state.json")
+            try:
+                self.bot._demo_analysis_record_cycle_v736(
+                    987654321,
+                    [row],
+                    decision={"opened": False, "status": "NO_TRADE", "reason": "коротко для пользователя"},
+                )
+                state = self.bot._demo_analysis_load_v736()
+                stored = state["cycles"][-1]
+                self.assertEqual(stored["user_visible"]["reason"], "коротко для пользователя")
+                self.assertIn("подробная техническая причина", stored["scan"]["top"][0]["testnet_gate"])
+            finally:
+                self.bot.DEMO_ANALYTICS_STATE_FILE = old_file
 
 
 if __name__ == "__main__":

@@ -17469,6 +17469,7 @@ JOURNAL_RESET_FILES = (
     "paper_trader_state.json",
     "execution_gateway_state.json",
     "testnet_journal.json",
+    "demo_analysis_state.json",
 )
 
 
@@ -17867,6 +17868,8 @@ def reset_demo_journals(reason="clean_testnet_start"):
         json.dump({"plans": [], "events": [], "reset_at": reset_at, "reset_reason": reason}, f, indent=2, ensure_ascii=False)
     with open("testnet_journal.json", "w", encoding="utf-8") as f:
         json.dump({"events": [], "reset_at": reset_at, "reset_reason": reason}, f, indent=2, ensure_ascii=False)
+    with open("demo_analysis_state.json", "w", encoding="utf-8") as f:
+        json.dump({"cycles": [], "reset_at": reset_at, "reset_reason": reason}, f, indent=2, ensure_ascii=False)
     try:
         global _paper_state
         _paper_state = {"positions": {}, "trades": [], "events": [], "reset_at": reset_at, "reset_reason": reason}
@@ -20004,9 +20007,6 @@ def _format_scan_rows(tried):
             f"{idx}) {_ui_ticker_short(ticker)} {_ui_tf_short(row.get('tf'))} — <b>{_ui_html(status)}</b>\n"
             f"   Entry: {row.get('entry_now', 0)}/100 | Setup: {row.get('setup', 0)}/100 | RR: {row.get('rr', 0):.2f}x"
         )
-        gate = row.get("testnet_gate")
-        if gate:
-            line += f"\n   Gate: {_testnet_short_block_v735(gate)}"
         lines.append(line)
     errors = [x for x in tried if x.get("error")]
     if errors:
@@ -20165,7 +20165,210 @@ def paper_trader_cycle(chat_id, manual=False):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.35 No-Paper Testnet Demo Bot"
+# ============================================================
+# v7.36 — USER CARD VS LOCAL ANALYTICS SEPARATION
+# ============================================================
+# Telegram gets the compact decision. The machine-readable diagnostics stay on
+# disk for later accuracy work, without cluttering the user's chat.
+
+DEMO_ANALYTICS_STATE_FILE = "demo_analysis_state.json"
+
+
+def _demo_analysis_load_v736():
+    try:
+        if os.path.exists(DEMO_ANALYTICS_STATE_FILE):
+            with open(DEMO_ANALYTICS_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("cycles", [])
+                return data
+    except Exception as e:
+        print(f"  [demo_analysis_v736] load error: {e}")
+    return {"cycles": []}
+
+
+def _demo_analysis_save_v736(state):
+    try:
+        state = dict(state or {})
+        state["cycles"] = list(state.get("cycles") or [])[-2000:]
+        with open(DEMO_ANALYTICS_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [demo_analysis_v736] save error: {e}")
+
+
+def _demo_scan_row_for_storage_v736(row):
+    row = row or {}
+    return {
+        "ticker": row.get("ticker"),
+        "tf": row.get("tf"),
+        "signal": str(row.get("signal") or ""),
+        "status": _ui_status_plain(row.get("status")),
+        "entry_now": int(row.get("entry_now", 0) or 0),
+        "setup": int(row.get("setup", 0) or 0),
+        "rr": round(_safe_float(row.get("rr"), 0) or 0, 4),
+        "gate": str(row.get("gate") or "")[:300],
+        "testnet_gate": str(row.get("testnet_gate") or "")[:500],
+        "error": str(row.get("error") or "")[:500],
+    }
+
+
+def _demo_candidate_for_storage_v736(candidate):
+    candidate = candidate or {}
+    data = candidate.get("data") or {}
+    ep = candidate.get("entry_plan") or {}
+    risk = data.get("risk_levels") or {}
+    return {
+        "ticker": candidate.get("ticker"),
+        "interval": candidate.get("interval"),
+        "direction": candidate.get("direction"),
+        "strategy": candidate.get("strategy"),
+        "score": round(_safe_float(candidate.get("score"), 0) or 0, 4),
+        "reason": str(candidate.get("reason") or "")[:500],
+        "signal": str(data.get("signal") or ""),
+        "confidence": int(data.get("confidence", 0) or 0),
+        "micro_regime": data.get("micro_regime"),
+        "mtf_score": _safe_float(data.get("mtf_score"), None),
+        "entry_now": int(ep.get("entry_now_score", ep.get("score", 0)) or 0),
+        "setup": int(ep.get("setup_score", ep.get("score", 0)) or 0),
+        "status": _ui_status_plain(ep.get("status")),
+        "entry_ref": _safe_float(ep.get("live_price"), None) or _safe_float(data.get("price"), None),
+        "sl": _safe_float(ep.get("sl"), None) or _safe_float(risk.get("sl"), None),
+        "tp1": _safe_float(ep.get("tp1"), None) or _safe_float(risk.get("tp1"), None),
+        "tp2": _safe_float(ep.get("tp2"), None) or _safe_float(risk.get("tp2"), None),
+        "rr": _safe_float(ep.get("rr_now"), None) or _safe_float(risk.get("rr_ratio"), None),
+        "risk_blockers": [str(x)[:240] for x in list(data.get("risk_blockers") or [])[:8]],
+        "risk_warnings": [str(x)[:240] for x in list(data.get("risk_warnings") or [])[:8]],
+        "entry_warnings": [str(x)[:240] for x in list(ep.get("warnings") or [])[:8]],
+    }
+
+
+def _demo_result_for_storage_v736(result):
+    result = result or {}
+    plan = result.get("plan") or {}
+    entry_order = plan.get("entry_order") or {}
+    protection = result.get("protection") or {}
+    return {
+        "ok": bool(result.get("ok")),
+        "stage": result.get("stage"),
+        "reason": str(result.get("reason") or "")[:500],
+        "plan_id": plan.get("plan_id"),
+        "ticker": plan.get("ticker"),
+        "interval": plan.get("interval"),
+        "direction": plan.get("direction"),
+        "entry_reference": entry_order.get("entry_reference"),
+        "quantity": entry_order.get("quantity"),
+        "leverage": entry_order.get("leverage"),
+        "protection_order_count": len(protection.get("orders") or []),
+    }
+
+
+def _demo_analysis_record_cycle_v736(chat_id, tried, candidate=None, result=None, decision=None):
+    event = {
+        "type": "demo_testnet_cycle",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "chat_id": _paper_chat_key(chat_id),
+        "mode": "testnet",
+        "user_visible": dict(decision or {}),
+        "selected": _demo_candidate_for_storage_v736(candidate) if candidate else None,
+        "result": _demo_result_for_storage_v736(result) if result else None,
+        "scan": {
+            "total_rows": len(tried or []),
+            "top": [_demo_scan_row_for_storage_v736(x) for x in list(tried or [])[:20]],
+            "errors": [_demo_scan_row_for_storage_v736(x) for x in list(tried or []) if x.get("error")][:20],
+        },
+    }
+    state = _demo_analysis_load_v736()
+    state.setdefault("cycles", []).append(event)
+    _demo_analysis_save_v736(state)
+    return event
+
+
+def _demo_analysis_recent_cycles_v736(chat_id=None, limit=10):
+    rows = list((_demo_analysis_load_v736().get("cycles") or []))
+    if chat_id is not None:
+        key = _paper_chat_key(chat_id)
+        rows = [x for x in rows if str(x.get("chat_id")) == key]
+    rows.sort(key=lambda x: str(x.get("ts") or ""), reverse=True)
+    return rows[: int(limit)]
+
+
+_base_paper_trader_cycle_v735 = paper_trader_cycle
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _simple_sync_public_auto_settings(chat_id)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d • %H:%M UTC")
+    st = _testnet_stats_line_v734()
+    lines = [
+        "🤖 <b>Демо-бот Binance Testnet: цикл 15м</b>",
+        now,
+        "",
+        f"Testnet позиции: <b>{st['open']}/{PAPER_TRADER_MAX_POSITIONS}</b> | Сегодня: <b>{_testnet_today_real_entry_count_v734(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+        "Режим: <b>только Binance Futures Testnet</b>",
+    ]
+    candidate, tried = testnet_select_trade_candidate(chat_id)
+    if not candidate:
+        reason = _testnet_best_gate_message_v735(tried)
+        decision = {"opened": False, "status": "NO_TRADE", "reason": reason}
+        _demo_analysis_record_cycle_v736(chat_id, tried, decision=decision)
+        lines += ["", "<b>Решение:</b>", "Сделка на Binance Testnet не открыта.", reason]
+        best = _format_scan_rows(tried)
+        if best:
+            lines += ["", "<b>Лучшие проверки:</b>"] + best[:3]
+        return "\n".join(lines)
+    result = _submit_testnet_trade_v734(chat_id, candidate)
+    plan = result.get("plan") or {}
+    ticker = plan.get("ticker") or candidate.get("ticker")
+    direction = str(plan.get("direction") or candidate.get("direction") or "").upper()
+    interval = plan.get("interval") or candidate.get("interval")
+    if not result.get("ok"):
+        decision = {
+            "opened": False,
+            "status": "BLOCKED",
+            "stage": result.get("stage"),
+            "reason": str(result.get("reason") or "")[:500],
+            "ticker": ticker,
+            "interval": interval,
+            "direction": direction,
+        }
+        _demo_analysis_record_cycle_v736(chat_id, tried, candidate=candidate, result=result, decision=decision)
+        lines += [
+            "",
+            "<b>Решение:</b>",
+            "Сделка на Binance Testnet не открыта.",
+            f"Этап: <b>{_ui_html(result.get('stage'))}</b>",
+            "Причина: " + _ui_short_text(result.get("reason"), 180),
+        ]
+        if ticker and direction:
+            lines.append(f"План: <b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}")
+        return "\n".join(lines)
+    entry_order = plan.get("entry_order") or {}
+    protection = result.get("protection") or {}
+    decision = {
+        "opened": True,
+        "status": "OPENED",
+        "ticker": ticker,
+        "interval": interval,
+        "direction": direction,
+        "reason": str(candidate.get("reason") or "")[:500],
+    }
+    _demo_analysis_record_cycle_v736(chat_id, tried, candidate=candidate, result=result, decision=decision)
+    lines += [
+        "",
+        "<b>Решение:</b>",
+        "✅ Открыта сделка на <b>Binance Futures Testnet</b>.",
+        "",
+        f"<b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}",
+        f"Qty: <b>{entry_order.get('quantity')}</b> | Leverage: <b>x{entry_order.get('leverage')}</b>",
+        f"Entry ref: <b>{fmt_price(entry_order.get('entry_reference'), ticker)}</b>",
+        f"Protection: <b>{len(protection.get('orders') or [])} reduce-only algo orders</b>",
+        f"Причина: {_ui_short_text(candidate.get('reason'), 140)}",
+    ]
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.36 Compact User Cards + Local Demo Analytics"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -20227,6 +20430,7 @@ RUNTIME_LAYERS = [
     ("v7.33", "honest paper-vs-Binance Testnet status in demo bot cards"),
     ("v7.34", "testnet-only demo trading with precision rounding and algo protection orders"),
     ("v7.35", "remove public paper trading path and select demo trades through Testnet-only gates"),
+    ("v7.36", "separate compact user cards from local demo analytics storage"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -20258,6 +20462,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "testnet_open_positions": _testnet_open_positions_v734,
     "testnet_income_stats": _testnet_income_stats_v734,
     "testnet_select_trade_candidate": testnet_select_trade_candidate,
+    "demo_analysis_record_cycle": _demo_analysis_record_cycle_v736,
+    "demo_analysis_recent_cycles": _demo_analysis_recent_cycles_v736,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
