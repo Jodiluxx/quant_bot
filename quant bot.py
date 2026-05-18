@@ -20410,6 +20410,146 @@ def _testnet_public_pnl_line_v738(stats):
     )
 
 
+# ============================================================
+# v7.39 — STRICT BINANCE FILTER PRECISION
+# ============================================================
+# Use exchangeInfo filters as the source of truth. This fixes small-position
+# cases where splitting TP1/TP2 would create quantities below the symbol step.
+
+_base_normalize_testnet_plan_v734_for_v739 = _normalize_testnet_plan_v734
+_base_build_testnet_protection_order_tests_v734_for_v739 = build_testnet_protection_order_tests
+
+
+def _testnet_rules_summary_v739(symbol):
+    qty = _testnet_qty_rules_v734(symbol)
+    price = _testnet_price_rules_v734(symbol)
+    return {
+        "quantity_step": qty.get("step"),
+        "min_qty": qty.get("min_qty"),
+        "max_qty": qty.get("max_qty"),
+        "min_notional": qty.get("min_notional"),
+        "price_tick": price.get("tick"),
+    }
+
+
+def _testnet_quantity_decimal_v739(symbol, qty, ref_price=None):
+    text = _testnet_format_quantity_v734(symbol, qty, ref_price)
+    return _d_v734(text), text
+
+
+def _testnet_price_text_v739(symbol, price):
+    return _testnet_format_price_v734(symbol, price)
+
+
+def _testnet_tp_quantity_texts_v739(symbol, total_qty_text):
+    rules = _testnet_qty_rules_v734(symbol)
+    step = _d_v734(rules.get("step"))
+    min_qty = _d_v734(rules.get("min_qty"))
+    total = _d_v734(total_qty_text)
+    if total <= 0:
+        return {}
+    if step <= 0:
+        return {"TP1": _fmt_decimal_fixed_v734(total, "0.00000001")}
+
+    # If the total position cannot be split into two valid child quantities,
+    # use one full-size TP. A valid single TP is better than two rejected TPs.
+    if min_qty > 0 and total < (min_qty * Decimal("2")):
+        return {"TP1": _fmt_decimal_fixed_v734(total, step)}
+
+    tp1_raw = total * _d_v734(PROTECTION_TP1_QTY_PCT) / Decimal("100")
+    tp1 = _floor_step_v734(tp1_raw, step)
+    tp2 = _floor_step_v734(total - tp1, step)
+
+    if tp1 <= 0 or tp2 <= 0:
+        return {"TP1": _fmt_decimal_fixed_v734(total, step)}
+    if min_qty > 0 and (tp1 < min_qty or tp2 < min_qty):
+        return {"TP1": _fmt_decimal_fixed_v734(total, step)}
+
+    remainder = total - tp1 - tp2
+    if remainder >= step:
+        tp2 = _floor_step_v734(tp2 + remainder, step)
+    if tp1 + tp2 > total:
+        tp2 = _floor_step_v734(total - tp1, step)
+    if tp2 <= 0 or (min_qty > 0 and tp2 < min_qty):
+        return {"TP1": _fmt_decimal_fixed_v734(total, step)}
+
+    return {
+        "TP1": _fmt_decimal_fixed_v734(tp1, step),
+        "TP2": _fmt_decimal_fixed_v734(tp2, step),
+    }
+
+
+def _normalize_testnet_plan_v734(plan):
+    plan = _copy_v734.deepcopy(plan or {})
+    symbol = plan.get("api_symbol") or plan.get("ticker")
+    order = plan.setdefault("entry_order", {})
+    ref_price = (
+        order.get("entry_reference")
+        or plan.get("entry_reference")
+        or (plan.get("data") or {}).get("price")
+    )
+    qty_d, qty_text = _testnet_quantity_decimal_v739(symbol, order.get("quantity_est"), ref_price)
+    order["quantity_est"] = float(qty_d)
+    order["quantity"] = qty_text
+    order["quantity_text"] = qty_text
+    if ref_price:
+        order["entry_reference"] = float(_d_v734(ref_price))
+    plan["exchange_rules"] = _testnet_rules_summary_v739(symbol)
+    blockers = list(plan.get("blockers") or [])
+    if not symbol:
+        blockers.append("exchange precision: symbol is missing")
+    if qty_d <= 0:
+        blockers.append("exchange precision: normalized quantity is zero")
+    for protection in plan.get("protection_orders") or []:
+        if protection.get("stop_price"):
+            price_text = _testnet_price_text_v739(symbol, protection.get("stop_price"))
+            protection["stop_price"] = float(price_text)
+            protection["stop_price_text"] = price_text
+    plan["blockers"] = list(dict.fromkeys(str(x) for x in blockers if x))
+    if plan.get("blockers"):
+        plan["status"] = "BLOCKED"
+    return plan
+
+
+def build_testnet_protection_order_tests(plan):
+    plan = _normalize_testnet_plan_v734(plan)
+    geometry = validate_protection_order_geometry(plan)
+    if not geometry.get("ok"):
+        return [], geometry
+    params = []
+    prot = _plan_protection_map_v720(plan)
+    symbol = plan.get("api_symbol") or plan.get("ticker")
+    entry_order = plan.get("entry_order") or {}
+    total_qty_text = entry_order.get("quantity") or _testnet_format_quantity_v734(
+        symbol,
+        entry_order.get("quantity_est"),
+        entry_order.get("entry_reference"),
+    )
+    tp_quantities = _testnet_tp_quantity_texts_v739(symbol, total_qty_text)
+    quantities = {"SL": total_qty_text, **tp_quantities}
+    for label in ("SL", "TP1", "TP2"):
+        order = prot.get(label)
+        qty_text = quantities.get(label)
+        if not order or not qty_text or _d_v734(qty_text) <= 0:
+            continue
+        trigger_text = _testnet_price_text_v739(symbol, order.get("stop_price"))
+        params.append({
+            "label": label,
+            "symbol": symbol,
+            "side": order.get("side"),
+            "type": order.get("type"),
+            "quantity": qty_text,
+            "triggerPrice": trigger_text,
+            "reduceOnly": "true",
+            "workingType": "CONTRACT_PRICE",
+            "priceProtect": "false",
+            "clientAlgoId": _protect_client_id_v720(plan.get("plan_id"), label),
+        })
+    geometry["quantity_plan"] = quantities
+    geometry["exchange_rules"] = _testnet_rules_summary_v739(symbol)
+    return params, geometry
+
+
 def format_autobot_menu(chat_id):
     _simple_sync_public_auto_settings(chat_id)
     st = _testnet_public_stats_v738(chat_id)
@@ -20537,7 +20677,7 @@ def paper_trader_cycle(chat_id, manual=False):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.38 Honest Bot-Level PnL"
+BOT_VERSION_LABEL = "v7.39 Strict Binance Precision"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -20602,6 +20742,7 @@ RUNTIME_LAYERS = [
     ("v7.36", "separate compact user cards from local demo analytics storage"),
     ("v7.37", "immediate Testnet monitor checks position plus regular and algo protection orders"),
     ("v7.38", "show PnL only as bot-level closed-trade stats, not raw account income"),
+    ("v7.39", "strict Binance exchangeInfo precision for entry quantity and protection orders"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -20637,6 +20778,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "demo_analysis_recent_cycles": _demo_analysis_recent_cycles_v736,
     "run_immediate_testnet_monitor": _testnet_monitor_for_plan_v737,
     "testnet_public_stats": _testnet_public_stats_v738,
+    "normalize_testnet_plan": _normalize_testnet_plan_v734,
+    "build_testnet_protection_orders": build_testnet_protection_order_tests,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
