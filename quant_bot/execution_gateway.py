@@ -229,17 +229,17 @@ def protection_orders(open_orders_payload: Any, plan: dict[str, Any] | None) -> 
             continue
         if symbol and str(row.get("symbol") or "").upper() != symbol:
             continue
-        typ = str(row.get("type") or "").upper()
+        typ = str(row.get("type") or row.get("orderType") or "").upper()
         side = str(row.get("side") or "").upper()
         reduce_only = _truthy_order_flag(row.get("reduceOnly"))
         is_expected_side = not close_side or side == close_side
-        if typ in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+        if typ in {"STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET", "TAKE_PROFIT"}:
             orders.append(row)
             if not reduce_only or not is_expected_side:
                 bad_orders.append(row)
-        if typ == "STOP_MARKET" and reduce_only and is_expected_side:
+        if typ in {"STOP_MARKET", "STOP"} and reduce_only and is_expected_side:
             sl_orders.append(row)
-        if typ == "TAKE_PROFIT_MARKET" and reduce_only and is_expected_side:
+        if typ in {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"} and reduce_only and is_expected_side:
             tp_orders.append(row)
     return {
         "all": orders,

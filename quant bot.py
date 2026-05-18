@@ -17903,6 +17903,7 @@ _base_async_handle_update_v729 = async_handle_update
 
 TESTNET_POSITION_RISK_PATH = "/fapi/v2/positionRisk"
 TESTNET_OPEN_ORDERS_PATH = "/fapi/v1/openOrders"
+TESTNET_OPEN_ALGO_ORDERS_PATH = "/fapi/v1/openAlgoOrders"
 TESTNET_MONITOR_EVENTS_FILE_KIND = "testnet_position_monitor"
 
 
@@ -17992,18 +17993,34 @@ def fetch_testnet_position_snapshot(plan):
     params = {"symbol": plan.get("api_symbol") or plan.get("ticker")}
     position_response = _testnet_get_signed_v730(TESTNET_POSITION_RISK_PATH, params)
     orders_response = _testnet_get_signed_v730(TESTNET_OPEN_ORDERS_PATH, params)
+    algo_orders_response = _testnet_get_signed_v730(TESTNET_OPEN_ALGO_ORDERS_PATH, params)
+    regular_orders = orders_response.get("payload") if isinstance(orders_response.get("payload"), list) else []
+    algo_orders = algo_orders_response.get("payload") if isinstance(algo_orders_response.get("payload"), list) else []
     result.update({
-        "submitted": not position_response.get("skipped", False) and not orders_response.get("skipped", False),
+        "submitted": (
+            not position_response.get("skipped", False)
+            and not orders_response.get("skipped", False)
+            and not algo_orders_response.get("skipped", False)
+        ),
         "position_status_code": position_response.get("status_code"),
         "orders_status_code": orders_response.get("status_code"),
+        "algo_orders_status_code": algo_orders_response.get("status_code"),
         "position_response": position_response.get("payload"),
-        "orders_response": orders_response.get("payload"),
+        "regular_orders_response": orders_response.get("payload"),
+        "algo_orders_response": algo_orders_response.get("payload"),
+        "orders_response": list(regular_orders) + list(algo_orders),
         "position_error": position_response.get("reason") or position_response.get("error"),
         "orders_error": orders_response.get("reason") or orders_response.get("error"),
+        "algo_orders_error": algo_orders_response.get("reason") or algo_orders_response.get("error"),
     })
-    result["ok"] = bool(position_response.get("ok") and orders_response.get("ok"))
+    result["ok"] = bool(position_response.get("ok") and orders_response.get("ok") and algo_orders_response.get("ok"))
     if not result["ok"]:
-        result["reason"] = result.get("position_error") or result.get("orders_error") or "position/openOrders fetch failed"
+        result["reason"] = (
+            result.get("position_error")
+            or result.get("orders_error")
+            or result.get("algo_orders_error")
+            or "position/openOrders/openAlgoOrders fetch failed"
+        )
     return result
 
 
@@ -20248,6 +20265,7 @@ def _demo_result_for_storage_v736(result):
     plan = result.get("plan") or {}
     entry_order = plan.get("entry_order") or {}
     protection = result.get("protection") or {}
+    monitor = result.get("monitor") or {}
     return {
         "ok": bool(result.get("ok")),
         "stage": result.get("stage"),
@@ -20260,6 +20278,15 @@ def _demo_result_for_storage_v736(result):
         "quantity": entry_order.get("quantity"),
         "leverage": entry_order.get("leverage"),
         "protection_order_count": len(protection.get("orders") or []),
+        "monitor": {
+            "ok": monitor.get("ok"),
+            "status": monitor.get("status"),
+            "reason": str(monitor.get("reason") or "")[:500],
+            "has_position": monitor.get("has_position"),
+            "sl_count": monitor.get("sl_count"),
+            "tp_count": monitor.get("tp_count"),
+            "bad_protection_count": monitor.get("bad_protection_count"),
+        } if monitor else None,
     }
 
 
@@ -20291,6 +20318,46 @@ def _demo_analysis_recent_cycles_v736(chat_id=None, limit=10):
         rows = [x for x in rows if str(x.get("chat_id")) == key]
     rows.sort(key=lambda x: str(x.get("ts") or ""), reverse=True)
     return rows[: int(limit)]
+
+
+def _testnet_monitor_for_plan_v737(plan, delay_sec=0.75):
+    plan = plan or {}
+    if delay_sec:
+        time.sleep(float(delay_sec))
+    snapshot = fetch_testnet_position_snapshot(plan)
+    if snapshot.get("ok"):
+        evaluation = _evaluate_position_monitor_v730(
+            plan,
+            snapshot.get("position_response"),
+            snapshot.get("orders_response"),
+        )
+    else:
+        evaluation = {
+            "status": "FETCH_FAILED",
+            "ok": False,
+            "blockers": [snapshot.get("reason") or "fetch failed"],
+            "warnings": [],
+        }
+    event = _record_testnet_monitor_result_v730(plan, snapshot, evaluation)
+    return {
+        "ok": bool(evaluation.get("ok")),
+        "status": evaluation.get("status"),
+        "reason": snapshot.get("reason") or "; ".join((evaluation.get("blockers") or [])[:3]),
+        "event": event,
+        **evaluation,
+    }
+
+
+def _testnet_monitor_short_line_v737(monitor):
+    monitor = monitor or {}
+    status = monitor.get("status") or "UNKNOWN"
+    icon = _testnet_monitor_status_icon_v730(status)
+    if status == "PROTECTED":
+        return f"Monitor: {icon} <b>PROTECTED</b> | SL {monitor.get('sl_count', 0)} | TP {monitor.get('tp_count', 0)}"
+    if status == "NO_POSITION":
+        return f"Monitor: {icon} <b>NO POSITION</b> | позиция не найдена или уже закрыта"
+    reason = _ui_short_text(monitor.get("reason"), 120)
+    return f"Monitor: {icon} <b>{_ui_html(status)}</b>" + (f" | {reason}" if reason else "")
 
 
 _base_paper_trader_cycle_v735 = paper_trader_cycle
@@ -20345,6 +20412,8 @@ def paper_trader_cycle(chat_id, manual=False):
         return "\n".join(lines)
     entry_order = plan.get("entry_order") or {}
     protection = result.get("protection") or {}
+    monitor = _testnet_monitor_for_plan_v737(plan)
+    result["monitor"] = monitor
     decision = {
         "opened": True,
         "status": "OPENED",
@@ -20352,6 +20421,7 @@ def paper_trader_cycle(chat_id, manual=False):
         "interval": interval,
         "direction": direction,
         "reason": str(candidate.get("reason") or "")[:500],
+        "monitor_status": monitor.get("status"),
     }
     _demo_analysis_record_cycle_v736(chat_id, tried, candidate=candidate, result=result, decision=decision)
     lines += [
@@ -20363,12 +20433,13 @@ def paper_trader_cycle(chat_id, manual=False):
         f"Qty: <b>{entry_order.get('quantity')}</b> | Leverage: <b>x{entry_order.get('leverage')}</b>",
         f"Entry ref: <b>{fmt_price(entry_order.get('entry_reference'), ticker)}</b>",
         f"Protection: <b>{len(protection.get('orders') or [])} reduce-only algo orders</b>",
+        _testnet_monitor_short_line_v737(monitor),
         f"Причина: {_ui_short_text(candidate.get('reason'), 140)}",
     ]
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.36 Compact User Cards + Local Demo Analytics"
+BOT_VERSION_LABEL = "v7.37 Immediate Testnet Protection Monitor"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -20431,6 +20502,7 @@ RUNTIME_LAYERS = [
     ("v7.34", "testnet-only demo trading with precision rounding and algo protection orders"),
     ("v7.35", "remove public paper trading path and select demo trades through Testnet-only gates"),
     ("v7.36", "separate compact user cards from local demo analytics storage"),
+    ("v7.37", "immediate Testnet monitor checks position plus regular and algo protection orders"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -20464,6 +20536,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "testnet_select_trade_candidate": testnet_select_trade_candidate,
     "demo_analysis_record_cycle": _demo_analysis_record_cycle_v736,
     "demo_analysis_recent_cycles": _demo_analysis_recent_cycles_v736,
+    "run_immediate_testnet_monitor": _testnet_monitor_for_plan_v737,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,

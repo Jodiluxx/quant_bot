@@ -54,6 +54,20 @@ class ExecutionGatewayTests(unittest.TestCase):
         self.assertEqual(result["sl_count"], 1)
         self.assertEqual(result["tp_count"], 2)
 
+    def test_position_monitor_accepts_algo_protection_orders(self) -> None:
+        plan = {"ticker": "BNBUSDT", "api_symbol": "BNBUSDT", "direction": "short"}
+        positions = [{"symbol": "BNBUSDT", "positionAmt": "-0.020", "entryPrice": "650", "markPrice": "648"}]
+        algo_orders = [
+            {"symbol": "BNBUSDT", "orderType": "STOP_MARKET", "side": "BUY", "reduceOnly": "true"},
+            {"symbol": "BNBUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "BUY", "reduceOnly": "true"},
+            {"symbol": "BNBUSDT", "orderType": "TAKE_PROFIT", "side": "BUY", "reduceOnly": "true"},
+        ]
+        result = evaluate_position_monitor(plan, positions, algo_orders)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "PROTECTED")
+        self.assertEqual(result["sl_count"], 1)
+        self.assertEqual(result["tp_count"], 2)
+
     def test_position_monitor_flags_unprotected_position(self) -> None:
         plan = {"ticker": "ETHUSDT", "api_symbol": "ETHUSDT", "direction": "short"}
         positions = [{"symbol": "ETHUSDT", "positionAmt": "-0.5", "entryPrice": "2000", "markPrice": "1990"}]

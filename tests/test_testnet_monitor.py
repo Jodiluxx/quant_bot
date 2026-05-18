@@ -28,6 +28,33 @@ class TestnetPositionMonitorTests(unittest.TestCase):
         ]
         self.assertIn("testnet_monitor", callbacks)
 
+    def test_snapshot_fetches_algo_open_orders_for_protection(self) -> None:
+        calls = []
+
+        def fake_get(path, params=None):
+            calls.append(path)
+            if path == self.bot.TESTNET_POSITION_RISK_PATH:
+                return {"ok": True, "payload": [{"symbol": "BNBUSDT", "positionAmt": "-0.02"}]}
+            if path == self.bot.TESTNET_OPEN_ORDERS_PATH:
+                return {"ok": True, "payload": []}
+            if path == self.bot.TESTNET_OPEN_ALGO_ORDERS_PATH:
+                return {"ok": True, "payload": [{"symbol": "BNBUSDT", "orderType": "STOP_MARKET"}]}
+            return {"ok": False, "reason": path}
+
+        old_get = self.bot._testnet_get_signed_v730
+        old_guard = self.bot._testnet_monitor_read_guard_v730
+        self.bot._testnet_get_signed_v730 = fake_get
+        self.bot._testnet_monitor_read_guard_v730 = lambda: []
+        try:
+            snapshot = self.bot.fetch_testnet_position_snapshot({"ticker": "BNBUSDT", "api_symbol": "BNBUSDT"})
+        finally:
+            self.bot._testnet_get_signed_v730 = old_get
+            self.bot._testnet_monitor_read_guard_v730 = old_guard
+
+        self.assertTrue(snapshot["ok"])
+        self.assertIn(self.bot.TESTNET_OPEN_ALGO_ORDERS_PATH, calls)
+        self.assertEqual(len(snapshot["orders_response"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
