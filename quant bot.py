@@ -19198,7 +19198,708 @@ def paper_trader_cycle(chat_id, manual=False):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.33 Honest Paper/Testnet Status"
+# ============================================================
+# v7.34 - TESTNET-ONLY DEMO TRADING
+# ============================================================
+# Public demo trading no longer opens internal paper positions. A cycle either
+# sends a real Binance Futures Testnet entry + protection orders, or reports
+# that no exchange order was sent. Paper state remains on disk for old history
+# but is not used by the public demo bot.
+
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP
+import copy as _copy_v734
+
+TESTNET_ALGO_ORDER_PATH = "/fapi/v1/algoOrder"
+TESTNET_INCOME_PATH = "/fapi/v1/income"
+TESTNET_EXCHANGE_INFO_TTL = 3600
+_testnet_exchange_info_cache_v734 = {"ts": 0.0, "symbols": {}}
+
+
+def _d_v734(value):
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+
+
+def _step_decimals_v734(step):
+    step = _d_v734(step)
+    if step <= 0:
+        return 8
+    return max(0, -step.normalize().as_tuple().exponent)
+
+
+def _floor_step_v734(value, step):
+    value = _d_v734(value)
+    step = _d_v734(step)
+    if value <= 0 or step <= 0:
+        return Decimal("0")
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _ceil_step_v734(value, step):
+    value = _d_v734(value)
+    step = _d_v734(step)
+    if value <= 0 or step <= 0:
+        return Decimal("0")
+    return (value / step).to_integral_value(rounding=ROUND_CEILING) * step
+
+
+def _round_tick_v734(value, tick):
+    value = _d_v734(value)
+    tick = _d_v734(tick)
+    if value <= 0 or tick <= 0:
+        return Decimal("0")
+    return (value / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
+
+
+def _fmt_decimal_fixed_v734(value, step):
+    decs = _step_decimals_v734(step)
+    quant = Decimal("1") if decs <= 0 else Decimal("1").scaleb(-decs)
+    return format(_d_v734(value).quantize(quant), "f")
+
+
+def _testnet_exchange_symbols_v734(force=False):
+    now = time.time()
+    cached = _testnet_exchange_info_cache_v734
+    if cached.get("symbols") and not force and now - float(cached.get("ts") or 0) < TESTNET_EXCHANGE_INFO_TTL:
+        return cached["symbols"]
+    url = BINANCE_FUTURES_TESTNET_REST.rstrip("/") + "/fapi/v1/exchangeInfo"
+    response = _session.get(url, timeout=15)
+    response.raise_for_status()
+    payload = response.json()
+    symbols = {}
+    for row in payload.get("symbols") or []:
+        symbol = row.get("symbol")
+        if not symbol:
+            continue
+        filters = {f.get("filterType"): f for f in row.get("filters") or []}
+        symbols[symbol] = dict(row, filters_map=filters)
+    cached["symbols"] = symbols
+    cached["ts"] = now
+    return symbols
+
+
+def _testnet_symbol_info_v734(symbol):
+    return _testnet_exchange_symbols_v734().get(symbol) or {}
+
+
+def _testnet_qty_rules_v734(symbol):
+    info = _testnet_symbol_info_v734(symbol)
+    filters = info.get("filters_map") or {}
+    lot = filters.get("MARKET_LOT_SIZE") or filters.get("LOT_SIZE") or {}
+    lot_fallback = filters.get("LOT_SIZE") or {}
+    step = lot.get("stepSize") or lot_fallback.get("stepSize") or "0.001"
+    min_qty = lot.get("minQty") or lot_fallback.get("minQty") or step
+    max_qty = lot.get("maxQty") or lot_fallback.get("maxQty")
+    min_notional_filter = filters.get("MIN_NOTIONAL") or {}
+    min_notional = (
+        min_notional_filter.get("notional")
+        or min_notional_filter.get("minNotional")
+        or "0"
+    )
+    return {
+        "step": step,
+        "min_qty": min_qty,
+        "max_qty": max_qty,
+        "min_notional": min_notional,
+    }
+
+
+def _testnet_price_rules_v734(symbol):
+    info = _testnet_symbol_info_v734(symbol)
+    filters = info.get("filters_map") or {}
+    price = filters.get("PRICE_FILTER") or {}
+    return {"tick": price.get("tickSize") or "0.01"}
+
+
+def _testnet_format_quantity_v734(symbol, qty, ref_price=None):
+    rules = _testnet_qty_rules_v734(symbol)
+    step = rules["step"]
+    qty_d = _floor_step_v734(qty, step)
+    min_qty = _d_v734(rules.get("min_qty"))
+    if min_qty > 0 and qty_d < min_qty:
+        qty_d = min_qty
+    min_notional = _d_v734(rules.get("min_notional"))
+    price_d = _d_v734(ref_price)
+    if min_notional > 0 and price_d > 0 and qty_d * price_d < min_notional:
+        qty_d = _ceil_step_v734(min_notional / price_d, step)
+    max_qty = _d_v734(rules.get("max_qty"))
+    if max_qty > 0 and qty_d > max_qty:
+        qty_d = max_qty
+    qty_d = _floor_step_v734(qty_d, step)
+    return _fmt_decimal_fixed_v734(qty_d, step)
+
+
+def _testnet_format_price_v734(symbol, price):
+    tick = _testnet_price_rules_v734(symbol)["tick"]
+    return _fmt_decimal_fixed_v734(_round_tick_v734(price, tick), tick)
+
+
+def _normalize_testnet_plan_v734(plan):
+    plan = _copy_v734.deepcopy(plan or {})
+    symbol = plan.get("api_symbol") or plan.get("ticker")
+    order = plan.setdefault("entry_order", {})
+    ref_price = (
+        order.get("entry_reference")
+        or plan.get("entry_reference")
+        or (plan.get("data") or {}).get("price")
+    )
+    qty_text = _testnet_format_quantity_v734(symbol, order.get("quantity_est"), ref_price)
+    order["quantity_est"] = float(qty_text)
+    order["quantity"] = qty_text
+    if ref_price:
+        order["entry_reference"] = float(_d_v734(ref_price))
+    for protection in plan.get("protection_orders") or []:
+        if protection.get("stop_price"):
+            price_text = _testnet_format_price_v734(symbol, protection.get("stop_price"))
+            protection["stop_price"] = float(price_text)
+            protection["stop_price_text"] = price_text
+    return plan
+
+
+def _entry_order_test_params_v719(plan):
+    plan = _normalize_testnet_plan_v734(plan)
+    order = plan.get("entry_order") or {}
+    qty = order.get("quantity") or _testnet_format_quantity_v734(
+        plan.get("api_symbol") or plan.get("ticker"),
+        order.get("quantity_est"),
+        order.get("entry_reference"),
+    )
+    return {
+        "symbol": plan.get("api_symbol") or plan.get("ticker"),
+        "side": order.get("side"),
+        "type": "MARKET",
+        "quantity": qty,
+        "newClientOrderId": order.get("client_order_id"),
+        "newOrderRespType": "ACK",
+    }
+
+
+def build_testnet_protection_order_tests(plan):
+    plan = _normalize_testnet_plan_v734(plan)
+    geometry = validate_protection_order_geometry(plan)
+    if not geometry.get("ok"):
+        return [], geometry
+    params = []
+    prot = _plan_protection_map_v720(plan)
+    symbol = plan.get("api_symbol") or plan.get("ticker")
+    for label in ("SL", "TP1", "TP2"):
+        order = prot.get(label)
+        if not order:
+            continue
+        qty = _protection_order_qty_v720(plan, label)
+        if qty <= 0:
+            continue
+        params.append({
+            "label": label,
+            "symbol": symbol,
+            "side": order.get("side"),
+            "type": order.get("type"),
+            "quantity": _testnet_format_quantity_v734(symbol, qty, (plan.get("entry_order") or {}).get("entry_reference")),
+            "triggerPrice": _testnet_format_price_v734(symbol, order.get("stop_price")),
+            "reduceOnly": "true",
+            "workingType": "CONTRACT_PRICE",
+            "priceProtect": "false",
+            "clientAlgoId": _protect_client_id_v720(plan.get("plan_id"), label),
+        })
+    return params, geometry
+
+
+def submit_testnet_protection_order_tests(plan):
+    plan = _normalize_testnet_plan_v734(plan)
+    mode = execution_mode()
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "mode": mode.get("mode"),
+        "endpoint": TESTNET_ALGO_ORDER_PATH,
+        "submitted": False,
+        "ok": False,
+        "orders": [],
+    }
+    params_list, geometry = build_testnet_protection_order_tests(plan)
+    result["geometry"] = geometry
+    if not geometry.get("ok"):
+        result["skipped"] = True
+        result["reason"] = "SL/TP geometry invalid"
+        return result
+    if mode.get("mode") != "testnet":
+        result["skipped"] = True
+        result["reason"] = "BOT_EXECUTION_MODE должен быть testnet"
+        return result
+    if not _testnet_submit_enabled_v719():
+        result["skipped"] = True
+        result["reason"] = "BINANCE_TESTNET_ORDER_SUBMIT не включён"
+        return result
+    if plan.get("blockers"):
+        result["skipped"] = True
+        result["reason"] = "ордер-план заблокирован risk/safety"
+        result["blockers"] = list(plan.get("blockers") or [])[:5]
+        return result
+    if not params_list:
+        result["skipped"] = True
+        result["reason"] = "нет защитных ордеров для проверки"
+        return result
+    for params in params_list:
+        result["orders"].append({
+            "label": params.get("label"),
+            "submitted": False,
+            "ok": True,
+            "status_code": "LOCAL_VALIDATION",
+            "request": {
+                "symbol": params.get("symbol"),
+                "side": params.get("side"),
+                "type": params.get("type"),
+                "quantity": params.get("quantity"),
+                "triggerPrice": params.get("triggerPrice"),
+                "reduceOnly": params.get("reduceOnly"),
+            },
+            "response": {"msg": "local algo-order validation only"},
+        })
+    result["ok"] = True
+    result["reason"] = "local validation passed; real protection uses /fapi/v1/algoOrder"
+    return result
+
+
+def _real_protection_client_id_v729(plan_id, label):
+    raw = f"real_{label}_{str(plan_id or 'plan').replace(':', '_')}"
+    return raw[-36:]
+
+
+def _real_protection_order_params_v729(plan):
+    params_list, geometry = build_testnet_protection_order_tests(plan)
+    out = []
+    for item in params_list:
+        params = dict(item)
+        label = params.pop("label", None)
+        params["clientAlgoId"] = _real_protection_client_id_v729(plan.get("plan_id"), label)
+        out.append((label, params))
+    return out, geometry
+
+
+def submit_testnet_real_protection_orders(plan, entry_result=None):
+    plan = _normalize_testnet_plan_v734(plan)
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "mode": execution_mode().get("mode"),
+        "endpoint": TESTNET_ALGO_ORDER_PATH,
+        "kind": "real_protection",
+        "submitted": False,
+        "ok": False,
+        "orders": [],
+    }
+    blockers = _testnet_real_guard_v729(plan, {"entry_test_ok": True, "protection_test_ok": True})
+    if blockers:
+        result["skipped"] = True
+        result["reason"] = "; ".join(blockers[:5])
+        result["blockers"] = blockers
+        return result
+    params_list, geometry = _real_protection_order_params_v729(plan)
+    result["geometry"] = geometry
+    if not geometry.get("ok"):
+        result["skipped"] = True
+        result["reason"] = "SL/TP geometry invalid"
+        return result
+    for label, params in params_list:
+        response = _testnet_post_signed_v719(TESTNET_ALGO_ORDER_PATH, params)
+        item = {
+            "label": label,
+            "submitted": not response.get("skipped", False),
+            "ok": bool(response.get("ok")),
+            "status_code": response.get("status_code"),
+            "reason": response.get("reason") or response.get("error"),
+            "request": {
+                "symbol": params.get("symbol"),
+                "side": params.get("side"),
+                "type": params.get("type"),
+                "quantity": params.get("quantity"),
+                "triggerPrice": params.get("triggerPrice"),
+                "reduceOnly": params.get("reduceOnly"),
+            },
+            "response": response.get("payload"),
+        }
+        if isinstance(item.get("response"), dict) and not item.get("reason"):
+            item["reason"] = item["response"].get("msg")
+        result["orders"].append(item)
+    result["submitted"] = any(x.get("submitted") for x in result["orders"])
+    result["ok"] = bool(result["orders"]) and all(x.get("ok") for x in result["orders"])
+    if not result["ok"]:
+        result["reason"] = "; ".join(
+            f"{x.get('label')}: {x.get('reason') or x.get('status_code')}"
+            for x in result["orders"] if not x.get("ok")
+        )[:500]
+    return result
+
+
+def _testnet_open_positions_v734():
+    response = _testnet_get_signed_v730(TESTNET_POSITION_RISK_PATH, {})
+    if not response.get("ok"):
+        return [], response.get("reason") or response.get("error") or response.get("payload")
+    rows = response.get("payload") or []
+    active = []
+    iter_rows = rows if isinstance(rows, list) else []
+    for row in iter_rows:
+        amt = _safe_float(row.get("positionAmt"), 0) or 0
+        if abs(amt) > 0:
+            active.append(row)
+    return active, None
+
+
+def _testnet_today_real_entry_count_v734(chat_id=None):
+    today = datetime.now(timezone.utc).date().isoformat()
+    events = [
+        e for e in (_execution_load_state_v715().get("events") or [])
+        if e.get("type") == TESTNET_REAL_EVENTS_FILE_KIND
+        and e.get("kind") == "real_entry"
+        and e.get("ok")
+        and str(e.get("ts") or "").startswith(today)
+    ]
+    if chat_id is not None:
+        key = _paper_chat_key(chat_id)
+        events = [e for e in events if str(e.get("chat_id")) == key]
+    return len(events)
+
+
+def _testnet_income_stats_v734(limit=1000):
+    response = _testnet_get_signed_v730(TESTNET_INCOME_PATH, {"incomeType": "REALIZED_PNL", "limit": int(limit)})
+    if not response.get("ok"):
+        return {"ok": False, "reason": response.get("reason") or response.get("error") or response.get("payload")}
+    rows = response.get("payload") or []
+    pnl_rows = []
+    iter_rows = rows if isinstance(rows, list) else []
+    for row in iter_rows:
+        pnl = _safe_float(row.get("income"), 0) or 0
+        if abs(pnl) > 0:
+            pnl_rows.append(dict(row, pnl=pnl))
+    wins = [x for x in pnl_rows if x["pnl"] > 0]
+    losses = [x for x in pnl_rows if x["pnl"] < 0]
+    total = len(wins) + len(losses)
+    return {
+        "ok": True,
+        "rows": pnl_rows,
+        "wins": len(wins),
+        "losses": len(losses),
+        "closed": total,
+        "winrate": (len(wins) / total * 100.0) if total else 0.0,
+        "net": sum(x["pnl"] for x in pnl_rows),
+    }
+
+
+def _build_testnet_trade_plan_v734(chat_id, candidate):
+    info = execution_mode()
+    candidate = candidate or {}
+    data = candidate.get("data") or {}
+    ep = candidate.get("entry_plan") or {}
+    ticker = candidate.get("ticker")
+    interval = candidate.get("interval")
+    direction = str(candidate.get("direction") or "").lower()
+    strategy = candidate.get("strategy") or "unknown"
+    entry = _safe_float(ep.get("live_price"), None) or _safe_float(data.get("price"), None)
+    sl = _safe_float(ep.get("sl"), None) or _safe_float((data.get("risk_levels") or {}).get("sl"), None)
+    tp1 = _safe_float(ep.get("tp1"), None) or _safe_float((data.get("risk_levels") or {}).get("tp1"), None)
+    tp2 = _safe_float(ep.get("tp2"), None) or _safe_float((data.get("risk_levels") or {}).get("tp2"), tp1)
+    bal, size_pct, lev, margin, notional = _paper_position_notional(chat_id)
+    blockers = []
+    warnings = []
+    if info.get("mode") != "testnet":
+        blockers.append("BOT_EXECUTION_MODE должен быть testnet")
+    if not info.get("testnet_keys_present"):
+        blockers.append("Binance Futures Testnet API key/secret не заданы")
+    if not _testnet_submit_enabled_v719():
+        blockers.append("BINANCE_TESTNET_ORDER_SUBMIT=1 не включён")
+    if not _testnet_real_submit_enabled_v729():
+        blockers.append("BINANCE_TESTNET_REAL_ORDER_SUBMIT=1 не включён")
+    if not ticker or ticker not in TICKERS:
+        blockers.append("неизвестный тикер")
+    if not interval or interval not in INTERVALS:
+        blockers.append("неизвестный TF")
+    if direction not in {"long", "short"}:
+        blockers.append("нет направления long/short")
+    if not entry or not sl or not tp1:
+        blockers.append("не хватает entry/SL/TP")
+    active_positions, pos_err = _testnet_open_positions_v734()
+    if pos_err:
+        warnings.append("не удалось прочитать Testnet позиции: " + str(pos_err)[:120])
+    if len(active_positions) >= PAPER_TRADER_MAX_POSITIONS:
+        blockers.append(f"достигнут лимит Testnet позиций {len(active_positions)}/{PAPER_TRADER_MAX_POSITIONS}")
+    today_count = _testnet_today_real_entry_count_v734(chat_id)
+    if today_count >= PAPER_TRADER_MAX_TRADES_PER_DAY:
+        blockers.append(f"достигнут дневной лимит Testnet сделок {today_count}/{PAPER_TRADER_MAX_TRADES_PER_DAY}")
+    side = "BUY" if direction == "long" else "SELL"
+    close_side = "SELL" if direction == "long" else "BUY"
+    setup_id = None
+    setup_slot = None
+    try:
+        setup_id, _, setup_slot = _paper_setup_ids_v79(chat_id=chat_id, candidate=candidate)
+    except Exception:
+        setup_id = str(int(time.time()))
+    plan_id = _execution_plan_id_v715(chat_id, ticker, interval, direction, strategy, setup_id, setup_slot)
+    qty = _execution_qty_est_v715(entry, notional)
+    plan = {
+        "plan_id": plan_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "chat_id": _paper_chat_key(chat_id),
+        "mode": "testnet",
+        "status": "TESTNET_REAL_READY" if not blockers else "BLOCKED",
+        "blockers": blockers,
+        "warnings": warnings,
+        "ticker": ticker,
+        "api_symbol": futures_api_symbol(ticker) if ticker in TICKERS else ticker,
+        "interval": interval,
+        "direction": direction,
+        "strategy": strategy,
+        "setup_id": setup_id,
+        "setup_slot": setup_slot,
+        "entry_order": {
+            "side": side,
+            "type": "MARKET",
+            "quantity_est": qty,
+            "notional_est": notional,
+            "margin_est": margin,
+            "leverage": lev,
+            "entry_reference": entry,
+            "client_order_id": str(plan_id).replace(":", "_")[-36:],
+        },
+        "protection_orders": [
+            {"label": "SL", "side": close_side, "type": "STOP_MARKET", "stop_price": sl, "reduce_only": True},
+            {"label": "TP1", "side": close_side, "type": "TAKE_PROFIT_MARKET", "stop_price": tp1, "reduce_only": True},
+            {"label": "TP2", "side": close_side, "type": "TAKE_PROFIT_MARKET", "stop_price": tp2, "reduce_only": True},
+        ],
+        "reason": candidate.get("reason"),
+        "metrics": candidate.get("metrics") or {},
+    }
+    try:
+        plan = _normalize_testnet_plan_v734(plan)
+    except Exception as e:
+        plan["blockers"] = list(plan.get("blockers") or []) + [f"precision normalization error: {e}"]
+        plan["status"] = "BLOCKED"
+    return plan
+
+
+def _record_testnet_trade_attempt_v734(plan, entry_test=None, protection_test=None, leverage=None, entry=None, protection=None, emergency=None):
+    _execution_record_plan_v715(plan)
+    if entry_test is not None:
+        _record_testnet_result_v719(plan, entry_test)
+        _record_testnet_journal_event_v721("entry", plan, entry_test)
+    if protection_test is not None:
+        _record_testnet_protection_result_v720(plan, protection_test)
+        _record_testnet_journal_event_v721("protection", plan, protection_test)
+    for kind, result in (
+        ("real_leverage", leverage),
+        ("real_entry", entry),
+        ("real_protection", protection),
+        ("real_emergency_close", emergency),
+    ):
+        if result is not None:
+            _record_testnet_real_order_result_v729(kind, plan, result)
+
+
+def _submit_testnet_trade_v734(chat_id, candidate):
+    plan = _build_testnet_trade_plan_v734(chat_id, candidate)
+    if plan.get("blockers"):
+        _execution_record_plan_v715(plan)
+        return {"ok": False, "stage": "plan", "plan": plan, "reason": "; ".join(plan.get("blockers") or [])}
+    entry_test = submit_testnet_order_test(plan)
+    protection_test = submit_testnet_protection_order_tests(plan)
+    if not entry_test.get("ok") or not protection_test.get("ok"):
+        _record_testnet_trade_attempt_v734(plan, entry_test, protection_test)
+        reason = entry_test.get("reason") or entry_test.get("error")
+        if isinstance(entry_test.get("response"), dict):
+            reason = reason or entry_test["response"].get("msg")
+        reason = reason or protection_test.get("reason") or "testnet validation failed"
+        return {
+            "ok": False,
+            "stage": "validation",
+            "plan": plan,
+            "entry_test": entry_test,
+            "protection_test": protection_test,
+            "reason": reason,
+        }
+    leverage = submit_testnet_set_leverage(plan)
+    entry = submit_testnet_real_entry_order(plan, {"entry_test_ok": True, "protection_test_ok": True})
+    protection = None
+    emergency = None
+    if entry.get("ok"):
+        protection = submit_testnet_real_protection_orders(plan, entry)
+        if not protection.get("ok"):
+            emergency = submit_testnet_emergency_close_order(plan, "protection_failed_after_entry")
+    _record_testnet_trade_attempt_v734(plan, entry_test, protection_test, leverage, entry, protection, emergency)
+    if not entry.get("ok"):
+        return {"ok": False, "stage": "entry", "plan": plan, "entry": entry, "reason": entry.get("reason") or entry.get("error") or entry.get("response")}
+    if not protection or not protection.get("ok"):
+        return {
+            "ok": False,
+            "stage": "protection",
+            "plan": plan,
+            "entry": entry,
+            "protection": protection,
+            "emergency": emergency,
+            "reason": (protection or {}).get("reason") or "protection order rejected",
+        }
+    return {
+        "ok": True,
+        "stage": "done",
+        "plan": plan,
+        "entry": entry,
+        "protection": protection,
+        "leverage": leverage,
+    }
+
+
+def _testnet_stats_line_v734():
+    active, err = _testnet_open_positions_v734()
+    stats = _testnet_income_stats_v734()
+    if stats.get("ok"):
+        wr = f"{stats.get('winrate', 0):.1f}%"
+        return {
+            "open": len(active),
+            "closed": stats.get("closed", 0),
+            "wins": stats.get("wins", 0),
+            "losses": stats.get("losses", 0),
+            "winrate": wr,
+            "net": stats.get("net", 0.0),
+            "err": err,
+        }
+    return {
+        "open": len(active),
+        "closed": 0,
+        "wins": 0,
+        "losses": 0,
+        "winrate": "0.0%",
+        "net": 0.0,
+        "err": err or stats.get("reason"),
+    }
+
+
+def format_main_status(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
+    sig = _get_auto_task_settings(chat_id, "signals")
+    paper = _get_auto_task_settings(chat_id, "paper_trader")
+    stats = _testnet_stats_line_v734()
+    return "\n".join([
+        "🏠 <b>Главное меню</b>",
+        "",
+        f"Сигнал: <b>{_ui_ticker_short(ticker)}USDT</b> | TF <b>{_ui_tf_short(interval)}</b>",
+        f"Авто: <b>{auto_state}</b> | Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
+        f"Testnet позиции: <b>{stats['open']}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        "",
+        "<b>Уведомления:</b>",
+        f"• Сигналы: <b>{'ON' if sig.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | { _ui_tf_short(sig.get('send_interval')) } | TF { _ui_tf_short(sig.get('tf') or '30m') }",
+        f"• Демо-бот: <b>{'ON' if paper.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | каждые 15м",
+    ])
+
+
+def _simple_latest_analysis(chat_id):
+    events = _recent_testnet_real_events_v729(chat_id, 1)
+    if events:
+        e = events[0]
+        status = "OK" if e.get("ok") else "BLOCK"
+        return f"Последнее Testnet событие: {e.get('kind')} | {status} | {_ui_short_text(e.get('reason') or e.get('ticker') or '', 100)}"
+    return "Пока Testnet-сделок нет. Бот ждет setup, который пройдет фильтры и будет принят Binance."
+
+
+def format_autobot_menu(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    st = _testnet_stats_line_v734()
+    paper_enabled = chat_id in auto_chat_ids and bool(_get_auto_task_settings(chat_id, "paper_trader").get("enabled"))
+    lines = [
+        "🤖 <b>Демо-бот Binance Testnet</b>",
+        "",
+        f"Торговля: <b>{'ON' if paper_enabled else 'OFF'}</b> | Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
+        "Paper-сделки: <b>OFF</b>",
+        "Частота: <b>каждые 15 минут</b> | TF выбирает бот",
+        "",
+        "<b>Статистика Testnet:</b>",
+        f"• Открытые позиции: <b>{st['open']}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"• Закрытые PnL-события: <b>{st['closed']}</b>",
+        f"• Winrate: <b>{st['winrate']}</b> | Win/Loss: <b>{st['wins']}/{st['losses']}</b>",
+        f"• Net realized PnL: <b>{st['net']:+.3f} USDT</b>",
+        "",
+        "<b>Краткий анализ:</b>",
+        _simple_latest_analysis(chat_id),
+    ]
+    if st.get("err"):
+        lines += ["", "⚠️ Статистика может быть неполной: " + _ui_short_text(st["err"], 140)]
+    return "\n".join(lines)
+
+
+def _simple_format_open_positions(chat_id):
+    positions, err = _testnet_open_positions_v734()
+    lines = ["🟢 <b>Открытые Binance Testnet позиции</b>", ""]
+    if err:
+        lines.append("Не удалось прочитать Testnet позиции: " + _ui_short_text(err, 160))
+        return "\n".join(lines)
+    if not positions:
+        lines.append("Открытых Testnet позиций нет.")
+        return "\n".join(lines)
+    for pos in positions[-5:]:
+        amt = _safe_float(pos.get("positionAmt"), 0) or 0
+        direction = "LONG" if amt > 0 else "SHORT"
+        lines += [
+            f"<b>{_ui_ticker_short(pos.get('symbol'))} {direction}</b>",
+            f"Size: <b>{amt:g}</b> | Entry: <b>{fmt_price(pos.get('entryPrice'), pos.get('symbol'))}</b>",
+            f"Mark: <b>{fmt_price(pos.get('markPrice'), pos.get('symbol'))}</b> | uPnL: <b>{_safe_float(pos.get('unRealizedProfit'), 0):+.3f} USDT</b>",
+            "",
+        ]
+    return "\n".join(lines).rstrip()
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _simple_sync_public_auto_settings(chat_id)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d • %H:%M UTC")
+    st = _testnet_stats_line_v734()
+    lines = [
+        "🤖 <b>Демо-бот Binance Testnet: цикл 15м</b>",
+        now,
+        "",
+        f"Testnet позиции: <b>{st['open']}/{PAPER_TRADER_MAX_POSITIONS}</b> | Сегодня: <b>{_testnet_today_real_entry_count_v734(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+        "Paper-сделки: <b>OFF</b>",
+    ]
+    candidate, tried = paper_select_trade_candidate(chat_id)
+    if not candidate:
+        lines += ["", "<b>Решение:</b>", "Сделка на Binance Testnet не открыта.", "Лучший сетап не прошел фильтры."]
+        best = _format_scan_rows(tried)
+        if best:
+            lines += ["", "<b>Лучшие проверки:</b>"] + best[:3]
+        return "\n".join(lines)
+    result = _submit_testnet_trade_v734(chat_id, candidate)
+    plan = result.get("plan") or {}
+    ticker = plan.get("ticker") or candidate.get("ticker")
+    direction = str(plan.get("direction") or candidate.get("direction") or "").upper()
+    interval = plan.get("interval") or candidate.get("interval")
+    if not result.get("ok"):
+        lines += [
+            "",
+            "<b>Решение:</b>",
+            "Сделка на Binance Testnet не открыта.",
+            f"Этап: <b>{_ui_html(result.get('stage'))}</b>",
+            "Причина: " + _ui_short_text(result.get("reason"), 180),
+        ]
+        if ticker and direction:
+            lines.append(f"План: <b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}")
+        return "\n".join(lines)
+    entry_order = plan.get("entry_order") or {}
+    protection = result.get("protection") or {}
+    lines += [
+        "",
+        "<b>Решение:</b>",
+        "✅ Открыта сделка на <b>Binance Futures Testnet</b>.",
+        "",
+        f"<b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}",
+        f"Qty: <b>{entry_order.get('quantity')}</b> | Leverage: <b>x{entry_order.get('leverage')}</b>",
+        f"Entry ref: <b>{fmt_price(entry_order.get('entry_reference'), ticker)}</b>",
+        f"Protection: <b>{len(protection.get('orders') or [])} reduce-only algo orders</b>",
+        f"Причина: {_ui_short_text(candidate.get('reason'), 140)}",
+    ]
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.34 Testnet-Only Demo Trading"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -19258,6 +19959,7 @@ RUNTIME_LAYERS = [
     ("v7.31", "simple public Telegram UI for signals, auto-signals and demo trading"),
     ("v7.32", "single-message Telegram navigation with editMessageText and callback acknowledgements"),
     ("v7.33", "honest paper-vs-Binance Testnet status in demo bot cards"),
+    ("v7.34", "testnet-only demo trading with precision rounding and algo protection orders"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -19286,6 +19988,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "async_edit_message_text": async_edit_message_text,
     "send_or_edit": send_or_edit,
     "testnet_position_status_line": _testnet_position_status_line_v733,
+    "testnet_open_positions": _testnet_open_positions_v734,
+    "testnet_income_stats": _testnet_income_stats_v734,
+    "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,

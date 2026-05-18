@@ -45,7 +45,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.33 Honest Paper/Testnet Status`.
+Current active runtime is `v7.34 Testnet-Only Demo Trading`.
 
 Layer summary:
 
@@ -91,6 +91,9 @@ Layer summary:
     `editMessageText` via `send_or_edit`, while scheduled notifications remain separate
 31. v7.33: Demo bot cards separate internal paper positions from accepted
     Binance Testnet exchange orders and show the block reason when no order was sent
+32. v7.34: public demo trading no longer opens paper positions; it submits
+    Binance Futures Testnet entries only after precision rounding and local
+    protection validation, then uses `/fapi/v1/algoOrder` for reduce-only SL/TP
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.

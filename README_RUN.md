@@ -199,6 +199,13 @@ Testnet exchange position unless the real Testnet entry order was accepted. If
 Binance rejects `/order/test` or protective orders, the Telegram card says that
 the Binance order was not sent and shows the short reason.
 
+Testnet-only demo trading v7.34 disables public paper openings. The demo bot
+uses paper-style scanning only as a signal-selection engine, then either opens a
+real Binance Futures Testnet order with reduce-only protection, or reports that
+no exchange order was sent. Quantity and trigger prices are rounded from
+Testnet `exchangeInfo`; realized winrate is read from Testnet realized PnL
+income events.
+
 The first real extraction helpers now live in:
 
 - `quant_bot/execution_gateway.py`

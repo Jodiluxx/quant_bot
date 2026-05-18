@@ -75,13 +75,15 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.33 Honest Paper/Testnet Status")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.34 Testnet-Only Demo Trading")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("send_or_edit", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
         calls = []
@@ -122,6 +124,11 @@ class TelegramUiPolishTests(unittest.TestCase):
         })
         self.assertIn("ордер не отправлен", line)
         self.assertIn("entry &lt;blocked&gt;", line)
+
+    def test_testnet_only_menu_says_paper_off(self) -> None:
+        text = self.bot.format_autobot_menu(987654321)
+        self.assertIn("Binance Testnet", text)
+        self.assertIn("Paper-сделки: <b>OFF</b>", text)
 
 
 if __name__ == "__main__":
