@@ -19021,7 +19021,184 @@ async def async_handle_update(session, update, sem):
     except Exception as e:
         print(f"  [async_update_v732] error: {e}")
 
-BOT_VERSION_LABEL = "v7.32 Single-Message Telegram Navigation"
+
+# ============================================================
+# v7.33 - HONEST PAPER VS BINANCE TESTNET STATUS
+# ============================================================
+# The demo bot can open an internal paper position even when Binance Testnet
+# rejects or blocks the real order. Make that distinction explicit in every
+# public card so the user never confuses a paper journal entry with an exchange
+# position.
+
+_base_format_main_status_v732 = format_main_status
+_base_format_autobot_menu_v732 = format_autobot_menu
+_base_paper_trader_cycle_v732 = paper_trader_cycle
+_base_simple_format_open_positions_v732 = _simple_format_open_positions
+
+
+def _testnet_short_status_v733():
+    info = execution_mode()
+    if info.get("mode") != "testnet":
+        return "OFF"
+    if not info.get("testnet_keys_present"):
+        return "ключей нет"
+    if not _testnet_real_submit_enabled_v729():
+        return "подключен, real submit OFF"
+    return "подключен"
+
+
+def _testnet_position_status_line_v733(pos):
+    real = (pos or {}).get("testnet_real_order") or {}
+    entry = real.get("entry") or {}
+    if entry.get("submitted") and entry.get("ok"):
+        return "Binance Testnet: ✅ реальный demo-ордер отправлен."
+    if real:
+        reason = (
+            entry.get("reason")
+            or (real.get("leverage") or {}).get("reason")
+            or (real.get("protection") or {}).get("reason")
+            or "real entry не подтвержден"
+        )
+        return "Binance Testnet: ❌ ордер не отправлен — " + _ui_short_text(reason, 150)
+    status = _testnet_short_status_v733()
+    if status == "подключен":
+        return "Binance Testnet: подключен, но этот paper-вход еще не отправлялся на биржу."
+    return "Binance Testnet: " + _ui_html(status)
+
+
+def _testnet_position_badge_v733(pos):
+    line = _testnet_position_status_line_v733(pos)
+    if "✅" in line:
+        return "Binance: отправлен"
+    if "❌" in line:
+        return "Binance: не отправлен"
+    return "Binance: " + _testnet_short_status_v733()
+
+
+def format_main_status(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    positions = len(_paper_positions(chat_id)) if "_paper_positions" in globals() else 0
+    auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
+    sig = _get_auto_task_settings(chat_id, "signals")
+    paper = _get_auto_task_settings(chat_id, "paper_trader")
+    return "\n".join([
+        "🏠 <b>Главное меню</b>",
+        "",
+        f"Сигнал: <b>{_ui_ticker_short(ticker)}USDT</b> | TF <b>{_ui_tf_short(interval)}</b>",
+        f"Авто: <b>{auto_state}</b> | Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
+        f"Paper позиции: <b>{positions}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        "",
+        "<b>Уведомления:</b>",
+        f"• Сигналы: <b>{'ON' if sig.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | { _ui_tf_short(sig.get('send_interval')) } | TF { _ui_tf_short(sig.get('tf') or '30m') }",
+        f"• Демо-бот: <b>{'ON' if paper.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | каждые 15м",
+    ])
+
+
+def _simple_latest_analysis(chat_id):
+    positions = _paper_positions(chat_id)
+    if positions:
+        pos = positions[-1]
+        return (
+            f"Paper открыта: {_ui_ticker_short(pos.get('ticker'))} {str(pos.get('direction')).upper()} | "
+            f"{_testnet_position_badge_v733(pos)}"
+        )
+    trades = _paper_closed_trades(chat_id)
+    if trades:
+        tr = trades[-1]
+        return f"Последняя закрытая: {_ui_ticker_short(tr.get('ticker'))} {str(tr.get('direction')).upper()} | {tr.get('exit_reason')} | {tr.get('net_usd', 0):+.3f} USDT"
+    return "Пока сделок нет. Бот ждет setup, который пройдет фильтры."
+
+
+def format_autobot_menu(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    positions = _paper_positions(chat_id)
+    trades, wins, losses, wr, net = _simple_paper_stats(chat_id)
+    paper_enabled = chat_id in auto_chat_ids and bool(_get_auto_task_settings(chat_id, "paper_trader").get("enabled"))
+    return "\n".join([
+        "🤖 <b>Демо-бот</b>",
+        "",
+        f"Paper: <b>{'ON' if paper_enabled else 'OFF'}</b> | Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
+        "Частота: <b>каждые 15 минут</b> | TF выбирает бот",
+        "",
+        "<b>Статистика:</b>",
+        f"• Paper открытые: <b>{len(positions)}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"• Paper закрытые: <b>{len(trades)}</b>",
+        f"• Winrate: <b>{wr:.1f}%</b> | Win/Loss: <b>{len(wins)}/{len(losses)}</b>",
+        f"• Net PnL: <b>{net:+.3f} USDT</b>",
+        "",
+        "<b>Краткий анализ:</b>",
+        _simple_latest_analysis(chat_id),
+    ])
+
+
+def _simple_format_open_positions(chat_id):
+    positions = _paper_positions(chat_id)
+    lines = ["🟢 <b>Открытые paper-позиции</b>", ""]
+    if not positions:
+        lines.append("Открытых paper-позиций нет.")
+        return "\n".join(lines)
+    for pos in positions[-5:]:
+        lines += [
+            f"<b>{_ui_ticker_short(pos.get('ticker'))} {str(pos.get('direction')).upper()}</b> | TF {_ui_tf_short(pos.get('interval'))}",
+            f"Entry {fmt_price(pos.get('entry_price'), pos.get('ticker'))} | SL {fmt_price(pos.get('sl'), pos.get('ticker'))} | TP1 {fmt_price(pos.get('tp1'), pos.get('ticker'))}",
+            _testnet_position_status_line_v733(pos),
+            f"Причина: {_ui_short_text(pos.get('reason'), 120)}",
+            "",
+        ]
+    return "\n".join(lines).rstrip()
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _simple_sync_public_auto_settings(chat_id)
+    _paper_load_state()
+    closed = _paper_manage_open_positions(chat_id)
+    open_positions = _paper_positions(chat_id)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d • %H:%M UTC")
+    lines = [
+        "🤖 <b>Демо-бот: цикл 15м</b>",
+        now,
+        "",
+        f"Paper позиции: <b>{len(open_positions)}/{PAPER_TRADER_MAX_POSITIONS}</b> | Сегодня: <b>{_paper_today_open_count(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+        f"Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
+    ]
+    if closed:
+        lines += ["", "<b>Закрыто:</b>"]
+        for trade in closed[-2:]:
+            lines.append(f"• {_ui_ticker_short(trade.get('ticker'))} {str(trade.get('direction')).upper()} | {trade.get('exit_reason')} | {trade.get('net_usd', 0):+.3f} USDT")
+    if _paper_today_open_count(chat_id) >= PAPER_TRADER_MAX_TRADES_PER_DAY:
+        lines += ["", "<b>Решение:</b>", "Paper-сделка не открыта: дневной лимит достигнут.", "Binance-ордер не отправлялся."]
+        return "\n".join(lines)
+    candidate, tried = paper_select_trade_candidate(chat_id)
+    if not candidate:
+        lines += ["", "<b>Решение:</b>", "Paper-сделка не открыта.", "Лучший сетап не прошел фильтры.", "Binance-ордер не отправлялся."]
+        best = _format_scan_rows(tried)
+        if best:
+            lines += ["", "<b>Лучшие проверки:</b>"] + best[:3]
+        return "\n".join(lines)
+    pos, err = _paper_open_candidate(chat_id, candidate)
+    if err:
+        lines += ["", "<b>Решение:</b>", "Paper-сделка не открыта.", _ui_short_text(err, 160), "Binance-ордер не отправлялся."]
+        best = _format_scan_rows(tried)
+        if best:
+            lines += ["", "<b>Лучшие проверки:</b>"] + best[:3]
+        return "\n".join(lines)
+    lines += [
+        "",
+        "<b>Решение:</b>",
+        "Открыта <b>paper-сделка</b> в журнале бота.",
+        _testnet_position_status_line_v733(pos),
+        "",
+        f"<b>{_ui_ticker_short(pos.get('ticker'))} {str(pos.get('direction')).upper()}</b> | TF {_ui_tf_short(pos.get('interval'))}",
+        f"Entry: <b>{fmt_price(pos.get('entry_price'), pos.get('ticker'))}</b>",
+        f"SL: <b>{fmt_price(pos.get('sl'), pos.get('ticker'))}</b> | TP1: <b>{fmt_price(pos.get('tp1'), pos.get('ticker'))}</b>",
+        f"Причина: {_ui_short_text(pos.get('reason'), 140)}",
+    ]
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.33 Honest Paper/Testnet Status"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -19080,6 +19257,7 @@ RUNTIME_LAYERS = [
     ("v7.30", "Testnet position/fill monitor for positions and reduce-only protection"),
     ("v7.31", "simple public Telegram UI for signals, auto-signals and demo trading"),
     ("v7.32", "single-message Telegram navigation with editMessageText and callback acknowledgements"),
+    ("v7.33", "honest paper-vs-Binance Testnet status in demo bot cards"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -19107,6 +19285,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "async_handle_update": async_handle_update,
     "async_edit_message_text": async_edit_message_text,
     "send_or_edit": send_or_edit,
+    "testnet_position_status_line": _testnet_position_status_line_v733,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,

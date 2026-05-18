@@ -75,12 +75,13 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.32 Single-Message Telegram Navigation")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.33 Honest Paper/Testnet Status")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("send_or_edit", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
         calls = []
@@ -108,6 +109,19 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertEqual(calls[0][1]["message_id"], 456)
         self.assertEqual(calls[0][1]["parse_mode"], "HTML")
         self.assertIn("reply_markup", calls[0][1])
+
+    def test_testnet_status_line_distinguishes_paper_from_exchange(self) -> None:
+        line = self.bot._testnet_position_status_line_v733({
+            "testnet_real_order": {
+                "entry": {
+                    "submitted": False,
+                    "ok": False,
+                    "reason": "entry <blocked>",
+                }
+            }
+        })
+        self.assertIn("ордер не отправлен", line)
+        self.assertIn("entry &lt;blocked&gt;", line)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ signal_journal.json
 positions.json
 risk_state.json
 indicator_weights.json
+user_state.json
 journal_backups/
 
 # Backups generated during patching

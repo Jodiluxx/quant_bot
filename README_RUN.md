@@ -193,6 +193,12 @@ so tapping Signal, Demo bot, Notifications, ticker/TF selectors or manual scan
 updates the current message instead of flooding the chat. Scheduled auto reports
 and true errors can still be sent as separate messages.
 
+Honest Paper/Testnet status v7.33 makes the demo bot explicit about what
+actually happened: an opened paper journal position is not shown as a Binance
+Testnet exchange position unless the real Testnet entry order was accepted. If
+Binance rejects `/order/test` or protective orders, the Telegram card says that
+the Binance order was not sent and shows the short reason.
+
 The first real extraction helpers now live in:
 
 - `quant_bot/execution_gateway.py`

@@ -45,7 +45,7 @@ quant_bot/
 redefined: each later layer wraps the previous active function and then becomes
 the new active runtime function.
 
-Current active runtime is `v7.32 Single-Message Telegram Navigation`.
+Current active runtime is `v7.33 Honest Paper/Testnet Status`.
 
 Layer summary:
 
@@ -89,6 +89,8 @@ Layer summary:
     settings and demo trading while internal analytics remain available to code
 30. v7.32: Telegram callback navigation edits the current message with
     `editMessageText` via `send_or_edit`, while scheduled notifications remain separate
+31. v7.33: Demo bot cards separate internal paper positions from accepted
+    Binance Testnet exchange orders and show the block reason when no order was sent
 
 The active functions are registered in `ACTIVE_RUNTIME_FUNCTIONS` near the
 bottom of `quant bot.py`.
