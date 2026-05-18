@@ -20360,6 +20360,104 @@ def _testnet_monitor_short_line_v737(monitor):
     return f"Monitor: {icon} <b>{_ui_html(status)}</b>" + (f" | {reason}" if reason else "")
 
 
+# ============================================================
+# v7.38 — HONEST PUBLIC PNL
+# ============================================================
+# Binance account income events are not the same thing as confirmed closed bot
+# trades. Keep raw income for local diagnostics; show the user only bot-level
+# closed-trade stats.
+
+
+def _testnet_bot_closed_events_v738(chat_id=None, limit=200):
+    events = [
+        e for e in _recent_testnet_monitor_events_v730(chat_id, limit)
+        if e.get("plan_id") and (e.get("status") or (e.get("evaluation") or {}).get("status")) == "NO_POSITION"
+    ]
+    seen = set()
+    rows = []
+    for event in events:
+        plan_id = event.get("plan_id")
+        if plan_id in seen:
+            continue
+        seen.add(plan_id)
+        rows.append(event)
+    rows.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    return rows[: int(limit)]
+
+
+def _testnet_public_stats_v738(chat_id):
+    active, pos_err = _testnet_open_positions_v734()
+    income = _testnet_income_stats_v734()
+    closed_events = _testnet_bot_closed_events_v738(chat_id, 200)
+    income_ok = bool(income.get("ok"))
+    return {
+        "open": len(active),
+        "position_error": pos_err,
+        "bot_closed": len(closed_events),
+        "income_events": int(income.get("closed", 0) or 0) if income_ok else 0,
+        "income_winrate": f"{income.get('winrate', 0):.1f}%" if income_ok else "н/д",
+        "income_net": _safe_float(income.get("net"), 0) if income_ok else 0.0,
+        "income_error": None if income_ok else income.get("reason"),
+    }
+
+
+def _testnet_public_pnl_line_v738(stats):
+    if int(stats.get("bot_closed") or 0) <= 0:
+        return "• Winrate / PnL: <b>н/д</b> — закрытых сделок бота ещё нет"
+    return (
+        f"• Account realized PnL: <b>{stats.get('income_net', 0):+.3f} USDT</b> | "
+        f"income WR <b>{stats.get('income_winrate')}</b>"
+    )
+
+
+def format_autobot_menu(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    st = _testnet_public_stats_v738(chat_id)
+    demo_enabled = chat_id in auto_chat_ids and bool(_get_auto_task_settings(chat_id, "paper_trader").get("enabled"))
+    lines = [
+        "🤖 <b>Демо-бот Binance Testnet</b>",
+        "",
+        f"Торговля: <b>{'ON' if demo_enabled else 'OFF'}</b> | Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
+        "Режим: <b>только Binance Futures Testnet</b>",
+        "Частота: <b>каждые 15 минут</b> | TF выбирает бот",
+        "",
+        "<b>Статистика Testnet:</b>",
+        f"• Открытые позиции: <b>{st['open']}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"• Закрытые сделки бота: <b>{st['bot_closed']}</b>",
+        _testnet_public_pnl_line_v738(st),
+        "",
+        "<b>Краткий анализ:</b>",
+        _simple_latest_analysis(chat_id),
+    ]
+    if st.get("income_events") and not st.get("bot_closed"):
+        lines += [
+            "",
+            "ℹ️ На Binance есть realized PnL-события, но бот не считает их закрытыми сделками без подтверждённого закрытия позиции.",
+        ]
+    if st.get("position_error") or st.get("income_error"):
+        err = st.get("position_error") or st.get("income_error")
+        lines += ["", "⚠️ Статистика может быть неполной: " + _ui_short_text(err, 140)]
+    return "\n".join(lines)
+
+
+def _simple_format_closed_positions(chat_id):
+    closed = _testnet_bot_closed_events_v738(chat_id, 50)
+    stats = _testnet_public_stats_v738(chat_id)
+    lines = ["📕 <b>Закрытые Binance Testnet сделки бота</b>", ""]
+    if not closed:
+        lines.append("Закрытых Testnet-сделок бота пока нет.")
+        if stats.get("income_events"):
+            lines.append("Binance realized PnL-события сохранены локально, но не показаны как сделки без подтверждения закрытия позиции.")
+        return "\n".join(lines)
+    for event in closed[:10]:
+        lines.append(
+            f"• {_fmt_dt_short(event.get('ts'))} | {_ui_ticker_short(event.get('ticker'))} "
+            f"{str(event.get('direction') or '').upper()} | <b>NO POSITION</b>"
+        )
+    lines += ["", "PnL по конкретным сделкам появится после связывания income-событий Binance с plan_id бота."]
+    return "\n".join(lines)
+
+
 _base_paper_trader_cycle_v735 = paper_trader_cycle
 
 
@@ -20439,7 +20537,7 @@ def paper_trader_cycle(chat_id, manual=False):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.37 Immediate Testnet Protection Monitor"
+BOT_VERSION_LABEL = "v7.38 Honest Bot-Level PnL"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -20503,6 +20601,7 @@ RUNTIME_LAYERS = [
     ("v7.35", "remove public paper trading path and select demo trades through Testnet-only gates"),
     ("v7.36", "separate compact user cards from local demo analytics storage"),
     ("v7.37", "immediate Testnet monitor checks position plus regular and algo protection orders"),
+    ("v7.38", "show PnL only as bot-level closed-trade stats, not raw account income"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -20537,6 +20636,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "demo_analysis_record_cycle": _demo_analysis_record_cycle_v736,
     "demo_analysis_recent_cycles": _demo_analysis_recent_cycles_v736,
     "run_immediate_testnet_monitor": _testnet_monitor_for_plan_v737,
+    "testnet_public_stats": _testnet_public_stats_v738,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,

@@ -77,7 +77,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.37 Immediate Testnet Protection Monitor")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.38 Honest Bot-Level PnL")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -88,9 +88,11 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.35" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.36" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.37" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.38" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_public_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
@@ -196,6 +198,31 @@ class TelegramUiPolishTests(unittest.TestCase):
                 self.assertIn("подробная техническая причина", stored["scan"]["top"][0]["testnet_gate"])
             finally:
                 self.bot.DEMO_ANALYTICS_STATE_FILE = old_file
+
+    def test_public_pnl_waits_for_bot_closed_trades(self) -> None:
+        old_open = self.bot._testnet_open_positions_v734
+        old_income = self.bot._testnet_income_stats_v734
+        old_monitor = self.bot._recent_testnet_monitor_events_v730
+        try:
+            self.bot._testnet_open_positions_v734 = lambda: ([], None)
+            self.bot._testnet_income_stats_v734 = lambda: {
+                "ok": True,
+                "closed": 2,
+                "wins": 1,
+                "losses": 1,
+                "winrate": 50.0,
+                "net": 12.34,
+            }
+            self.bot._recent_testnet_monitor_events_v730 = lambda chat_id=None, limit=6: []
+            text = self.bot.format_autobot_menu(987654321)
+        finally:
+            self.bot._testnet_open_positions_v734 = old_open
+            self.bot._testnet_income_stats_v734 = old_income
+            self.bot._recent_testnet_monitor_events_v730 = old_monitor
+
+        self.assertIn("Закрытые сделки бота: <b>0</b>", text)
+        self.assertIn("Winrate / PnL: <b>н/д</b>", text)
+        self.assertNotIn("+12.340 USDT", text)
 
 
 if __name__ == "__main__":
