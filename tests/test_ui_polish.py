@@ -75,7 +75,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.34 Testnet-Only Demo Trading")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.35 No-Paper Testnet Demo Bot")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -83,6 +83,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.35" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
@@ -125,10 +127,39 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("ордер не отправлен", line)
         self.assertIn("entry &lt;blocked&gt;", line)
 
-    def test_testnet_only_menu_says_paper_off(self) -> None:
+    def test_testnet_only_menu_hides_paper_language(self) -> None:
         text = self.bot.format_autobot_menu(987654321)
         self.assertIn("Binance Testnet", text)
-        self.assertIn("Paper-сделки: <b>OFF</b>", text)
+        self.assertIn("только Binance Futures Testnet", text)
+        self.assertNotIn("Paper-", text)
+        self.assertNotIn("paper-", text)
+        self.assertNotIn("Paper Trader", text)
+
+    def test_testnet_gate_does_not_use_stale_paper_positions(self) -> None:
+        old_open = self.bot._testnet_open_positions_v734
+        old_count = self.bot._testnet_today_real_entry_count_v734
+        old_plan = self.bot._build_testnet_trade_plan_v734
+        try:
+            self.bot._testnet_open_positions_v734 = lambda: ([], None)
+            self.bot._testnet_today_real_entry_count_v734 = lambda chat_id=None: 0
+            self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: {"blockers": []}
+            candidate = {
+                "ticker": "BTCUSDT",
+                "interval": "15m",
+                "direction": "long",
+                "data": {"risk_levels": {"rr_ratio": 1.67}, "risk_blockers": []},
+                "entry_plan": {
+                    "status": "ENTER_NOW",
+                    "entry_now_score": 88,
+                    "setup_score": 88,
+                    "rr_now": 1.67,
+                },
+            }
+            self.assertIsNone(self.bot._testnet_candidate_block_reason_v735(987654321, candidate))
+        finally:
+            self.bot._testnet_open_positions_v734 = old_open
+            self.bot._testnet_today_real_entry_count_v734 = old_count
+            self.bot._build_testnet_trade_plan_v734 = old_plan
 
 
 if __name__ == "__main__":

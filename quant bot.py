@@ -19811,7 +19811,7 @@ def format_autobot_menu(chat_id):
         "🤖 <b>Демо-бот Binance Testnet</b>",
         "",
         f"Торговля: <b>{'ON' if paper_enabled else 'OFF'}</b> | Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
-        "Paper-сделки: <b>OFF</b>",
+        "Режим: <b>только Binance Futures Testnet</b>",
         "Частота: <b>каждые 15 минут</b> | TF выбирает бот",
         "",
         "<b>Статистика Testnet:</b>",
@@ -19858,7 +19858,7 @@ def paper_trader_cycle(chat_id, manual=False):
         now,
         "",
         f"Testnet позиции: <b>{st['open']}/{PAPER_TRADER_MAX_POSITIONS}</b> | Сегодня: <b>{_testnet_today_real_entry_count_v734(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
-        "Paper-сделки: <b>OFF</b>",
+        "Режим: <b>только Binance Futures Testnet</b>",
     ]
     candidate, tried = paper_select_trade_candidate(chat_id)
     if not candidate:
@@ -19899,7 +19899,273 @@ def paper_trader_cycle(chat_id, manual=False):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.34 Testnet-Only Demo Trading"
+# ============================================================
+# v7.35 — NO-PAPER TESTNET DEMO BOT
+# ============================================================
+# The public demo bot must not open or block on virtual paper positions.
+# Legacy function names are kept for callback compatibility, but the active
+# demo path below selects candidates with Testnet-only gates.
+
+if "paper_trader" in AUTO_TASKS:
+    AUTO_TASKS["paper_trader"]["label"] = "🤖 Демо-бот"
+
+
+def _testnet_position_ticker_v735(pos):
+    api_symbol = str((pos or {}).get("symbol") or "")
+    for ticker in TICKERS:
+        try:
+            if futures_api_symbol(ticker) == api_symbol or ticker == api_symbol:
+                return ticker
+        except Exception:
+            if ticker == api_symbol:
+                return ticker
+    return api_symbol
+
+
+def _testnet_position_direction_v735(pos):
+    amt = _safe_float((pos or {}).get("positionAmt"), 0) or 0
+    if amt > 0:
+        return "long"
+    if amt < 0:
+        return "short"
+    return None
+
+
+def _testnet_candidate_block_reason_v735(chat_id, candidate, active_positions=None, pos_err=None, today_count=None):
+    candidate = candidate or {}
+    data = candidate.get("data") or {}
+    ep = candidate.get("entry_plan") or {}
+    ticker = candidate.get("ticker")
+    direction = str(candidate.get("direction") or "").lower()
+    rr = _safe_float(ep.get("rr_now"), 0) or _safe_float((data.get("risk_levels") or {}).get("rr_ratio"), 0) or 0
+    entry_now = int(ep.get("entry_now_score", ep.get("score", 0)) or 0)
+    setup = int(ep.get("setup_score", ep.get("score", 0)) or 0)
+
+    if ep.get("status") != "ENTER_NOW":
+        return "entry status пока не READY"
+    blockers = list(data.get("risk_blockers") or [])
+    if blockers:
+        return "risk blocker: " + str(blockers[0])[:140]
+    if rr < PAPER_TRADER_MIN_RR:
+        return f"RR {rr:.2f}x ниже минимума {PAPER_TRADER_MIN_RR:.2f}x"
+    if entry_now < PAPER_TRADER_MIN_ENTRY_NOW:
+        return f"EntryNow {entry_now}/100 ниже минимума {PAPER_TRADER_MIN_ENTRY_NOW}/100"
+    if setup < max(70, PAPER_TRADER_MIN_ENTRY_NOW - 5):
+        return f"Setup {setup}/100 слабее минимального качества"
+
+    if active_positions is None:
+        active_positions, pos_err = _testnet_open_positions_v734()
+    if pos_err:
+        return "не удалось проверить открытые Testnet позиции: " + str(pos_err)[:120]
+    if len(active_positions) >= PAPER_TRADER_MAX_POSITIONS:
+        return f"достигнут лимит Testnet позиций {len(active_positions)}/{PAPER_TRADER_MAX_POSITIONS}"
+
+    same_dir = [
+        p for p in active_positions
+        if _testnet_position_direction_v735(p) == direction
+    ]
+    if len(same_dir) >= PAPER_TRADER_MAX_SAME_DIRECTION:
+        return f"уже есть Testnet позиция в сторону {direction.upper()}"
+
+    group = _paper_corr_group(ticker)
+    for pos in active_positions:
+        pos_ticker = _testnet_position_ticker_v735(pos)
+        if pos_ticker in group and _testnet_position_direction_v735(pos) == direction:
+            return f"коррелированный Testnet актив уже открыт: {_ui_ticker_short(pos_ticker)} {direction.upper()}"
+
+    if today_count is None:
+        today_count = _testnet_today_real_entry_count_v734(chat_id)
+    if today_count >= PAPER_TRADER_MAX_TRADES_PER_DAY:
+        return f"достигнут дневной лимит Testnet сделок {today_count}/{PAPER_TRADER_MAX_TRADES_PER_DAY}"
+
+    plan = _build_testnet_trade_plan_v734(chat_id, candidate)
+    if plan.get("blockers"):
+        return "; ".join(str(x) for x in plan.get("blockers")[:3])
+    return None
+
+
+def _testnet_short_block_v735(reason):
+    if not reason:
+        return ""
+    return _ui_short_text(str(reason), 120)
+
+
+def _format_scan_rows(tried):
+    ranked = sorted(
+        [x for x in tried if not x.get("error")],
+        key=lambda x: (x.get("entry_now", 0), x.get("setup", 0), x.get("rr", 0)),
+        reverse=True,
+    )
+    lines = []
+    for idx, row in enumerate(ranked[:5], 1):
+        ticker = row.get("ticker")
+        status = _ui_status_plain(row.get("status"))
+        line = (
+            f"{idx}) {_ui_ticker_short(ticker)} {_ui_tf_short(row.get('tf'))} — <b>{_ui_html(status)}</b>\n"
+            f"   Entry: {row.get('entry_now', 0)}/100 | Setup: {row.get('setup', 0)}/100 | RR: {row.get('rr', 0):.2f}x"
+        )
+        gate = row.get("testnet_gate")
+        if gate:
+            line += f"\n   Gate: {_testnet_short_block_v735(gate)}"
+        lines.append(line)
+    errors = [x for x in tried if x.get("error")]
+    if errors:
+        lines.append(f"• Ошибок данных: {len(errors)}")
+    return lines
+
+
+def testnet_select_trade_candidate(chat_id):
+    tried = []
+    candidates = []
+    blocked = []
+    pairs = [(ticker, tf) for ticker in PAPER_TRADER_SCAN_TICKERS for tf in PAPER_TRADER_TFS]
+    workers = min(PAPER_SCAN_WORKERS, len(pairs)) or 1
+    active_positions, pos_err = _testnet_open_positions_v734()
+    today_count = _testnet_today_real_entry_count_v734(chat_id)
+
+    with _futures_v74.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="testnet-scan") as pool:
+        fut_to_pair = {
+            pool.submit(_paper_scan_one_v74, chat_id, ticker, tf): (ticker, tf)
+            for ticker, tf in pairs
+        }
+        for fut in _futures_v74.as_completed(fut_to_pair):
+            ticker, tf = fut_to_pair[fut]
+            try:
+                row, found = fut.result()
+                tried.append(row)
+                candidates.extend(found)
+            except Exception as e:
+                tried.append({"ticker": ticker, "tf": tf, "error": str(e)})
+
+    candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+    row_by_pair = {(row.get("ticker"), row.get("tf")): row for row in tried}
+    for cand in candidates:
+        reason = _testnet_candidate_block_reason_v735(
+            chat_id,
+            cand,
+            active_positions=active_positions,
+            pos_err=pos_err,
+            today_count=today_count,
+        )
+        key = (cand.get("ticker"), cand.get("interval"))
+        if reason:
+            blocked.append({
+                "ticker": cand.get("ticker"),
+                "tf": cand.get("interval"),
+                "strategy": cand.get("strategy"),
+                "score": cand.get("score"),
+                "reason": reason,
+            })
+            if key in row_by_pair and not row_by_pair[key].get("testnet_gate"):
+                row_by_pair[key]["testnet_gate"] = reason
+            continue
+        cand["scan_total_candidates"] = len(candidates)
+        cand["scan_blocked"] = blocked[:PAPER_TRADER_MAX_CANDIDATES_SHOWN]
+        cand["scan_tried"] = tried
+        try:
+            data = cand.get("data") or {}
+            data["futures_context"] = build_futures_context(cand.get("ticker"), data.get("price"))
+        except Exception:
+            pass
+        return cand, tried
+
+    return None, tried
+
+
+def _testnet_best_gate_message_v735(tried):
+    ranked = sorted(
+        [x for x in tried if not x.get("error")],
+        key=lambda x: (x.get("entry_now", 0), x.get("setup", 0), x.get("rr", 0)),
+        reverse=True,
+    )
+    if not ranked:
+        return "Подходящих сетапов сейчас нет."
+    best = ranked[0]
+    status = _ui_status_plain(best.get("status"))
+    gate = best.get("testnet_gate") or best.get("gate")
+    if gate:
+        return f"Лучший сетап {status}, но Testnet-gate остановил вход: {_testnet_short_block_v735(gate)}."
+    if status == "READY":
+        return "Лучший сетап READY, но Binance-ready кандидат не собрался. Это защитный отказ, нужна повторная проверка."
+    return f"Лучший сетап пока {status}: бот ждёт условия входа, а не догоняет цену."
+
+
+def format_autobot_menu(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    st = _testnet_stats_line_v734()
+    demo_enabled = chat_id in auto_chat_ids and bool(_get_auto_task_settings(chat_id, "paper_trader").get("enabled"))
+    lines = [
+        "🤖 <b>Демо-бот Binance Testnet</b>",
+        "",
+        f"Торговля: <b>{'ON' if demo_enabled else 'OFF'}</b> | Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
+        "Режим: <b>только Binance Futures Testnet</b>",
+        "Частота: <b>каждые 15 минут</b> | TF выбирает бот",
+        "",
+        "<b>Статистика Testnet:</b>",
+        f"• Открытые позиции: <b>{st['open']}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"• Закрытые PnL-события: <b>{st['closed']}</b>",
+        f"• Winrate: <b>{st['winrate']}</b> | Win/Loss: <b>{st['wins']}/{st['losses']}</b>",
+        f"• Net realized PnL: <b>{st['net']:+.3f} USDT</b>",
+        "",
+        "<b>Краткий анализ:</b>",
+        _simple_latest_analysis(chat_id),
+    ]
+    if st.get("err"):
+        lines += ["", "⚠️ Статистика может быть неполной: " + _ui_short_text(st["err"], 140)]
+    return "\n".join(lines)
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _simple_sync_public_auto_settings(chat_id)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d • %H:%M UTC")
+    st = _testnet_stats_line_v734()
+    lines = [
+        "🤖 <b>Демо-бот Binance Testnet: цикл 15м</b>",
+        now,
+        "",
+        f"Testnet позиции: <b>{st['open']}/{PAPER_TRADER_MAX_POSITIONS}</b> | Сегодня: <b>{_testnet_today_real_entry_count_v734(chat_id)}/{PAPER_TRADER_MAX_TRADES_PER_DAY}</b>",
+        "Режим: <b>только Binance Futures Testnet</b>",
+    ]
+    candidate, tried = testnet_select_trade_candidate(chat_id)
+    if not candidate:
+        lines += ["", "<b>Решение:</b>", "Сделка на Binance Testnet не открыта.", _testnet_best_gate_message_v735(tried)]
+        best = _format_scan_rows(tried)
+        if best:
+            lines += ["", "<b>Лучшие проверки:</b>"] + best[:3]
+        return "\n".join(lines)
+    result = _submit_testnet_trade_v734(chat_id, candidate)
+    plan = result.get("plan") or {}
+    ticker = plan.get("ticker") or candidate.get("ticker")
+    direction = str(plan.get("direction") or candidate.get("direction") or "").upper()
+    interval = plan.get("interval") or candidate.get("interval")
+    if not result.get("ok"):
+        lines += [
+            "",
+            "<b>Решение:</b>",
+            "Сделка на Binance Testnet не открыта.",
+            f"Этап: <b>{_ui_html(result.get('stage'))}</b>",
+            "Причина: " + _ui_short_text(result.get("reason"), 180),
+        ]
+        if ticker and direction:
+            lines.append(f"План: <b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}")
+        return "\n".join(lines)
+    entry_order = plan.get("entry_order") or {}
+    protection = result.get("protection") or {}
+    lines += [
+        "",
+        "<b>Решение:</b>",
+        "✅ Открыта сделка на <b>Binance Futures Testnet</b>.",
+        "",
+        f"<b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}",
+        f"Qty: <b>{entry_order.get('quantity')}</b> | Leverage: <b>x{entry_order.get('leverage')}</b>",
+        f"Entry ref: <b>{fmt_price(entry_order.get('entry_reference'), ticker)}</b>",
+        f"Protection: <b>{len(protection.get('orders') or [])} reduce-only algo orders</b>",
+        f"Причина: {_ui_short_text(candidate.get('reason'), 140)}",
+    ]
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.35 No-Paper Testnet Demo Bot"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -19960,6 +20226,7 @@ RUNTIME_LAYERS = [
     ("v7.32", "single-message Telegram navigation with editMessageText and callback acknowledgements"),
     ("v7.33", "honest paper-vs-Binance Testnet status in demo bot cards"),
     ("v7.34", "testnet-only demo trading with precision rounding and algo protection orders"),
+    ("v7.35", "remove public paper trading path and select demo trades through Testnet-only gates"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -19990,25 +20257,13 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "testnet_position_status_line": _testnet_position_status_line_v733,
     "testnet_open_positions": _testnet_open_positions_v734,
     "testnet_income_stats": _testnet_income_stats_v734,
+    "testnet_select_trade_candidate": testnet_select_trade_candidate,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,
     "build_auto_task_message": build_auto_task_message,
-    "paper_trader_cycle": paper_trader_cycle,
-    "paper_manage_open_positions": _paper_manage_open_positions,
-    "paper_fill_price": _paper_fill_price_v714,
-    "paper_take_partial_tp1": _paper_take_partial_tp1_v714,
-    "paper_close_position": _paper_close_position,
-    "paper_select_trade_candidate": paper_select_trade_candidate,
-    "paper_trader_scan_tickers": paper_trader_scan_tickers,
-    "format_paper_report": format_paper_report,
-    "paper_strategy_lines": _strategy_lines_v77,
-    "paper_directional_factors": _directional_factors_v77,
-    "_paper_positions": _paper_positions,
-    "_paper_closed_trades": _paper_closed_trades,
-    "_paper_today_open_count": _paper_today_open_count,
-    "paper_data_quality_summary": paper_data_quality_summary,
+    "demo_bot_cycle": paper_trader_cycle,
     "format_bot_quality_report": format_bot_quality_report,
     "format_setup_analytics_report": format_setup_analytics_report,
     "format_probability_calibration_report": format_probability_calibration_report,
@@ -20044,7 +20299,6 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_period_performance_report": format_period_performance_report,
     "reset_demo_journals": reset_demo_journals,
     "simple_public_mode_enabled": simple_public_mode_enabled,
-    "paper_duplicate_guard": _paper_duplicate_reason_v79,
     "positions_risk_keyboard": positions_risk_keyboard,
     "back_to_positions_keyboard": back_to_positions_keyboard,
     "run_walk_forward_optimization": run_walk_forward_optimization,
