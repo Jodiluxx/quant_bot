@@ -77,7 +77,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.43 Testnet Fill Quality + Orphan Cleanup")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.44 Testnet Trade Lifecycle Report")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -94,6 +94,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.41" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.42" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.43" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.44" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -108,6 +109,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("testnet_closed_trade_rows", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_pnl_attribution", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_position_quality", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("format_testnet_lifecycle_report", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
@@ -285,6 +287,58 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("Winrate: <b>50.0%</b>", text)
         self.assertIn("+1.500 USDT", text)
         self.assertNotIn("+999.000 USDT", text)
+
+    def test_lifecycle_report_is_compact_and_user_facing(self) -> None:
+        old_stats = self.bot._testnet_public_stats_v738
+        old_rows = self.bot._testnet_lifecycle_recent_v740
+        try:
+            self.bot._testnet_public_stats_v738 = lambda chat_id: {
+                "open": 1,
+                "bot_closed": 2,
+                "attributed_closed": 1,
+                "bot_winrate": 100.0,
+                "bot_net": 1.25,
+            }
+            self.bot._testnet_lifecycle_recent_v740 = lambda chat_id=None, limit=50: [
+                {
+                    "ticker": "BTCUSDT",
+                    "direction": "long",
+                    "interval": "15m",
+                    "status": "CLOSED_WIN",
+                    "pnl": {"status": "ATTRIBUTED", "outcome": "WIN", "realized_usdt": 1.25},
+                },
+                {
+                    "ticker": "ETHUSDT",
+                    "direction": "short",
+                    "interval": "30m",
+                    "status": "CLOSED_UNATTRIBUTED",
+                    "monitor": {"status": "NO_POSITION"},
+                    "pnl": {"status": "NO_INCOME_MATCH"},
+                },
+            ]
+            text = self.bot.format_testnet_lifecycle_report_v744(987654321)
+        finally:
+            self.bot._testnet_public_stats_v738 = old_stats
+            self.bot._testnet_lifecycle_recent_v740 = old_rows
+
+        self.assertIn("Demo Trade Report", text)
+        self.assertIn("Открытые: <b>1/3</b>", text)
+        self.assertIn("CLOSED_WIN", text)
+        self.assertIn("+1.250 USDT", text)
+        self.assertIn("PNL_PENDING", text)
+        self.assertNotIn("plan_id", text)
+        self.assertNotIn("orderId", text)
+
+    def test_autobot_keyboard_uses_report_button_without_new_callback(self) -> None:
+        keyboard = self.bot.autobot_keyboard(987654321)
+        buttons = [
+            button
+            for row in keyboard.get("inline_keyboard", [])
+            for button in row
+        ]
+        report = [button for button in buttons if button.get("callback_data") == "paper_closed_menu"]
+        self.assertTrue(report)
+        self.assertIn("Отчёт", report[0]["text"])
 
 
 if __name__ == "__main__":

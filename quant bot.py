@@ -21526,7 +21526,119 @@ def _simple_format_closed_positions(chat_id):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.43 Testnet Fill Quality + Orphan Cleanup"
+# ============================================================
+# v7.44 - COMPACT TESTNET TRADE LIFECYCLE REPORT
+# ============================================================
+# User-facing summary for real Binance Futures Testnet trades. Detailed
+# plan/order/monitor rows stay local; the chat shows only useful statuses,
+# linked PnL and the latest lifecycle rows.
+
+_base_autobot_keyboard_v743_for_v744 = autobot_keyboard
+_base_simple_format_closed_positions_v743_for_v744 = _simple_format_closed_positions
+
+
+def _testnet_lifecycle_user_status_v744(row):
+    row = row or {}
+    status = str(row.get("status") or "").upper()
+    monitor_status = str(((row.get("monitor") or {}).get("status")) or "").upper()
+    pnl = row.get("pnl") or {}
+    if pnl.get("status") == "ATTRIBUTED":
+        if pnl.get("outcome") == "WIN":
+            return "CLOSED_WIN"
+        if pnl.get("outcome") == "LOSS":
+            return "CLOSED_LOSS"
+        return "CLOSED_FLAT"
+    if status in {"CLOSED_WIN", "CLOSED_LOSS", "CLOSED_FLAT"}:
+        return status
+    if monitor_status in {"NO_POSITION", "ORPHAN_ORDERS"} or status in {"CLOSED_UNATTRIBUTED", "ORPHAN_ORDERS"}:
+        return "ORPHAN_CLEANED" if monitor_status == "ORPHAN_ORDERS" else "PNL_PENDING"
+    if status == "PROTECTED":
+        return "OPEN_PROTECTED"
+    if status == "EMERGENCY_CLOSED":
+        return "EMERGENCY_CLOSED"
+    if status in {"UNPROTECTED", "MISMATCH", "FETCH_FAILED", "PROTECTION_REJECTED"}:
+        return "NEEDS_ATTENTION"
+    if status == "ENTRY_REJECTED":
+        return "ENTRY_REJECTED"
+    if status == "ENTRY_ACCEPTED":
+        return "ENTRY_ACCEPTED"
+    return status or "PLANNED"
+
+
+def _testnet_lifecycle_result_text_v744(row):
+    pnl = (row or {}).get("pnl") or {}
+    if pnl.get("status") == "ATTRIBUTED":
+        return f"{pnl.get('realized_usdt', 0):+.3f} USDT"
+    status = _testnet_lifecycle_user_status_v744(row)
+    if status == "PNL_PENDING":
+        return "PnL сверяется"
+    if status == "OPEN_PROTECTED":
+        return "открыта"
+    if status == "ORPHAN_CLEANED":
+        return "ордера очищены"
+    if status == "NEEDS_ATTENTION":
+        return "нужна проверка"
+    return status
+
+
+def _testnet_lifecycle_issue_count_v744(rows):
+    bad = {"NEEDS_ATTENTION", "EMERGENCY_CLOSED", "ENTRY_REJECTED"}
+    return sum(1 for row in rows if _testnet_lifecycle_user_status_v744(row) in bad)
+
+
+def format_testnet_lifecycle_report_v744(chat_id, limit=8):
+    stats = _testnet_public_stats_v738(chat_id)
+    rows = _testnet_lifecycle_recent_v740(chat_id, 50)
+    linked = int(stats.get("attributed_closed") or 0)
+    pending = max(0, int(stats.get("bot_closed") or 0) - linked)
+    issues = _testnet_lifecycle_issue_count_v744(rows)
+    lines = [
+        "📒 <b>Demo Trade Report</b>",
+        "",
+        f"Открытые: <b>{stats.get('open', 0)}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"Закрытые: <b>{stats.get('bot_closed', 0)}</b> | PnL linked: <b>{linked}</b>",
+        _testnet_public_pnl_line_v738(stats),
+        f"Сверяется: <b>{pending}</b> | Проблемы: <b>{issues}</b>",
+        "",
+        "<b>Последние сделки:</b>",
+    ]
+    if not rows:
+        lines.append("Пока нет Testnet-сделок бота.")
+        return "\n".join(lines)
+    for row in rows[: int(limit)]:
+        ticker = _ui_ticker_short(row.get("ticker"))
+        direction = str(row.get("direction") or "").upper()
+        interval = _ui_tf_short(row.get("interval"))
+        status = _testnet_lifecycle_user_status_v744(row)
+        result = _testnet_lifecycle_result_text_v744(row)
+        lines.append(f"• {ticker} {direction} {interval} | <b>{_ui_html(status)}</b> | {result}")
+    if pending:
+        lines += ["", "PnL может появиться позже: Binance income иногда приходит не сразу."]
+    if issues:
+        lines += ["", "Проблемные статусы уже записаны локально для разбора."]
+    return "\n".join(lines)
+
+
+def _simple_format_closed_positions(chat_id):
+    return format_testnet_lifecycle_report_v744(chat_id)
+
+
+def autobot_keyboard(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    return {"inline_keyboard": [
+        [
+            {"text": "▶️ Скан сейчас", "callback_data": "paper_run_now"},
+            {"text": "🟢 Открытые", "callback_data": "paper_open_positions"},
+        ],
+        [
+            {"text": "📒 Отчёт", "callback_data": "paper_closed_menu"},
+            {"text": "⚙️ Уведомления", "callback_data": "auto_settings"},
+        ],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+BOT_VERSION_LABEL = "v7.44 Testnet Trade Lifecycle Report"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -21596,6 +21708,7 @@ RUNTIME_LAYERS = [
     ("v7.41", "behind-the-scenes Testnet emergency safety and cleanup controls"),
     ("v7.42", "closed Testnet trade PnL attribution by bot plan and Binance income window"),
     ("v7.43", "Testnet fill quality tracking and orphan protection-order cleanup"),
+    ("v7.44", "compact Testnet trade lifecycle report for the public demo bot"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -21642,6 +21755,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "testnet_closed_trade_rows": _testnet_closed_trade_rows_v742,
     "testnet_pnl_attribution": _testnet_pnl_attribution_v742,
     "testnet_position_quality": _testnet_position_quality_v743,
+    "format_testnet_lifecycle_report": format_testnet_lifecycle_report_v744,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -21826,6 +21940,8 @@ def validate_runtime_architecture():
         errors.append("testnet PnL attribution helper is missing")
     if not callable(globals().get("_testnet_position_quality_v743")):
         errors.append("testnet position quality helper is missing")
+    if not callable(globals().get("format_testnet_lifecycle_report_v744")):
+        errors.append("testnet lifecycle report helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):
