@@ -20906,7 +20906,325 @@ def paper_trader_cycle(chat_id, manual=False):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.40 Binance Connection + Testnet Lifecycle"
+# ============================================================
+# v7.41 - BEHIND-THE-SCENES TESTNET EMERGENCY SAFETY
+# ============================================================
+# User-visible cards stay compact. Detailed emergency actions are recorded in
+# local journals. If a real Testnet position is found without valid protection,
+# the bot pauses new entries, cancels exchange orders for the symbol and closes
+# the exposed position with a reduceOnly MARKET order when positionAmt is known.
+
+_base_run_testnet_position_monitor_v740 = run_testnet_position_monitor
+_base_testnet_monitor_for_plan_v740 = _testnet_monitor_for_plan_v737
+_base_testnet_monitor_short_line_v740 = _testnet_monitor_short_line_v737
+_base_submit_testnet_trade_v740 = _submit_testnet_trade_v734
+
+TESTNET_CANCEL_ALL_OPEN_ORDERS_PATH = "/fapi/v1/allOpenOrders"
+TESTNET_CANCEL_ALL_ALGO_OPEN_ORDERS_PATH = "/fapi/v1/algoOpenOrders"
+TESTNET_AUTO_SAFETY_EVENTS_FILE_KIND = "testnet_auto_safety"
+TESTNET_AUTO_SAFETY_BAD_STATUSES = {"UNPROTECTED", "MISMATCH", "FETCH_FAILED"}
+TESTNET_AUTO_SAFETY_PAUSE_MIN = 240
+TESTNET_AUTO_SAFETY_DEDUPE_MIN = 30
+
+
+def _testnet_delete_signed_v741(path, params=None):
+    api_key, secret = _testnet_keys_v719()
+    if not api_key or not secret:
+        return {"ok": False, "skipped": True, "reason": "testnet API key/secret not set"}
+    signed, _ = _testnet_signed_payload_v719(params or {}, secret)
+    url = BINANCE_FUTURES_TESTNET_REST.rstrip("/") + path
+    try:
+        response = _session.delete(
+            url,
+            params=signed,
+            headers={"X-MBX-APIKEY": api_key},
+            timeout=15,
+        )
+        payload = response.json() if response.text else {}
+        return {
+            "ok": response.status_code < 400,
+            "status_code": response.status_code,
+            "payload": payload,
+            "headers": {
+                "order_count_10s": response.headers.get("X-MBX-ORDER-COUNT-10S"),
+                "order_count_1m": response.headers.get("X-MBX-ORDER-COUNT-1M"),
+                "used_weight_1m": response.headers.get("X-MBX-USED-WEIGHT-1M"),
+            },
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _testnet_mutation_guard_v741():
+    blockers = list(_testnet_monitor_read_guard_v730())
+    if not _testnet_real_submit_enabled_v729():
+        blockers.append("BINANCE_TESTNET_REAL_ORDER_SUBMIT=1 is required for emergency exchange actions")
+    return blockers
+
+
+def _testnet_symbol_from_plan_v741(plan):
+    return str((plan or {}).get("api_symbol") or (plan or {}).get("ticker") or "").upper()
+
+
+def cancel_testnet_open_orders_v741(symbol, reason="auto_safety"):
+    symbol = str(symbol or "").upper()
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "kind": "cancel_open_orders",
+        "endpoint": TESTNET_CANCEL_ALL_OPEN_ORDERS_PATH,
+        "symbol": symbol,
+        "submitted": False,
+        "ok": False,
+        "reason": reason,
+    }
+    blockers = _testnet_mutation_guard_v741()
+    if not symbol:
+        blockers.append("symbol is missing")
+    if blockers:
+        result.update({"skipped": True, "reason": "; ".join(blockers[:5])})
+        return result
+    response = _testnet_delete_signed_v741(TESTNET_CANCEL_ALL_OPEN_ORDERS_PATH, {"symbol": symbol})
+    result.update({
+        "submitted": not response.get("skipped", False),
+        "ok": bool(response.get("ok")),
+        "status_code": response.get("status_code"),
+        "response": response.get("payload"),
+        "headers": response.get("headers"),
+        "error": response.get("error"),
+        "reason": response.get("reason") or response.get("error") or reason,
+    })
+    return result
+
+
+def cancel_testnet_algo_orders_v741(symbol, reason="auto_safety"):
+    symbol = str(symbol or "").upper()
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "kind": "cancel_algo_orders",
+        "endpoint": TESTNET_CANCEL_ALL_ALGO_OPEN_ORDERS_PATH,
+        "symbol": symbol,
+        "submitted": False,
+        "ok": False,
+        "reason": reason,
+    }
+    blockers = _testnet_mutation_guard_v741()
+    if not symbol:
+        blockers.append("symbol is missing")
+    if blockers:
+        result.update({"skipped": True, "reason": "; ".join(blockers[:5])})
+        return result
+    response = _testnet_delete_signed_v741(TESTNET_CANCEL_ALL_ALGO_OPEN_ORDERS_PATH, {"symbol": symbol})
+    result.update({
+        "submitted": not response.get("skipped", False),
+        "ok": bool(response.get("ok")),
+        "status_code": response.get("status_code"),
+        "response": response.get("payload"),
+        "headers": response.get("headers"),
+        "error": response.get("error"),
+        "reason": response.get("reason") or response.get("error") or reason,
+    })
+    return result
+
+
+def submit_testnet_emergency_close_position_v741(plan, monitor=None, reason="auto_safety_unprotected"):
+    plan = _normalize_testnet_plan_v734(plan or {})
+    monitor = monitor or {}
+    symbol = _testnet_symbol_from_plan_v741(plan)
+    position_amt = _safe_float(monitor.get("position_amt"), 0) or 0
+    ref_price = (
+        _safe_float(monitor.get("mark_price"), 0)
+        or _safe_float(monitor.get("entry_price"), 0)
+        or _safe_float((plan.get("entry_order") or {}).get("entry_reference"), 0)
+    )
+    if position_amt > 0:
+        close_side = "SELL"
+        qty_raw = abs(position_amt)
+    elif position_amt < 0:
+        close_side = "BUY"
+        qty_raw = abs(position_amt)
+    else:
+        close_side = "SELL" if str(plan.get("direction")).lower() == "long" else "BUY"
+        qty_raw = (plan.get("entry_order") or {}).get("quantity_est")
+    qty = _testnet_format_quantity_v734(symbol, qty_raw, ref_price)
+    params = {
+        "symbol": symbol,
+        "side": close_side,
+        "type": "MARKET",
+        "quantity": qty,
+        "reduceOnly": "true",
+        "newClientOrderId": ("safeclose_" + str(plan.get("plan_id") or "").replace(":", "_"))[-36:],
+        "newOrderRespType": "ACK",
+    }
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "mode": execution_mode().get("mode"),
+        "endpoint": TESTNET_ORDER_REAL_PATH,
+        "kind": "real_emergency_close",
+        "submitted": False,
+        "ok": False,
+        "reason": reason,
+        "request": {k: params.get(k) for k in ("symbol", "side", "type", "quantity", "reduceOnly", "newClientOrderId")},
+    }
+    blockers = _testnet_real_guard_v729(plan, {"entry_test_ok": True, "protection_test_ok": True})
+    if _d_v734(qty) <= 0:
+        blockers.append("emergency close quantity is zero")
+    if blockers:
+        result["skipped"] = True
+        result["reason"] = "; ".join(blockers[:5])
+        return result
+    response = _testnet_post_signed_v719(TESTNET_ORDER_REAL_PATH, params)
+    result.update({
+        "submitted": not response.get("skipped", False),
+        "ok": bool(response.get("ok")),
+        "status_code": response.get("status_code"),
+        "response": response.get("payload"),
+        "headers": response.get("headers"),
+        "error": response.get("error"),
+    })
+    return result
+
+
+def _record_testnet_auto_safety_v741(chat_id, plan, payload):
+    plan = plan or {}
+    payload = payload or {}
+    chat_key = _paper_chat_key(chat_id if chat_id is not None else plan.get("chat_id"))
+    event = {
+        "type": TESTNET_AUTO_SAFETY_EVENTS_FILE_KIND,
+        "kind": "auto_safety",
+        "ts": payload.get("ts") or datetime.now(timezone.utc).isoformat(),
+        "chat_id": chat_key,
+        "plan_id": plan.get("plan_id"),
+        "ticker": plan.get("ticker"),
+        "interval": plan.get("interval"),
+        "direction": plan.get("direction"),
+        "status": payload.get("status"),
+        "triggered": payload.get("triggered"),
+        "reason": payload.get("reason"),
+        "actions": payload.get("actions"),
+    }
+    with _execution_lock_v715:
+        state = _execution_load_state_v715()
+        state.setdefault("events", []).append(event)
+        _execution_save_state_v715(state)
+    with _safety_lock_v716:
+        state = _safety_load_state_v716()
+        _safety_record_event_v716(state, chat_key, "testnet_auto_safety", event)
+        _safety_save_state_v716(state)
+    return event
+
+
+def _testnet_recent_auto_safety_v741(plan_id, status, minutes=TESTNET_AUTO_SAFETY_DEDUPE_MIN):
+    if not plan_id:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=int(minutes))
+    events = [
+        e for e in (_execution_load_state_v715().get("events") or [])
+        if e.get("type") == TESTNET_AUTO_SAFETY_EVENTS_FILE_KIND
+        and e.get("plan_id") == plan_id
+        and str(e.get("status") or "").upper() == str(status or "").upper()
+    ]
+    events.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    for event in events:
+        ts = _safety_parse_dt_v716(event.get("ts"))
+        if ts and ts >= cutoff:
+            return event
+    return None
+
+
+def _testnet_auto_safety_after_monitor_v741(chat_id, plan, monitor):
+    plan = plan or {}
+    monitor = monitor or {}
+    status = str(monitor.get("status") or "").upper()
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "ticker": plan.get("ticker"),
+        "status": status,
+        "triggered": False,
+        "reason": monitor.get("reason"),
+        "actions": {},
+    }
+    if status not in TESTNET_AUTO_SAFETY_BAD_STATUSES:
+        return result
+    recent = _testnet_recent_auto_safety_v741(plan.get("plan_id"), status)
+    if recent:
+        result.update({"skipped": True, "reason": "recent auto-safety action already recorded"})
+        return result
+
+    result["triggered"] = True
+    symbol = _testnet_symbol_from_plan_v741(plan)
+    pause_reason = f"testnet auto safety: {status}"
+    set_safety_pause(chat_id if chat_id is not None else plan.get("chat_id"), TESTNET_AUTO_SAFETY_PAUSE_MIN, pause_reason)
+    result["actions"]["pause_new_entries"] = {
+        "ok": True,
+        "minutes": TESTNET_AUTO_SAFETY_PAUSE_MIN,
+        "reason": pause_reason,
+    }
+    result["actions"]["cancel_open_orders"] = cancel_testnet_open_orders_v741(symbol, pause_reason)
+    result["actions"]["cancel_algo_orders"] = cancel_testnet_algo_orders_v741(symbol, pause_reason)
+    if monitor.get("has_position") and status in {"UNPROTECTED", "MISMATCH"}:
+        close = submit_testnet_emergency_close_position_v741(plan, monitor, pause_reason)
+        _record_testnet_real_order_result_v729("real_emergency_close", plan, close)
+        result["actions"]["emergency_close_position"] = close
+    else:
+        result["actions"]["emergency_close_position"] = {
+            "skipped": True,
+            "reason": "no confirmed position amount",
+        }
+    _record_testnet_auto_safety_v741(chat_id, plan, result)
+    return result
+
+
+def _testnet_auto_safety_short_line_v741(safety):
+    safety = safety or {}
+    if safety.get("triggered"):
+        return "Safety: <b>PAUSE ON</b> | exchange cleanup started"
+    if safety.get("skipped"):
+        return "Safety: <b>already handled</b>"
+    return ""
+
+
+def run_testnet_position_monitor(chat_id=None, limit=10):
+    result = _base_run_testnet_position_monitor_v740(chat_id, limit)
+    for row in result.get("rows") or []:
+        plan = _execution_plan_by_id_v730(row.get("plan_id"))
+        if not plan:
+            continue
+        row["auto_safety"] = _testnet_auto_safety_after_monitor_v741(
+            chat_id if chat_id is not None else plan.get("chat_id"),
+            plan,
+            row,
+        )
+    result["auto_safety_triggered"] = any((row.get("auto_safety") or {}).get("triggered") for row in result.get("rows") or [])
+    return result
+
+
+def _testnet_monitor_for_plan_v737(plan, delay_sec=0.75):
+    monitor = _base_testnet_monitor_for_plan_v740(plan, delay_sec)
+    safety = _testnet_auto_safety_after_monitor_v741((plan or {}).get("chat_id"), plan, monitor)
+    if safety.get("triggered") or safety.get("skipped"):
+        monitor["auto_safety"] = safety
+    return monitor
+
+
+def _testnet_monitor_short_line_v737(monitor):
+    line = _base_testnet_monitor_short_line_v740(monitor)
+    safety_line = _testnet_auto_safety_short_line_v741((monitor or {}).get("auto_safety"))
+    return line + ("\n" + safety_line if safety_line else "")
+
+
+def _submit_testnet_trade_v734(chat_id, candidate):
+    result = _base_submit_testnet_trade_v740(chat_id, candidate)
+    plan = result.get("plan") or {}
+    if result.get("stage") == "protection" and plan:
+        monitor = _testnet_monitor_for_plan_v737(plan, delay_sec=0.2)
+        result["monitor"] = monitor
+        result["auto_safety"] = monitor.get("auto_safety")
+    return result
+
+
+BOT_VERSION_LABEL = "v7.41 Emergency Testnet Safety"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -20973,6 +21291,7 @@ RUNTIME_LAYERS = [
     ("v7.38", "show PnL only as bot-level closed-trade stats, not raw account income"),
     ("v7.39", "strict Binance exchangeInfo precision for entry quantity and protection orders"),
     ("v7.40", "clear Binance connection status and local Testnet lifecycle foundation"),
+    ("v7.41", "behind-the-scenes Testnet emergency safety and cleanup controls"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -21012,6 +21331,10 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "build_testnet_protection_orders": build_testnet_protection_order_tests,
     "testnet_connection_status": _testnet_connection_status_v740,
     "rebuild_testnet_lifecycle": rebuild_testnet_lifecycle_v740,
+    "cancel_testnet_open_orders": cancel_testnet_open_orders_v741,
+    "cancel_testnet_algo_orders": cancel_testnet_algo_orders_v741,
+    "testnet_auto_safety_after_monitor": _testnet_auto_safety_after_monitor_v741,
+    "submit_testnet_emergency_close_position": submit_testnet_emergency_close_position_v741,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -21184,6 +21507,12 @@ def validate_runtime_architecture():
         errors.append("telegram edit helper is missing")
     if not callable(globals().get("send_or_edit")):
         errors.append("telegram send_or_edit helper is missing")
+    if not callable(globals().get("cancel_testnet_open_orders_v741")):
+        errors.append("testnet cancel-open-orders helper is missing")
+    if not callable(globals().get("cancel_testnet_algo_orders_v741")):
+        errors.append("testnet cancel-algo-orders helper is missing")
+    if not callable(globals().get("_testnet_auto_safety_after_monitor_v741")):
+        errors.append("testnet auto-safety helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):

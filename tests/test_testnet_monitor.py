@@ -82,6 +82,84 @@ class TestnetPositionMonitorTests(unittest.TestCase):
         self.assertEqual(row["entry"]["order_id"], 123)
         self.assertTrue(row["protection"]["ok"])
 
+    def test_auto_safety_does_nothing_when_position_is_protected(self) -> None:
+        plan = {"plan_id": "safe-1", "chat_id": "1", "ticker": "BTCUSDT", "api_symbol": "BTCUSDT"}
+        monitor = {"status": "PROTECTED", "ok": True, "has_position": True}
+        result = self.bot._testnet_auto_safety_after_monitor_v741("1", plan, monitor)
+        self.assertFalse(result["triggered"])
+        self.assertEqual(result["actions"], {})
+
+    def test_auto_safety_pauses_cancels_and_closes_unprotected_position(self) -> None:
+        plan = {
+            "plan_id": "risk-1",
+            "chat_id": "1",
+            "ticker": "BTCUSDT",
+            "api_symbol": "BTCUSDT",
+            "interval": "15m",
+            "direction": "long",
+            "blockers": [],
+            "entry_order": {"quantity_est": 0.001, "entry_reference": 100.0, "leverage": 5},
+        }
+        monitor = {
+            "status": "UNPROTECTED",
+            "ok": False,
+            "has_position": True,
+            "position_amt": 0.001,
+            "mark_price": 100.0,
+            "reason": "missing reduceOnly STOP_MARKET SL",
+        }
+        calls = []
+        old_recent = self.bot._testnet_recent_auto_safety_v741
+        old_pause = self.bot.set_safety_pause
+        old_cancel = self.bot.cancel_testnet_open_orders_v741
+        old_cancel_algo = self.bot.cancel_testnet_algo_orders_v741
+        old_close = self.bot.submit_testnet_emergency_close_position_v741
+        old_record = self.bot._record_testnet_auto_safety_v741
+        old_real_record = self.bot._record_testnet_real_order_result_v729
+        self.bot._testnet_recent_auto_safety_v741 = lambda plan_id, status, minutes=30: None
+        self.bot.set_safety_pause = lambda chat_id, minutes=None, reason=None: calls.append(("pause", chat_id, minutes, reason)) or True
+        self.bot.cancel_testnet_open_orders_v741 = lambda symbol, reason="": {"ok": True, "symbol": symbol, "reason": reason}
+        self.bot.cancel_testnet_algo_orders_v741 = lambda symbol, reason="": {"ok": True, "symbol": symbol, "reason": reason}
+        self.bot.submit_testnet_emergency_close_position_v741 = lambda plan, monitor=None, reason="": {"ok": True, "reason": reason}
+        self.bot._record_testnet_auto_safety_v741 = lambda chat_id, plan, payload: dict(payload, recorded=True)
+        self.bot._record_testnet_real_order_result_v729 = lambda kind, plan, result: result
+        try:
+            result = self.bot._testnet_auto_safety_after_monitor_v741("1", plan, monitor)
+        finally:
+            self.bot._testnet_recent_auto_safety_v741 = old_recent
+            self.bot.set_safety_pause = old_pause
+            self.bot.cancel_testnet_open_orders_v741 = old_cancel
+            self.bot.cancel_testnet_algo_orders_v741 = old_cancel_algo
+            self.bot.submit_testnet_emergency_close_position_v741 = old_close
+            self.bot._record_testnet_auto_safety_v741 = old_record
+            self.bot._record_testnet_real_order_result_v729 = old_real_record
+
+        self.assertTrue(result["triggered"])
+        self.assertEqual(calls[0][0], "pause")
+        self.assertEqual(calls[0][2], self.bot.TESTNET_AUTO_SAFETY_PAUSE_MIN)
+        self.assertIn("cancel_open_orders", result["actions"])
+        self.assertIn("cancel_algo_orders", result["actions"])
+        self.assertIn("emergency_close_position", result["actions"])
+
+    def test_cancel_helpers_use_signed_delete_endpoints(self) -> None:
+        calls = []
+        old_guard = self.bot._testnet_mutation_guard_v741
+        old_delete = self.bot._testnet_delete_signed_v741
+        self.bot._testnet_mutation_guard_v741 = lambda: []
+        self.bot._testnet_delete_signed_v741 = lambda path, params=None: calls.append((path, params)) or {"ok": True, "status_code": 200, "payload": {"code": 200}}
+        try:
+            regular = self.bot.cancel_testnet_open_orders_v741("BTCUSDT")
+            algo = self.bot.cancel_testnet_algo_orders_v741("BTCUSDT")
+        finally:
+            self.bot._testnet_mutation_guard_v741 = old_guard
+            self.bot._testnet_delete_signed_v741 = old_delete
+
+        self.assertTrue(regular["ok"])
+        self.assertTrue(algo["ok"])
+        self.assertEqual(calls[0][0], self.bot.TESTNET_CANCEL_ALL_OPEN_ORDERS_PATH)
+        self.assertEqual(calls[1][0], self.bot.TESTNET_CANCEL_ALL_ALGO_OPEN_ORDERS_PATH)
+        self.assertEqual(calls[0][1]["symbol"], "BTCUSDT")
+
 
 if __name__ == "__main__":
     unittest.main()

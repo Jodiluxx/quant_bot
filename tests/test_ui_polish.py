@@ -77,7 +77,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.40 Binance Connection + Testnet Lifecycle")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.41 Emergency Testnet Safety")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -91,6 +91,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.38" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.39" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.40" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.41" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -98,6 +99,10 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("normalize_testnet_plan", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_connection_status", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("rebuild_testnet_lifecycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("cancel_testnet_open_orders", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("cancel_testnet_algo_orders", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_auto_safety_after_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("submit_testnet_emergency_close_position", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
