@@ -21406,7 +21406,127 @@ def _simple_format_closed_positions(chat_id):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.42 Testnet PnL Attribution"
+# ============================================================
+# v7.43 - TESTNET FILL QUALITY + ORPHAN ORDER CLEANUP
+# ============================================================
+# The monitor now treats leftover SL/TP orders after a flat position as a
+# cleanup issue. It also stores actual exchange fill/position quality so the
+# bot can compare planned size vs real Testnet size behind the scenes.
+
+_base_testnet_auto_safety_after_monitor_v741_for_v743 = _testnet_auto_safety_after_monitor_v741
+_base_testnet_auto_safety_short_line_v741_for_v743 = _testnet_auto_safety_short_line_v741
+_base_testnet_pnl_attribution_v742_for_v743 = _testnet_pnl_attribution_v742
+_base_testnet_lifecycle_row_v740_for_v743 = _testnet_lifecycle_row_v740
+_base_testnet_closed_trade_rows_v742_for_v743 = _testnet_closed_trade_rows_v742
+
+
+def _testnet_position_quality_v743(monitor):
+    monitor = monitor or {}
+    return {
+        "status": monitor.get("status"),
+        "has_position": bool(monitor.get("has_position")),
+        "side": monitor.get("position_side"),
+        "position_amt": monitor.get("position_amt"),
+        "position_qty_abs": monitor.get("position_qty_abs"),
+        "planned_qty": monitor.get("planned_qty"),
+        "qty_diff_pct": monitor.get("qty_diff_pct"),
+        "entry_price": monitor.get("entry_price"),
+        "mark_price": monitor.get("mark_price"),
+        "unrealized_pnl": monitor.get("unrealized_pnl"),
+        "orphan_order_count": monitor.get("orphan_order_count", 0),
+        "sl_count": monitor.get("sl_count", 0),
+        "tp_count": monitor.get("tp_count", 0),
+        "bad_protection_count": monitor.get("bad_protection_count", 0),
+        "warnings": list(monitor.get("warnings") or [])[:5],
+        "blockers": list(monitor.get("blockers") or [])[:5],
+    }
+
+
+def _testnet_auto_safety_after_monitor_v741(chat_id, plan, monitor):
+    status = str((monitor or {}).get("status") or "").upper()
+    if status != "ORPHAN_ORDERS":
+        return _base_testnet_auto_safety_after_monitor_v741_for_v743(chat_id, plan, monitor)
+    plan = plan or {}
+    recent = _testnet_recent_auto_safety_v741(plan.get("plan_id"), status)
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "ticker": plan.get("ticker"),
+        "status": status,
+        "triggered": False,
+        "cleanup_only": True,
+        "reason": (monitor or {}).get("reason") or "position closed but protective orders are still open",
+        "actions": {},
+    }
+    if recent:
+        result.update({"skipped": True, "reason": "recent orphan-order cleanup already recorded"})
+        return result
+    result["triggered"] = True
+    symbol = _testnet_symbol_from_plan_v741(plan)
+    reason = f"testnet cleanup: {status}"
+    result["actions"]["cancel_open_orders"] = cancel_testnet_open_orders_v741(symbol, reason)
+    result["actions"]["cancel_algo_orders"] = cancel_testnet_algo_orders_v741(symbol, reason)
+    result["actions"]["emergency_close_position"] = {
+        "skipped": True,
+        "reason": "no open position; cleanup orders only",
+    }
+    _record_testnet_auto_safety_v741(chat_id, plan, result)
+    return result
+
+
+def _testnet_auto_safety_short_line_v741(safety):
+    safety = safety or {}
+    if safety.get("status") == "ORPHAN_ORDERS" and safety.get("triggered"):
+        return "Safety: <b>cleanup</b> | old orders cancelled"
+    return _base_testnet_auto_safety_short_line_v741_for_v743(safety)
+
+
+def _testnet_pnl_attribution_v742(plan, entry_event=None, close_event=None):
+    status = close_event.get("status") if close_event else None
+    if status == "ORPHAN_ORDERS":
+        close_event = dict(close_event or {})
+        close_event["status"] = "NO_POSITION"
+    return _base_testnet_pnl_attribution_v742_for_v743(plan, entry_event, close_event)
+
+
+def _testnet_lifecycle_row_v740(plan):
+    row = _base_testnet_lifecycle_row_v740_for_v743(plan)
+    monitor = _testnet_monitor_event_by_plan_v740(row.get("plan_id"))
+    evaluation = (monitor or {}).get("evaluation") or {}
+    row["position_quality"] = _testnet_position_quality_v743(evaluation)
+    if (monitor or {}).get("status") == "ORPHAN_ORDERS" and not str(row.get("status") or "").startswith("CLOSED_"):
+        row["status"] = "ORPHAN_ORDERS"
+    return row
+
+
+def _testnet_closed_trade_rows_v742(chat_id=None, limit=200):
+    rows = _testnet_lifecycle_recent_v740(chat_id, limit)
+    closed = []
+    for row in rows:
+        monitor = row.get("monitor") or {}
+        if monitor.get("status") in {"NO_POSITION", "ORPHAN_ORDERS"} or str(row.get("status") or "").startswith("CLOSED_"):
+            closed.append(row)
+    closed.sort(key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+    return closed[: int(limit)]
+
+
+def _simple_format_closed_positions(chat_id):
+    trades = _testnet_closed_trade_rows_v742(chat_id, 50)
+    lines = ["📕 <b>Закрытые Binance Testnet сделки бота</b>", ""]
+    if not trades:
+        lines.append("Закрытых Testnet-сделок бота пока нет.")
+        return "\n".join(lines)
+    for trade in trades[:10]:
+        pnl = trade.get("pnl") or {}
+        result = f"{pnl.get('realized_usdt', 0):+.3f} USDT" if pnl.get("status") == "ATTRIBUTED" else "PnL сверяется"
+        lines.append(
+            f"• {_fmt_dt_short(trade.get('created_at'))} | {_ui_ticker_short(trade.get('ticker'))} "
+            f"{str(trade.get('direction') or '').upper()} | {_ui_tf_short(trade.get('interval'))} | {result}"
+        )
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.43 Testnet Fill Quality + Orphan Cleanup"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -21475,6 +21595,7 @@ RUNTIME_LAYERS = [
     ("v7.40", "clear Binance connection status and local Testnet lifecycle foundation"),
     ("v7.41", "behind-the-scenes Testnet emergency safety and cleanup controls"),
     ("v7.42", "closed Testnet trade PnL attribution by bot plan and Binance income window"),
+    ("v7.43", "Testnet fill quality tracking and orphan protection-order cleanup"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -21520,6 +21641,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "submit_testnet_emergency_close_position": submit_testnet_emergency_close_position_v741,
     "testnet_closed_trade_rows": _testnet_closed_trade_rows_v742,
     "testnet_pnl_attribution": _testnet_pnl_attribution_v742,
+    "testnet_position_quality": _testnet_position_quality_v743,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -21702,6 +21824,8 @@ def validate_runtime_architecture():
         errors.append("testnet closed-trade attribution helper is missing")
     if not callable(globals().get("_testnet_pnl_attribution_v742")):
         errors.append("testnet PnL attribution helper is missing")
+    if not callable(globals().get("_testnet_position_quality_v743")):
+        errors.append("testnet position quality helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):

@@ -83,6 +83,36 @@ class ExecutionGatewayTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "NO_POSITION")
 
+    def test_position_monitor_flags_orphan_orders_after_position_closes(self) -> None:
+        plan = {"ticker": "SOLUSDT", "api_symbol": "SOLUSDT", "direction": "long"}
+        orders = [
+            {"symbol": "SOLUSDT", "orderType": "STOP_MARKET", "side": "SELL", "reduceOnly": "true"},
+            {"symbol": "SOLUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": "true"},
+        ]
+        result = evaluate_position_monitor(plan, [], orders)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "ORPHAN_ORDERS")
+        self.assertEqual(result["orphan_order_count"], 2)
+
+    def test_position_monitor_reports_actual_fill_size_vs_plan(self) -> None:
+        plan = {
+            "ticker": "BTCUSDT",
+            "api_symbol": "BTCUSDT",
+            "direction": "long",
+            "entry_order": {"quantity": "0.010"},
+        }
+        positions = [{"symbol": "BTCUSDT", "positionAmt": "0.005", "entryPrice": "100", "markPrice": "101"}]
+        orders = [
+            {"symbol": "BTCUSDT", "type": "STOP_MARKET", "side": "SELL", "reduceOnly": True},
+            {"symbol": "BTCUSDT", "type": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True},
+        ]
+        result = evaluate_position_monitor(plan, positions, orders)
+        self.assertEqual(result["position_side"], "LONG")
+        self.assertEqual(result["position_qty_abs"], 0.005)
+        self.assertEqual(result["planned_qty"], 0.01)
+        self.assertAlmostEqual(result["qty_diff_pct"], 50.0)
+        self.assertIn("actual position size differs from planned size", result["warnings"])
+
 
 if __name__ == "__main__":
     unittest.main()

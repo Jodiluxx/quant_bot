@@ -260,19 +260,29 @@ def evaluate_position_monitor(
     plan = plan or {}
     symbol = plan.get("api_symbol") or plan.get("ticker")
     direction = str(plan.get("direction") or "").lower()
+    entry_order = plan.get("entry_order") or {}
+    planned_qty = safe_float(entry_order.get("quantity") or entry_order.get("quantity_est"), 0.0)
     position = selected_position(position_payload, symbol)
     protections = protection_orders(open_orders_payload, plan)
     blockers: list[str] = []
     warnings: list[str] = []
 
     if not position:
-        status = "NO_POSITION"
-        warnings.append("Testnet position is not open or already closed")
+        if protections["all"]:
+            status = "ORPHAN_ORDERS"
+            blockers.append("position is closed but protective orders are still open")
+        else:
+            status = "NO_POSITION"
+            warnings.append("Testnet position is not open or already closed")
         position_amt = 0.0
         direction_ok = None
     else:
         position_amt = safe_float(position.get("positionAmt"), 0.0)
         direction_ok = (direction == "long" and position_amt > 0) or (direction == "short" and position_amt < 0)
+        if planned_qty > 0:
+            qty_diff_pct = abs(abs(position_amt) - planned_qty) / planned_qty * 100.0
+            if qty_diff_pct > 15.0:
+                warnings.append("actual position size differs from planned size")
         if not direction_ok:
             blockers.append("position direction does not match the plan")
         if not protections["has_sl"]:
@@ -293,6 +303,10 @@ def evaluate_position_monitor(
         "ok": status in {"PROTECTED", "NO_POSITION"},
         "has_position": bool(position),
         "position_amt": position_amt,
+        "position_side": "LONG" if position_amt > 0 else ("SHORT" if position_amt < 0 else "FLAT"),
+        "position_qty_abs": abs(position_amt),
+        "planned_qty": planned_qty,
+        "qty_diff_pct": (abs(abs(position_amt) - planned_qty) / planned_qty * 100.0) if planned_qty > 0 else None,
         "entry_price": safe_float((position or {}).get("entryPrice"), 0.0),
         "mark_price": safe_float((position or {}).get("markPrice"), 0.0),
         "unrealized_pnl": safe_float((position or {}).get("unRealizedProfit"), 0.0),
@@ -301,6 +315,7 @@ def evaluate_position_monitor(
         "tp_count": protections["tp_count"],
         "bad_protection_count": len(protections["bad"]),
         "open_protection_count": len(protections["all"]),
+        "orphan_order_count": len(protections["all"]) if not position else 0,
         "blockers": blockers,
         "warnings": warnings,
     }

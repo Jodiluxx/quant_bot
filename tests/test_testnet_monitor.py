@@ -211,6 +211,79 @@ class TestnetPositionMonitorTests(unittest.TestCase):
         self.assertEqual(row["pnl"]["status"], "ATTRIBUTED")
         self.assertAlmostEqual(row["pnl"]["realized_usdt"], 1.25)
 
+    def test_orphan_orders_trigger_cleanup_without_pause_or_close(self) -> None:
+        plan = {"plan_id": "orphan-1", "chat_id": "1", "ticker": "BTCUSDT", "api_symbol": "BTCUSDT"}
+        monitor = {
+            "status": "ORPHAN_ORDERS",
+            "ok": False,
+            "has_position": False,
+            "orphan_order_count": 2,
+            "reason": "position is closed but protective orders are still open",
+        }
+        calls = []
+        old_recent = self.bot._testnet_recent_auto_safety_v741
+        old_pause = self.bot.set_safety_pause
+        old_cancel = self.bot.cancel_testnet_open_orders_v741
+        old_cancel_algo = self.bot.cancel_testnet_algo_orders_v741
+        old_close = self.bot.submit_testnet_emergency_close_position_v741
+        old_record = self.bot._record_testnet_auto_safety_v741
+        self.bot._testnet_recent_auto_safety_v741 = lambda plan_id, status, minutes=30: None
+        self.bot.set_safety_pause = lambda *args, **kwargs: calls.append(("pause", args, kwargs))
+        self.bot.cancel_testnet_open_orders_v741 = lambda symbol, reason="": calls.append(("cancel", symbol, reason)) or {"ok": True}
+        self.bot.cancel_testnet_algo_orders_v741 = lambda symbol, reason="": calls.append(("cancel_algo", symbol, reason)) or {"ok": True}
+        self.bot.submit_testnet_emergency_close_position_v741 = lambda *args, **kwargs: calls.append(("close", args, kwargs)) or {"ok": True}
+        self.bot._record_testnet_auto_safety_v741 = lambda chat_id, plan, payload: payload
+        try:
+            result = self.bot._testnet_auto_safety_after_monitor_v741("1", plan, monitor)
+        finally:
+            self.bot._testnet_recent_auto_safety_v741 = old_recent
+            self.bot.set_safety_pause = old_pause
+            self.bot.cancel_testnet_open_orders_v741 = old_cancel
+            self.bot.cancel_testnet_algo_orders_v741 = old_cancel_algo
+            self.bot.submit_testnet_emergency_close_position_v741 = old_close
+            self.bot._record_testnet_auto_safety_v741 = old_record
+
+        self.assertTrue(result["triggered"])
+        self.assertTrue(result["cleanup_only"])
+        self.assertIn(("cancel", "BTCUSDT", "testnet cleanup: ORPHAN_ORDERS"), calls)
+        self.assertIn(("cancel_algo", "BTCUSDT", "testnet cleanup: ORPHAN_ORDERS"), calls)
+        self.assertFalse(any(call[0] == "pause" for call in calls))
+        self.assertFalse(any(call[0] == "close" for call in calls))
+
+    def test_lifecycle_stores_position_quality(self) -> None:
+        plan = {
+            "plan_id": "quality-1",
+            "created_at": "2026-05-20T10:00:00+00:00",
+            "mode": "testnet",
+            "ticker": "BTCUSDT",
+            "api_symbol": "BTCUSDT",
+            "interval": "15m",
+            "direction": "long",
+        }
+        events = [
+            {"type": self.bot.TESTNET_REAL_EVENTS_FILE_KIND, "kind": "real_entry", "plan_id": "quality-1", "ok": True, "submitted": True},
+            {
+                "type": self.bot.TESTNET_MONITOR_EVENTS_FILE_KIND,
+                "plan_id": "quality-1",
+                "ok": False,
+                "status": "ORPHAN_ORDERS",
+                "evaluation": {"status": "ORPHAN_ORDERS", "orphan_order_count": 2, "planned_qty": 0.01},
+            },
+        ]
+        old_load = self.bot._execution_load_state_v715
+        old_income = self.bot._testnet_income_stats_v734
+        self.bot._execution_load_state_v715 = lambda: {"plans": [plan], "events": events}
+        self.bot._testnet_income_stats_v734 = lambda: {"ok": True, "rows": []}
+        try:
+            row = self.bot._testnet_lifecycle_row_v740(plan)
+        finally:
+            self.bot._execution_load_state_v715 = old_load
+            self.bot._testnet_income_stats_v734 = old_income
+
+        self.assertEqual(row["status"], "ORPHAN_ORDERS")
+        self.assertEqual(row["position_quality"]["orphan_order_count"], 2)
+        self.assertEqual(row["position_quality"]["planned_qty"], 0.01)
+
 
 if __name__ == "__main__":
     unittest.main()
