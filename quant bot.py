@@ -17470,6 +17470,7 @@ JOURNAL_RESET_FILES = (
     "execution_gateway_state.json",
     "testnet_journal.json",
     "demo_analysis_state.json",
+    "testnet_lifecycle_state.json",
 )
 
 
@@ -17870,6 +17871,8 @@ def reset_demo_journals(reason="clean_testnet_start"):
         json.dump({"events": [], "reset_at": reset_at, "reset_reason": reason}, f, indent=2, ensure_ascii=False)
     with open("demo_analysis_state.json", "w", encoding="utf-8") as f:
         json.dump({"cycles": [], "reset_at": reset_at, "reset_reason": reason}, f, indent=2, ensure_ascii=False)
+    with open("testnet_lifecycle_state.json", "w", encoding="utf-8") as f:
+        json.dump({"trades": [], "reset_at": reset_at, "reset_reason": reason}, f, indent=2, ensure_ascii=False)
     try:
         global _paper_state
         _paper_state = {"positions": {}, "trades": [], "events": [], "reset_at": reset_at, "reset_reason": reason}
@@ -20598,6 +20601,232 @@ def _simple_format_closed_positions(chat_id):
     return "\n".join(lines)
 
 
+# ============================================================
+# v7.40 — BINANCE CONNECTION + TESTNET LIFECYCLE FOUNDATION
+# ============================================================
+# User-visible status stays short: connected / not connected / ready to trade.
+# Detailed lifecycle rows stay local for later PnL attribution.
+
+TESTNET_LIFECYCLE_STATE_FILE = "testnet_lifecycle_state.json"
+TESTNET_CONNECTION_STATUS_TTL = 45
+_testnet_connection_cache_v740 = {"ts": 0.0, "data": None}
+
+
+def _testnet_lifecycle_load_v740():
+    try:
+        if os.path.exists(TESTNET_LIFECYCLE_STATE_FILE):
+            with open(TESTNET_LIFECYCLE_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("trades", [])
+                return data
+    except Exception as e:
+        print(f"  [testnet_lifecycle_v740] load error: {e}")
+    return {"trades": []}
+
+
+def _testnet_lifecycle_save_v740(state):
+    try:
+        state = dict(state or {})
+        state["trades"] = list(state.get("trades") or [])[-1000:]
+        with open(TESTNET_LIFECYCLE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [testnet_lifecycle_v740] save error: {e}")
+
+
+def _testnet_real_event_by_plan_v740(plan_id, kind=None):
+    rows = [
+        e for e in (_execution_load_state_v715().get("events") or [])
+        if e.get("type") == TESTNET_REAL_EVENTS_FILE_KIND
+        and e.get("plan_id") == plan_id
+        and (kind is None or e.get("kind") == kind)
+    ]
+    rows.sort(key=lambda x: str(x.get("ts") or ""), reverse=True)
+    return rows[0] if rows else None
+
+
+def _testnet_monitor_event_by_plan_v740(plan_id):
+    rows = [
+        e for e in (_execution_load_state_v715().get("events") or [])
+        if e.get("type") == TESTNET_MONITOR_EVENTS_FILE_KIND
+        and e.get("plan_id") == plan_id
+    ]
+    rows.sort(key=lambda x: str(x.get("ts") or ""), reverse=True)
+    return rows[0] if rows else None
+
+
+def _testnet_lifecycle_row_v740(plan):
+    plan = plan or {}
+    plan_id = plan.get("plan_id")
+    entry = _testnet_real_event_by_plan_v740(plan_id, "real_entry")
+    protection = _testnet_real_event_by_plan_v740(plan_id, "real_protection")
+    emergency = _testnet_real_event_by_plan_v740(plan_id, "real_emergency_close")
+    monitor = _testnet_monitor_event_by_plan_v740(plan_id)
+    monitor_status = monitor.get("status") if monitor else None
+    status = "PLANNED"
+    if entry and entry.get("ok"):
+        status = "ENTRY_ACCEPTED"
+    elif entry:
+        status = "ENTRY_REJECTED"
+    if protection and protection.get("ok"):
+        status = "PROTECTED"
+    elif protection:
+        status = "PROTECTION_REJECTED"
+    if emergency and emergency.get("ok"):
+        status = "EMERGENCY_CLOSED"
+    if monitor_status == "NO_POSITION" and entry and entry.get("ok"):
+        status = "CLOSED_UNATTRIBUTED"
+    elif monitor_status in {"UNPROTECTED", "MISMATCH", "FETCH_FAILED"}:
+        status = monitor_status
+    return {
+        "plan_id": plan_id,
+        "created_at": plan.get("created_at"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "ticker": plan.get("ticker"),
+        "api_symbol": plan.get("api_symbol"),
+        "interval": plan.get("interval"),
+        "direction": plan.get("direction"),
+        "strategy": plan.get("strategy"),
+        "entry": {
+            "ok": bool(entry.get("ok")) if entry else False,
+            "submitted": entry.get("submitted") if entry else None,
+            "order_id": ((entry.get("response") or {}).get("orderId") if entry else None),
+            "client_order_id": ((entry.get("response") or {}).get("clientOrderId") if entry else None),
+            "reason": entry.get("reason") if entry else None,
+        },
+        "protection": {
+            "ok": bool(protection.get("ok")) if protection else False,
+            "submitted": protection.get("submitted") if protection else None,
+            "reason": protection.get("reason") if protection else None,
+            "orders": protection.get("orders") if protection else None,
+        },
+        "monitor": {
+            "status": monitor_status,
+            "ok": monitor.get("ok") if monitor else None,
+            "reason": monitor.get("reason") if monitor else None,
+            "evaluation": monitor.get("evaluation") if monitor else None,
+        },
+        "pnl": {
+            "status": "UNATTRIBUTED",
+            "realized_usdt": None,
+            "note": "PnL will be linked after Binance income/trades are matched to this plan.",
+        },
+    }
+
+
+def rebuild_testnet_lifecycle_v740(chat_id=None, limit=200):
+    plans = _execution_last_plans_v715(chat_id, limit)
+    rows = []
+    for plan in plans:
+        if plan.get("mode") == "testnet":
+            rows.append(_testnet_lifecycle_row_v740(plan))
+    state = _testnet_lifecycle_load_v740()
+    existing = {
+        row.get("plan_id"): row
+        for row in (state.get("trades") or [])
+        if row.get("plan_id")
+    }
+    for row in rows:
+        if row.get("plan_id"):
+            existing[row["plan_id"]] = row
+    merged = list(existing.values())
+    merged.sort(key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+    state["trades"] = merged[-1000:]
+    state["last_rebuild_at"] = datetime.now(timezone.utc).isoformat()
+    _testnet_lifecycle_save_v740(state)
+    return {"ok": True, "count": len(rows), "trades": rows}
+
+
+def _testnet_lifecycle_recent_v740(chat_id=None, limit=20):
+    rebuild_testnet_lifecycle_v740(chat_id, limit)
+    rows = list((_testnet_lifecycle_load_v740().get("trades") or []))
+    if chat_id is not None:
+        plan_ids = {p.get("plan_id") for p in _execution_last_plans_v715(chat_id, 500)}
+        rows = [x for x in rows if x.get("plan_id") in plan_ids]
+    rows.sort(key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+    return rows[: int(limit)]
+
+
+def _testnet_connection_status_v740(force=False):
+    now_ts = time.time()
+    cached = _testnet_connection_cache_v740
+    if cached.get("data") and not force and now_ts - float(cached.get("ts") or 0) < TESTNET_CONNECTION_STATUS_TTL:
+        return cached["data"]
+    info = execution_mode()
+    status = {
+        "mode": info.get("mode"),
+        "keys_present": bool(info.get("testnet_keys_present")),
+        "order_submit": bool(_testnet_submit_enabled_v719()),
+        "real_submit": bool(_testnet_real_submit_enabled_v729()),
+        "signed_ok": False,
+        "active_positions": 0,
+        "state": "OFF",
+        "reason": "",
+    }
+    if info.get("mode") != "testnet":
+        status["reason"] = "BOT_EXECUTION_MODE не testnet"
+    elif not info.get("testnet_keys_present"):
+        status["reason"] = "Testnet API keys не заданы"
+    else:
+        positions, err = _testnet_open_positions_v734()
+        status["signed_ok"] = err is None
+        status["active_positions"] = len(positions)
+        if err:
+            status["state"] = "API_ERROR"
+            status["reason"] = str(err)[:180]
+        elif status["order_submit"] and status["real_submit"]:
+            status["state"] = "READY_TO_TRADE"
+            status["reason"] = "signed API OK, real Testnet submit ON"
+        else:
+            status["state"] = "READ_ONLY"
+            status["reason"] = "signed API OK, но real submit выключен"
+    cached["data"] = status
+    cached["ts"] = now_ts
+    return status
+
+
+def _testnet_connection_line_v740():
+    st = _testnet_connection_status_v740()
+    icon = "🟢" if st.get("state") == "READY_TO_TRADE" else ("🟡" if st.get("signed_ok") else "🔴")
+    if st.get("state") == "READY_TO_TRADE":
+        return f"• Binance: {icon} <b>READY</b> | signed OK | real ON"
+    if st.get("state") == "READ_ONLY":
+        return f"• Binance: {icon} <b>READ ONLY</b> | real OFF"
+    return f"• Binance: {icon} <b>{_ui_html(st.get('state'))}</b> | {_ui_short_text(st.get('reason'), 80)}"
+
+
+def format_autobot_menu(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    st = _testnet_public_stats_v738(chat_id)
+    demo_enabled = chat_id in auto_chat_ids and bool(_get_auto_task_settings(chat_id, "paper_trader").get("enabled"))
+    lines = [
+        "🤖 <b>Демо-бот Binance Testnet</b>",
+        "",
+        f"Торговля: <b>{'ON' if demo_enabled else 'OFF'}</b> | Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
+        _testnet_connection_line_v740(),
+        "Частота: <b>каждые 15 минут</b> | TF выбирает бот",
+        "",
+        "<b>Статистика Testnet:</b>",
+        f"• Открытые позиции: <b>{st['open']}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"• Закрытые сделки бота: <b>{st['bot_closed']}</b>",
+        _testnet_public_pnl_line_v738(st),
+        "",
+        "<b>Краткий анализ:</b>",
+        _simple_latest_analysis(chat_id),
+    ]
+    if st.get("income_events") and not st.get("bot_closed"):
+        lines += [
+            "",
+            "ℹ️ На Binance есть realized PnL-события, но бот не считает их закрытыми сделками без подтверждённого закрытия позиции.",
+        ]
+    if st.get("position_error") or st.get("income_error"):
+        err = st.get("position_error") or st.get("income_error")
+        lines += ["", "⚠️ Статистика может быть неполной: " + _ui_short_text(err, 140)]
+    return "\n".join(lines)
+
+
 _base_paper_trader_cycle_v735 = paper_trader_cycle
 
 
@@ -20677,7 +20906,7 @@ def paper_trader_cycle(chat_id, manual=False):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.39 Strict Binance Precision"
+BOT_VERSION_LABEL = "v7.40 Binance Connection + Testnet Lifecycle"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -20743,6 +20972,7 @@ RUNTIME_LAYERS = [
     ("v7.37", "immediate Testnet monitor checks position plus regular and algo protection orders"),
     ("v7.38", "show PnL only as bot-level closed-trade stats, not raw account income"),
     ("v7.39", "strict Binance exchangeInfo precision for entry quantity and protection orders"),
+    ("v7.40", "clear Binance connection status and local Testnet lifecycle foundation"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -20780,6 +21010,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "testnet_public_stats": _testnet_public_stats_v738,
     "normalize_testnet_plan": _normalize_testnet_plan_v734,
     "build_testnet_protection_orders": build_testnet_protection_order_tests,
+    "testnet_connection_status": _testnet_connection_status_v740,
+    "rebuild_testnet_lifecycle": rebuild_testnet_lifecycle_v740,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,

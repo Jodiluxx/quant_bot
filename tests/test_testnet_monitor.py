@@ -55,6 +55,33 @@ class TestnetPositionMonitorTests(unittest.TestCase):
         self.assertIn(self.bot.TESTNET_OPEN_ALGO_ORDERS_PATH, calls)
         self.assertEqual(len(snapshot["orders_response"]), 1)
 
+    def test_lifecycle_row_links_entry_protection_and_monitor(self) -> None:
+        plan = {
+            "plan_id": "life-1",
+            "created_at": "2026-05-20T00:00:00+00:00",
+            "mode": "testnet",
+            "ticker": "BTCUSDT",
+            "api_symbol": "BTCUSDT",
+            "interval": "15m",
+            "direction": "long",
+            "strategy": "test",
+        }
+        events = [
+            {"type": self.bot.TESTNET_REAL_EVENTS_FILE_KIND, "kind": "real_entry", "plan_id": "life-1", "ok": True, "submitted": True, "response": {"orderId": 123}},
+            {"type": self.bot.TESTNET_REAL_EVENTS_FILE_KIND, "kind": "real_protection", "plan_id": "life-1", "ok": True, "submitted": True, "orders": [{"ok": True}]},
+            {"type": self.bot.TESTNET_MONITOR_EVENTS_FILE_KIND, "plan_id": "life-1", "ok": True, "status": "PROTECTED", "evaluation": {"status": "PROTECTED"}},
+        ]
+        old_load = self.bot._execution_load_state_v715
+        self.bot._execution_load_state_v715 = lambda: {"plans": [plan], "events": events}
+        try:
+            row = self.bot._testnet_lifecycle_row_v740(plan)
+        finally:
+            self.bot._execution_load_state_v715 = old_load
+
+        self.assertEqual(row["status"], "PROTECTED")
+        self.assertEqual(row["entry"]["order_id"], 123)
+        self.assertTrue(row["protection"]["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

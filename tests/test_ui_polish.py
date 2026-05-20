@@ -77,7 +77,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.39 Strict Binance Precision")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.40 Binance Connection + Testnet Lifecycle")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -90,11 +90,14 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.37" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.38" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.39" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.40" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_public_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("normalize_testnet_plan", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_connection_status", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("rebuild_testnet_lifecycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
@@ -140,7 +143,7 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_testnet_only_menu_hides_paper_language(self) -> None:
         text = self.bot.format_autobot_menu(987654321)
         self.assertIn("Binance Testnet", text)
-        self.assertIn("только Binance Futures Testnet", text)
+        self.assertIn("Binance:", text)
         self.assertNotIn("Paper-", text)
         self.assertNotIn("paper-", text)
         self.assertNotIn("Paper Trader", text)
@@ -205,6 +208,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         old_open = self.bot._testnet_open_positions_v734
         old_income = self.bot._testnet_income_stats_v734
         old_monitor = self.bot._recent_testnet_monitor_events_v730
+        old_connection = self.bot._testnet_connection_status_v740
         try:
             self.bot._testnet_open_positions_v734 = lambda: ([], None)
             self.bot._testnet_income_stats_v734 = lambda: {
@@ -216,15 +220,33 @@ class TelegramUiPolishTests(unittest.TestCase):
                 "net": 12.34,
             }
             self.bot._recent_testnet_monitor_events_v730 = lambda chat_id=None, limit=6: []
+            self.bot._testnet_connection_status_v740 = lambda force=False: {
+                "state": "READY_TO_TRADE",
+                "signed_ok": True,
+                "reason": "ok",
+            }
             text = self.bot.format_autobot_menu(987654321)
         finally:
             self.bot._testnet_open_positions_v734 = old_open
             self.bot._testnet_income_stats_v734 = old_income
             self.bot._recent_testnet_monitor_events_v730 = old_monitor
+            self.bot._testnet_connection_status_v740 = old_connection
 
         self.assertIn("Закрытые сделки бота: <b>0</b>", text)
         self.assertIn("Winrate / PnL: <b>н/д</b>", text)
         self.assertNotIn("+12.340 USDT", text)
+
+    def test_connection_line_is_explicit(self) -> None:
+        old_status = self.bot._testnet_connection_status_v740
+        try:
+            self.bot._testnet_connection_status_v740 = lambda force=False: {
+                "state": "READY_TO_TRADE",
+                "signed_ok": True,
+                "reason": "signed API OK, real Testnet submit ON",
+            }
+            self.assertIn("Binance: 🟢 <b>READY</b>", self.bot._testnet_connection_line_v740())
+        finally:
+            self.bot._testnet_connection_status_v740 = old_status
 
 
 if __name__ == "__main__":
