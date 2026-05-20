@@ -77,7 +77,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.41 Emergency Testnet Safety")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.42 Testnet PnL Attribution")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -92,6 +92,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.39" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.40" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.41" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.42" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -103,6 +104,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("cancel_testnet_algo_orders", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_auto_safety_after_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_emergency_close_position", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_closed_trade_rows", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_pnl_attribution", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
@@ -252,6 +255,34 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertIn("Binance: 🟢 <b>READY</b>", self.bot._testnet_connection_line_v740())
         finally:
             self.bot._testnet_connection_status_v740 = old_status
+
+    def test_public_pnl_uses_attributed_bot_rows(self) -> None:
+        old_open = self.bot._testnet_open_positions_v734
+        old_income = self.bot._testnet_income_stats_v734
+        old_closed = self.bot._testnet_closed_trade_rows_v742
+        old_connection = self.bot._testnet_connection_status_v740
+        try:
+            self.bot._testnet_open_positions_v734 = lambda: ([], None)
+            self.bot._testnet_income_stats_v734 = lambda: {"ok": True, "closed": 8, "net": 999.0, "winrate": 100.0}
+            self.bot._testnet_closed_trade_rows_v742 = lambda chat_id=None, limit=200: [
+                {"pnl": {"status": "ATTRIBUTED", "realized_usdt": 2.5}},
+                {"pnl": {"status": "ATTRIBUTED", "realized_usdt": -1.0}},
+            ]
+            self.bot._testnet_connection_status_v740 = lambda force=False: {
+                "state": "READY_TO_TRADE",
+                "signed_ok": True,
+                "reason": "ok",
+            }
+            text = self.bot.format_autobot_menu(987654321)
+        finally:
+            self.bot._testnet_open_positions_v734 = old_open
+            self.bot._testnet_income_stats_v734 = old_income
+            self.bot._testnet_closed_trade_rows_v742 = old_closed
+            self.bot._testnet_connection_status_v740 = old_connection
+
+        self.assertIn("Winrate: <b>50.0%</b>", text)
+        self.assertIn("+1.500 USDT", text)
+        self.assertNotIn("+999.000 USDT", text)
 
 
 if __name__ == "__main__":

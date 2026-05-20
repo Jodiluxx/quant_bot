@@ -160,6 +160,57 @@ class TestnetPositionMonitorTests(unittest.TestCase):
         self.assertEqual(calls[1][0], self.bot.TESTNET_CANCEL_ALL_ALGO_OPEN_ORDERS_PATH)
         self.assertEqual(calls[0][1]["symbol"], "BTCUSDT")
 
+    def test_lifecycle_attributes_closed_trade_pnl_by_symbol_and_time(self) -> None:
+        plan = {
+            "plan_id": "pnl-1",
+            "created_at": "2026-05-20T10:00:00+00:00",
+            "mode": "testnet",
+            "ticker": "BTCUSDT",
+            "api_symbol": "BTCUSDT",
+            "interval": "15m",
+            "direction": "long",
+            "strategy": "test",
+        }
+        events = [
+            {
+                "type": self.bot.TESTNET_REAL_EVENTS_FILE_KIND,
+                "kind": "real_entry",
+                "plan_id": "pnl-1",
+                "ok": True,
+                "submitted": True,
+                "ts": "2026-05-20T10:00:10+00:00",
+                "response": {"orderId": 10},
+            },
+            {
+                "type": self.bot.TESTNET_MONITOR_EVENTS_FILE_KIND,
+                "plan_id": "pnl-1",
+                "ok": True,
+                "status": "NO_POSITION",
+                "ts": "2026-05-20T10:30:00+00:00",
+                "evaluation": {"status": "NO_POSITION"},
+            },
+        ]
+        income_time = int(self.bot._safety_parse_dt_v716("2026-05-20T10:29:30+00:00").timestamp() * 1000)
+        old_load = self.bot._execution_load_state_v715
+        old_income = self.bot._testnet_income_stats_v734
+        self.bot._execution_load_state_v715 = lambda: {"plans": [plan], "events": events}
+        self.bot._testnet_income_stats_v734 = lambda: {
+            "ok": True,
+            "rows": [
+                {"symbol": "BTCUSDT", "income": "1.25", "time": income_time},
+                {"symbol": "ETHUSDT", "income": "100", "time": income_time},
+            ],
+        }
+        try:
+            row = self.bot._testnet_lifecycle_row_v740(plan)
+        finally:
+            self.bot._execution_load_state_v715 = old_load
+            self.bot._testnet_income_stats_v734 = old_income
+
+        self.assertEqual(row["status"], "CLOSED_WIN")
+        self.assertEqual(row["pnl"]["status"], "ATTRIBUTED")
+        self.assertAlmostEqual(row["pnl"]["realized_usdt"], 1.25)
+
 
 if __name__ == "__main__":
     unittest.main()

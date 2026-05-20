@@ -21224,7 +21224,189 @@ def _submit_testnet_trade_v734(chat_id, candidate):
     return result
 
 
-BOT_VERSION_LABEL = "v7.41 Emergency Testnet Safety"
+# ============================================================
+# v7.42 - TESTNET CLOSED TRADE PNL ATTRIBUTION
+# ============================================================
+# Public PnL is shown only when a closed bot plan can be linked to Binance
+# realized income by symbol and time window. Raw account income stays local.
+
+_base_testnet_lifecycle_row_v740_for_v742 = _testnet_lifecycle_row_v740
+_base_testnet_public_stats_v738_for_v742 = _testnet_public_stats_v738
+_base_testnet_public_pnl_line_v738_for_v742 = _testnet_public_pnl_line_v738
+_base_simple_format_closed_positions_v740_for_v742 = _simple_format_closed_positions
+
+TESTNET_PNL_MATCH_WINDOW_MS = 5 * 60 * 1000
+
+
+def _testnet_ts_ms_v742(value):
+    if value is None or value == "":
+        return None
+    try:
+        num = float(value)
+        if num > 10_000_000_000:
+            return int(num)
+        if num > 0:
+            return int(num * 1000)
+    except Exception:
+        pass
+    dt = _safety_parse_dt_v716(value)
+    if not dt:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def _testnet_event_ms_v742(event):
+    event = event or {}
+    response = event.get("response") or {}
+    if isinstance(response, dict):
+        for key in ("updateTime", "transactTime", "time", "workingTime"):
+            ms = _testnet_ts_ms_v742(response.get(key))
+            if ms:
+                return ms
+    return _testnet_ts_ms_v742(event.get("ts"))
+
+
+def _testnet_income_rows_for_plan_v742(plan, entry_event=None, close_event=None):
+    plan = plan or {}
+    symbol = str(plan.get("api_symbol") or plan.get("ticker") or "").upper()
+    stats = _testnet_income_stats_v734()
+    if not stats.get("ok"):
+        return [], stats.get("reason") or "income fetch failed"
+    start_ms = _testnet_event_ms_v742(entry_event) or _testnet_ts_ms_v742(plan.get("created_at"))
+    end_ms = _testnet_event_ms_v742(close_event) or int(time.time() * 1000)
+    if start_ms:
+        start_ms -= TESTNET_PNL_MATCH_WINDOW_MS
+    if end_ms:
+        end_ms += TESTNET_PNL_MATCH_WINDOW_MS
+    rows = []
+    for row in stats.get("rows") or []:
+        if symbol and str(row.get("symbol") or "").upper() != symbol:
+            continue
+        row_ms = _testnet_ts_ms_v742(row.get("time") or row.get("timestamp"))
+        if start_ms and row_ms and row_ms < start_ms:
+            continue
+        if end_ms and row_ms and row_ms > end_ms:
+            continue
+        rows.append(row)
+    return rows, None
+
+
+def _testnet_pnl_attribution_v742(plan, entry_event=None, close_event=None):
+    if not close_event or (close_event.get("status") or (close_event.get("evaluation") or {}).get("status")) != "NO_POSITION":
+        return {
+            "status": "PENDING",
+            "realized_usdt": None,
+            "note": "Position is not confirmed closed yet.",
+        }
+    rows, error = _testnet_income_rows_for_plan_v742(plan, entry_event, close_event)
+    if error:
+        return {
+            "status": "INCOME_FETCH_FAILED",
+            "realized_usdt": None,
+            "note": str(error)[:300],
+        }
+    if not rows:
+        return {
+            "status": "NO_INCOME_MATCH",
+            "realized_usdt": None,
+            "income_rows": 0,
+            "note": "Closed position is confirmed, but Binance income is not matched yet.",
+        }
+    realized = sum(_safe_float(row.get("income"), 0) or 0 for row in rows)
+    return {
+        "status": "ATTRIBUTED",
+        "realized_usdt": realized,
+        "income_rows": len(rows),
+        "outcome": "WIN" if realized > 0 else ("LOSS" if realized < 0 else "FLAT"),
+        "matched_symbols": sorted({str(row.get("symbol") or "") for row in rows if row.get("symbol")}),
+    }
+
+
+def _testnet_lifecycle_row_v740(plan):
+    row = _base_testnet_lifecycle_row_v740_for_v742(plan)
+    plan_id = row.get("plan_id")
+    entry = _testnet_real_event_by_plan_v740(plan_id, "real_entry")
+    monitor = _testnet_monitor_event_by_plan_v740(plan_id)
+    pnl = _testnet_pnl_attribution_v742(plan, entry, monitor)
+    row["pnl"] = pnl
+    if pnl.get("status") == "ATTRIBUTED":
+        outcome = pnl.get("outcome") or "FLAT"
+        row["status"] = f"CLOSED_{outcome}"
+    return row
+
+
+def _testnet_closed_trade_rows_v742(chat_id=None, limit=200):
+    rows = _testnet_lifecycle_recent_v740(chat_id, limit)
+    closed = []
+    for row in rows:
+        monitor = row.get("monitor") or {}
+        if monitor.get("status") == "NO_POSITION" or str(row.get("status") or "").startswith("CLOSED_"):
+            closed.append(row)
+    closed.sort(key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+    return closed[: int(limit)]
+
+
+def _testnet_bot_closed_events_v738(chat_id=None, limit=200):
+    return _testnet_closed_trade_rows_v742(chat_id, limit)
+
+
+def _testnet_public_stats_v738(chat_id):
+    active, pos_err = _testnet_open_positions_v734()
+    income = _testnet_income_stats_v734()
+    closed_rows = _testnet_closed_trade_rows_v742(chat_id, 200)
+    attributed = [row for row in closed_rows if (row.get("pnl") or {}).get("status") == "ATTRIBUTED"]
+    wins = [row for row in attributed if _safe_float((row.get("pnl") or {}).get("realized_usdt"), 0) > 0]
+    losses = [row for row in attributed if _safe_float((row.get("pnl") or {}).get("realized_usdt"), 0) < 0]
+    net = sum(_safe_float((row.get("pnl") or {}).get("realized_usdt"), 0) or 0 for row in attributed)
+    income_ok = bool(income.get("ok"))
+    return {
+        "open": len(active),
+        "position_error": pos_err,
+        "bot_closed": len(closed_rows),
+        "attributed_closed": len(attributed),
+        "bot_wins": len(wins),
+        "bot_losses": len(losses),
+        "bot_winrate": (len(wins) / len(attributed) * 100.0) if attributed else None,
+        "bot_net": net,
+        "income_events": int(income.get("closed", 0) or 0) if income_ok else 0,
+        "income_winrate": f"{income.get('winrate', 0):.1f}%" if income_ok else "n/a",
+        "income_net": _safe_float(income.get("net"), 0) if income_ok else 0.0,
+        "income_error": None if income_ok else income.get("reason"),
+    }
+
+
+def _testnet_public_pnl_line_v738(stats):
+    if int(stats.get("bot_closed") or 0) <= 0:
+        return "• Winrate / PnL: <b>н/д</b> — закрытых сделок бота ещё нет"
+    if int(stats.get("attributed_closed") or 0) <= 0:
+        return "• Winrate / PnL: <b>н/д</b> — закрытие есть, PnL ещё сверяется"
+    return (
+        f"• Winrate: <b>{stats.get('bot_winrate', 0):.1f}%</b> | "
+        f"PnL: <b>{stats.get('bot_net', 0):+.3f} USDT</b> | "
+        f"linked {int(stats.get('attributed_closed') or 0)}/{int(stats.get('bot_closed') or 0)}"
+    )
+
+
+def _simple_format_closed_positions(chat_id):
+    trades = _testnet_closed_trade_rows_v742(chat_id, 50)
+    lines = ["📕 <b>Закрытые Binance Testnet сделки бота</b>", ""]
+    if not trades:
+        lines.append("Закрытых Testnet-сделок бота пока нет.")
+        return "\n".join(lines)
+    for trade in trades[:10]:
+        pnl = trade.get("pnl") or {}
+        if pnl.get("status") == "ATTRIBUTED":
+            result = f"{pnl.get('realized_usdt', 0):+.3f} USDT"
+        else:
+            result = "PnL сверяется"
+        lines.append(
+            f"• {_fmt_dt_short(trade.get('created_at'))} | {_ui_ticker_short(trade.get('ticker'))} "
+            f"{str(trade.get('direction') or '').upper()} | {_ui_tf_short(trade.get('interval'))} | {result}"
+        )
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.42 Testnet PnL Attribution"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -21292,6 +21474,7 @@ RUNTIME_LAYERS = [
     ("v7.39", "strict Binance exchangeInfo precision for entry quantity and protection orders"),
     ("v7.40", "clear Binance connection status and local Testnet lifecycle foundation"),
     ("v7.41", "behind-the-scenes Testnet emergency safety and cleanup controls"),
+    ("v7.42", "closed Testnet trade PnL attribution by bot plan and Binance income window"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -21335,6 +21518,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "cancel_testnet_algo_orders": cancel_testnet_algo_orders_v741,
     "testnet_auto_safety_after_monitor": _testnet_auto_safety_after_monitor_v741,
     "submit_testnet_emergency_close_position": submit_testnet_emergency_close_position_v741,
+    "testnet_closed_trade_rows": _testnet_closed_trade_rows_v742,
+    "testnet_pnl_attribution": _testnet_pnl_attribution_v742,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -21513,6 +21698,10 @@ def validate_runtime_architecture():
         errors.append("testnet cancel-algo-orders helper is missing")
     if not callable(globals().get("_testnet_auto_safety_after_monitor_v741")):
         errors.append("testnet auto-safety helper is missing")
+    if not callable(globals().get("_testnet_closed_trade_rows_v742")):
+        errors.append("testnet closed-trade attribution helper is missing")
+    if not callable(globals().get("_testnet_pnl_attribution_v742")):
+        errors.append("testnet PnL attribution helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):
