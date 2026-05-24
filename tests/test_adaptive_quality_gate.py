@@ -242,6 +242,33 @@ class AdaptiveQualityGateTests(unittest.TestCase):
         self.assertNotIn(stale, rows)
         self.assertEqual(stats[("ticker", "BTCUSDT")]["closed"], 2)
 
+    def test_duplicate_adaptive_buckets_are_group_capped(self) -> None:
+        rows = [_closed_row() for _ in range(10)]
+        stats = {}
+        for row in rows:
+            for key in self.bot._adaptive_quality_candidate_keys_v745({
+                "ticker": row["ticker"],
+                "interval": row["interval"],
+                "direction": row["direction"],
+                "strategy": row["strategy"],
+            }):
+                bucket = stats.setdefault(key, {"wins": 0, "losses": 0, "flats": 0, "issues": 0, "pending": 0})
+                bucket["losses"] += 1
+        for bucket in stats.values():
+            closed = bucket["wins"] + bucket["losses"] + bucket["flats"]
+            observed = closed + bucket["issues"]
+            bucket["closed"] = closed
+            bucket["observed"] = observed
+            bucket["winrate"] = bucket["wins"] / closed if closed else None
+            bucket["issue_rate"] = bucket["issues"] / observed if observed else None
+
+        quality = self.bot._adaptive_quality_penalty_from_stats_v746(stats, _candidate())
+
+        self.assertEqual(quality["dedup"], "grouped")
+        self.assertEqual(quality["penalty"], self.bot.ADAPTIVE_GATE_GROUP_TOTAL_CAP_V748)
+        self.assertLess(quality["penalty"], self.bot.ADAPTIVE_GATE_MAX_PENALTY_V745)
+        self.assertEqual(len({item["group"] for item in quality["evidence"]}), len(quality["evidence"]))
+
 
 if __name__ == "__main__":
     unittest.main()

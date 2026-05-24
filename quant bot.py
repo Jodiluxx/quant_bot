@@ -22123,7 +22123,125 @@ def _adaptive_quality_local_rows_v745(chat_id=None, limit=ADAPTIVE_GATE_LOCAL_RO
     return [row for row in rows if _adaptive_quality_row_is_fresh_v747(row, now)]
 
 
-BOT_VERSION_LABEL = "v7.47 Adaptive Evidence Freshness"
+# ============================================================
+# v7.48 - ADAPTIVE PENALTY DE-DUPLICATION
+# ============================================================
+# Related evidence buckets can describe the same losing streak. Penalize by
+# bucket groups instead of blindly summing ticker + TF + strategy duplicates.
+
+_base_adaptive_quality_penalty_from_stats_v746_for_v748 = _adaptive_quality_penalty_from_stats_v746
+
+ADAPTIVE_GATE_GROUP_CAPS_V748 = {
+    "specific": 8,
+    "strategy": 4,
+    "asset": 3,
+    "timeframe": 2,
+    "direction": 1,
+    "other": 2,
+}
+ADAPTIVE_GATE_GROUP_TOTAL_CAP_V748 = ADAPTIVE_GATE_BLOCK_PENALTY_V745
+
+
+def _adaptive_quality_bucket_group_v748(key):
+    key_type = (key or ("", ""))[0]
+    if key_type in {"ticker_tf", "strategy_tf"}:
+        return "specific"
+    if key_type == "strategy":
+        return "strategy"
+    if key_type == "ticker":
+        return "asset"
+    if key_type == "tf":
+        return "timeframe"
+    if key_type == "direction":
+        return "direction"
+    return "other"
+
+
+def _adaptive_quality_raw_bucket_penalty_v748(key, bucket):
+    closed = int((bucket or {}).get("closed") or 0)
+    observed = int((bucket or {}).get("observed") or 0)
+    key_penalty = 0
+    reasons = []
+    wr = (bucket or {}).get("winrate")
+    if closed >= ADAPTIVE_GATE_MIN_CLOSED_V745 and wr is not None:
+        if wr < 0.35:
+            key_penalty += 10
+        elif wr < 0.45:
+            key_penalty += 6
+        elif closed >= ADAPTIVE_GATE_STRONG_CLOSED_V745 and wr < 0.50:
+            key_penalty += 4
+        if key_penalty and closed >= ADAPTIVE_GATE_STRONG_CLOSED_V745:
+            key_penalty += 2
+        if key_penalty:
+            reasons.append(_adaptive_quality_reason_v745(key, bucket, "winrate"))
+    issue_rate = (bucket or {}).get("issue_rate")
+    if observed >= ADAPTIVE_GATE_MIN_CLOSED_V745 and issue_rate is not None:
+        if issue_rate >= 0.35:
+            key_penalty += 6
+        elif issue_rate >= 0.25:
+            key_penalty += 4
+        if issue_rate >= 0.25:
+            reasons.append(_adaptive_quality_reason_v745(key, bucket, "issues"))
+    return min(10, key_penalty), reasons
+
+
+def _adaptive_quality_penalty_from_stats_v746(stats, candidate):
+    stats = stats or {}
+    groups = {}
+    for key in _adaptive_quality_candidate_keys_v745(candidate):
+        bucket = stats.get(key)
+        if not bucket:
+            continue
+        raw_penalty, reasons = _adaptive_quality_raw_bucket_penalty_v748(key, bucket)
+        if raw_penalty <= 0:
+            continue
+        group = _adaptive_quality_bucket_group_v748(key)
+        cap = int(ADAPTIVE_GATE_GROUP_CAPS_V748.get(group, ADAPTIVE_GATE_GROUP_CAPS_V748["other"]))
+        group_penalty = min(cap, raw_penalty)
+        current = groups.get(group)
+        if current is not None and int(current.get("penalty") or 0) >= group_penalty:
+            continue
+        wr = bucket.get("winrate")
+        issue_rate = bucket.get("issue_rate")
+        groups[group] = {
+            "group": group,
+            "key": f"{key[0]}:{key[1]}",
+            "penalty": group_penalty,
+            "raw_penalty": raw_penalty,
+            "closed": int(bucket.get("closed") or 0),
+            "observed": int(bucket.get("observed") or 0),
+            "wins": int(bucket.get("wins") or 0),
+            "losses": int(bucket.get("losses") or 0),
+            "issues": int(bucket.get("issues") or 0),
+            "winrate": round(wr, 4) if wr is not None else None,
+            "issue_rate": round(issue_rate, 4) if issue_rate is not None else None,
+            "reasons": reasons[:3],
+        }
+
+    evidence = sorted(groups.values(), key=lambda x: int(x.get("penalty") or 0), reverse=True)
+    penalty = sum(int(item.get("penalty") or 0) for item in evidence)
+    penalty = min(ADAPTIVE_GATE_GROUP_TOTAL_CAP_V748, ADAPTIVE_GATE_MAX_PENALTY_V745, int(penalty))
+    if penalty >= ADAPTIVE_GATE_BLOCK_PENALTY_V745:
+        mode = "strong_penalty"
+    elif penalty > 0:
+        mode = "soft_penalty"
+    else:
+        mode = "observe"
+    reasons = []
+    for item in evidence:
+        reasons.extend(list(item.get("reasons") or []))
+    return {
+        "mode": mode,
+        "penalty": penalty,
+        "reasons": reasons[:5],
+        "evidence": evidence[:6],
+        "min_closed": ADAPTIVE_GATE_MIN_CLOSED_V745,
+        "max_penalty": ADAPTIVE_GATE_GROUP_TOTAL_CAP_V748,
+        "dedup": "grouped",
+    }
+
+
+BOT_VERSION_LABEL = "v7.48 Adaptive Penalty Dedup"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -22197,6 +22315,7 @@ RUNTIME_LAYERS = [
     ("v7.45", "adaptive setup quality gate from local Testnet lifecycle evidence"),
     ("v7.46", "per-scan cache for adaptive setup quality evidence"),
     ("v7.47", "freshness window for adaptive setup quality evidence"),
+    ("v7.48", "de-duplicate related adaptive setup quality penalties"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -22248,6 +22367,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "adaptive_quality_penalty": _adaptive_quality_penalty_v745,
     "adaptive_quality_penalty_from_stats": _adaptive_quality_penalty_from_stats_v746,
     "adaptive_quality_row_is_fresh": _adaptive_quality_row_is_fresh_v747,
+    "adaptive_quality_bucket_group": _adaptive_quality_bucket_group_v748,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -22442,6 +22562,8 @@ def validate_runtime_architecture():
         errors.append("adaptive setup quality cached penalty helper is missing")
     if not callable(globals().get("_adaptive_quality_row_is_fresh_v747")):
         errors.append("adaptive setup quality freshness helper is missing")
+    if not callable(globals().get("_adaptive_quality_bucket_group_v748")):
+        errors.append("adaptive setup quality bucket grouping helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):
