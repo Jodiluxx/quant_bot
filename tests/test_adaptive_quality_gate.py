@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import unittest
 
 from quant_bot.legacy import load_bot_module
@@ -221,6 +222,25 @@ class AdaptiveQualityGateTests(unittest.TestCase):
         self.assertEqual(len(tried), 3)
         self.assertEqual(calls["rows"], 1)
         self.assertFalse(self.bot._adaptive_quality_scan_stats_cache_v746)
+
+    def test_stale_adaptive_evidence_is_ignored(self) -> None:
+        old_rows = self.bot._base_adaptive_quality_local_rows_v745_for_v747
+        now = datetime.now(timezone.utc)
+        stale = _closed_row()
+        stale["updated_at"] = (now - timedelta(days=self.bot.ADAPTIVE_GATE_FRESHNESS_DAYS_V747 + 7)).isoformat()
+        fresh = _closed_row()
+        fresh["updated_at"] = (now - timedelta(days=2)).isoformat()
+        no_date = _closed_row()
+        self.bot._base_adaptive_quality_local_rows_v745_for_v747 = lambda chat_id=None, limit=600: [stale, fresh, no_date]
+        try:
+            rows = self.bot._adaptive_quality_local_rows_v745("chat-fresh")
+            stats = self.bot._adaptive_quality_stats_v745("chat-fresh")
+        finally:
+            self.bot._base_adaptive_quality_local_rows_v745_for_v747 = old_rows
+
+        self.assertEqual(len(rows), 2)
+        self.assertNotIn(stale, rows)
+        self.assertEqual(stats[("ticker", "BTCUSDT")]["closed"], 2)
 
 
 if __name__ == "__main__":

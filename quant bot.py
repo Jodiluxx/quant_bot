@@ -22080,7 +22080,50 @@ def testnet_select_trade_candidate(chat_id):
             _adaptive_quality_scan_stats_cache_v746.pop(cache_key, None)
 
 
-BOT_VERSION_LABEL = "v7.46 Adaptive Gate Scan Cache"
+# ============================================================
+# v7.47 - ADAPTIVE EVIDENCE FRESHNESS WINDOW
+# ============================================================
+# Old trades still stay in the local journal, but adaptive setup quality uses
+# fresh evidence only. This lowers overfitting to market regimes that may no
+# longer describe today's futures market.
+
+_base_adaptive_quality_local_rows_v745_for_v747 = _adaptive_quality_local_rows_v745
+ADAPTIVE_GATE_FRESHNESS_DAYS_V747 = int(os.getenv("ADAPTIVE_GATE_FRESHNESS_DAYS", "90"))
+
+
+def _adaptive_quality_row_dt_v747(row):
+    row = row or {}
+    raw = (
+        row.get("updated_at")
+        or row.get("closed_at")
+        or row.get("created_at")
+        or row.get("ts")
+    )
+    if not raw:
+        return None
+    try:
+        return _safety_parse_dt_v716(raw)
+    except Exception:
+        return None
+
+
+def _adaptive_quality_row_is_fresh_v747(row, now=None):
+    dt = _adaptive_quality_row_dt_v747(row)
+    if dt is None:
+        return True
+    now = now or datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt >= now - timedelta(days=ADAPTIVE_GATE_FRESHNESS_DAYS_V747)
+
+
+def _adaptive_quality_local_rows_v745(chat_id=None, limit=ADAPTIVE_GATE_LOCAL_ROW_LIMIT_V745):
+    rows = _base_adaptive_quality_local_rows_v745_for_v747(chat_id, limit)
+    now = datetime.now(timezone.utc)
+    return [row for row in rows if _adaptive_quality_row_is_fresh_v747(row, now)]
+
+
+BOT_VERSION_LABEL = "v7.47 Adaptive Evidence Freshness"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -22153,6 +22196,7 @@ RUNTIME_LAYERS = [
     ("v7.44", "compact Testnet trade lifecycle report for the public demo bot"),
     ("v7.45", "adaptive setup quality gate from local Testnet lifecycle evidence"),
     ("v7.46", "per-scan cache for adaptive setup quality evidence"),
+    ("v7.47", "freshness window for adaptive setup quality evidence"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -22203,6 +22247,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "adaptive_quality_stats": _adaptive_quality_stats_v745,
     "adaptive_quality_penalty": _adaptive_quality_penalty_v745,
     "adaptive_quality_penalty_from_stats": _adaptive_quality_penalty_from_stats_v746,
+    "adaptive_quality_row_is_fresh": _adaptive_quality_row_is_fresh_v747,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -22395,6 +22440,8 @@ def validate_runtime_architecture():
         errors.append("adaptive setup quality penalty helper is missing")
     if not callable(globals().get("_adaptive_quality_penalty_from_stats_v746")):
         errors.append("adaptive setup quality cached penalty helper is missing")
+    if not callable(globals().get("_adaptive_quality_row_is_fresh_v747")):
+        errors.append("adaptive setup quality freshness helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):
