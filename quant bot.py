@@ -21638,7 +21638,345 @@ def autobot_keyboard(chat_id):
     ]}
 
 
-BOT_VERSION_LABEL = "v7.44 Testnet Trade Lifecycle Report"
+# ============================================================
+# v7.45 - ADAPTIVE SETUP QUALITY GATE
+# ============================================================
+# Uses local Testnet lifecycle evidence to lower priority for weak recurring
+# conditions. Small samples do not block anything; this is a risk gate, not a
+# curve-fitting engine.
+
+_base_testnet_candidate_block_reason_v735_for_v745 = _testnet_candidate_block_reason_v735
+_base_demo_scan_row_for_storage_v736_for_v745 = _demo_scan_row_for_storage_v736
+_base_demo_candidate_for_storage_v736_for_v745 = _demo_candidate_for_storage_v736
+
+ADAPTIVE_GATE_MIN_CLOSED_V745 = 10
+ADAPTIVE_GATE_STRONG_CLOSED_V745 = 30
+ADAPTIVE_GATE_MAX_PENALTY_V745 = 18
+ADAPTIVE_GATE_BLOCK_PENALTY_V745 = 14
+ADAPTIVE_GATE_EXCEPTION_SCORE_V745 = 92
+ADAPTIVE_GATE_LOCAL_ROW_LIMIT_V745 = 600
+
+
+def _adaptive_quality_candidate_keys_v745(candidate):
+    candidate = candidate or {}
+    ticker = str(candidate.get("ticker") or "").strip()
+    interval = str(candidate.get("interval") or "").strip()
+    direction = str(candidate.get("direction") or "").strip().lower()
+    strategy = str(candidate.get("strategy") or "").strip()
+    keys = []
+    if ticker:
+        keys.append(("ticker", ticker))
+    if interval:
+        keys.append(("tf", interval))
+    if ticker and interval:
+        keys.append(("ticker_tf", f"{ticker}:{interval}"))
+    if direction:
+        keys.append(("direction", direction))
+    if strategy:
+        keys.append(("strategy", strategy))
+    if strategy and interval:
+        keys.append(("strategy_tf", f"{strategy}:{interval}"))
+    return keys
+
+
+def _adaptive_quality_local_rows_v745(chat_id=None, limit=ADAPTIVE_GATE_LOCAL_ROW_LIMIT_V745):
+    try:
+        state = _testnet_lifecycle_load_v740()
+        rows = list(state.get("trades") or [])
+        if chat_id is not None:
+            plan_ids = {
+                p.get("plan_id")
+                for p in _execution_last_plans_v715(chat_id, int(limit) * 2)
+                if p.get("plan_id")
+            }
+            rows = [row for row in rows if row.get("plan_id") in plan_ids]
+        rows.sort(key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+        return rows[: int(limit)]
+    except Exception as e:
+        print(f"  [adaptive_gate_v745] local rows error: {e}")
+        return []
+
+
+def _adaptive_quality_row_outcome_v745(row):
+    row = row or {}
+    status = ""
+    try:
+        status = str(_testnet_lifecycle_user_status_v744(row) or "").upper()
+    except Exception:
+        status = str(row.get("status") or "").upper()
+    pnl = row.get("pnl") or {}
+    if pnl.get("status") == "ATTRIBUTED":
+        realized = _safe_float(pnl.get("realized_usdt"), 0) or 0
+        if realized > 0:
+            return "win"
+        if realized < 0:
+            return "loss"
+        return "flat"
+    if status == "CLOSED_WIN":
+        return "win"
+    if status == "CLOSED_LOSS":
+        return "loss"
+    if status == "CLOSED_FLAT":
+        return "flat"
+    if status in {"NEEDS_ATTENTION", "EMERGENCY_CLOSED", "ENTRY_REJECTED", "PROTECTION_REJECTED", "ORPHAN_CLEANED"}:
+        return "issue"
+    return "pending"
+
+
+def _adaptive_quality_stats_v745(chat_id=None, limit=ADAPTIVE_GATE_LOCAL_ROW_LIMIT_V745):
+    stats = {}
+    rows = _adaptive_quality_local_rows_v745(chat_id, limit)
+    for row in rows:
+        candidate_like = {
+            "ticker": row.get("ticker"),
+            "interval": row.get("interval"),
+            "direction": row.get("direction"),
+            "strategy": row.get("strategy"),
+        }
+        outcome = _adaptive_quality_row_outcome_v745(row)
+        for key in _adaptive_quality_candidate_keys_v745(candidate_like):
+            bucket = stats.setdefault(key, {
+                "key": key,
+                "wins": 0,
+                "losses": 0,
+                "flats": 0,
+                "issues": 0,
+                "pending": 0,
+            })
+            if outcome == "win":
+                bucket["wins"] += 1
+            elif outcome == "loss":
+                bucket["losses"] += 1
+            elif outcome == "flat":
+                bucket["flats"] += 1
+            elif outcome == "issue":
+                bucket["issues"] += 1
+            else:
+                bucket["pending"] += 1
+    for bucket in stats.values():
+        closed = int(bucket["wins"] + bucket["losses"] + bucket["flats"])
+        observed = int(closed + bucket["issues"])
+        bucket["closed"] = closed
+        bucket["observed"] = observed
+        bucket["winrate"] = (bucket["wins"] / closed) if closed else None
+        bucket["issue_rate"] = (bucket["issues"] / observed) if observed else None
+    return stats
+
+
+def _adaptive_quality_reason_v745(key, bucket, kind):
+    key_type, key_value = key
+    closed = int(bucket.get("closed") or 0)
+    observed = int(bucket.get("observed") or 0)
+    if kind == "winrate":
+        wr = bucket.get("winrate")
+        wr_txt = "n/a" if wr is None else f"{wr * 100:.0f}%"
+        return f"{key_type} {key_value} WR {wr_txt} n={closed}"
+    issue_rate = bucket.get("issue_rate")
+    issue_txt = "n/a" if issue_rate is None else f"{issue_rate * 100:.0f}%"
+    return f"{key_type} {key_value} issues {issue_txt} n={observed}"
+
+
+def _adaptive_quality_penalty_v745(chat_id, candidate):
+    stats = _adaptive_quality_stats_v745(chat_id)
+    penalty = 0
+    reasons = []
+    evidence = []
+    for key in _adaptive_quality_candidate_keys_v745(candidate):
+        bucket = stats.get(key)
+        if not bucket:
+            continue
+        closed = int(bucket.get("closed") or 0)
+        observed = int(bucket.get("observed") or 0)
+        key_penalty = 0
+        wr = bucket.get("winrate")
+        if closed >= ADAPTIVE_GATE_MIN_CLOSED_V745 and wr is not None:
+            if wr < 0.35:
+                key_penalty += 10
+            elif wr < 0.45:
+                key_penalty += 6
+            elif closed >= ADAPTIVE_GATE_STRONG_CLOSED_V745 and wr < 0.50:
+                key_penalty += 4
+            if key_penalty and closed >= ADAPTIVE_GATE_STRONG_CLOSED_V745:
+                key_penalty += 2
+            if key_penalty:
+                reasons.append(_adaptive_quality_reason_v745(key, bucket, "winrate"))
+        issue_rate = bucket.get("issue_rate")
+        if observed >= ADAPTIVE_GATE_MIN_CLOSED_V745 and issue_rate is not None:
+            if issue_rate >= 0.35:
+                key_penalty += 6
+            elif issue_rate >= 0.25:
+                key_penalty += 4
+            if issue_rate >= 0.25:
+                reasons.append(_adaptive_quality_reason_v745(key, bucket, "issues"))
+        if key_penalty:
+            key_penalty = min(10, key_penalty)
+            penalty += key_penalty
+            evidence.append({
+                "key": f"{key[0]}:{key[1]}",
+                "penalty": key_penalty,
+                "closed": closed,
+                "observed": observed,
+                "wins": int(bucket.get("wins") or 0),
+                "losses": int(bucket.get("losses") or 0),
+                "issues": int(bucket.get("issues") or 0),
+                "winrate": round(wr, 4) if wr is not None else None,
+                "issue_rate": round(issue_rate, 4) if issue_rate is not None else None,
+            })
+    penalty = min(ADAPTIVE_GATE_MAX_PENALTY_V745, int(penalty))
+    if penalty >= ADAPTIVE_GATE_BLOCK_PENALTY_V745:
+        mode = "strong_penalty"
+    elif penalty > 0:
+        mode = "soft_penalty"
+    else:
+        mode = "observe"
+    return {
+        "mode": mode,
+        "penalty": penalty,
+        "reasons": reasons[:5],
+        "evidence": evidence[:6],
+        "min_closed": ADAPTIVE_GATE_MIN_CLOSED_V745,
+        "max_penalty": ADAPTIVE_GATE_MAX_PENALTY_V745,
+    }
+
+
+def _adaptive_quality_attach_v745(chat_id, candidate):
+    quality = (candidate or {}).get("adaptive_quality")
+    if not isinstance(quality, dict):
+        quality = _adaptive_quality_penalty_v745(chat_id, candidate)
+        if isinstance(candidate, dict):
+            candidate["adaptive_quality"] = quality
+    raw_score = _safe_float((candidate or {}).get("score"), 0) or 0
+    adjusted = max(0.0, raw_score - float(quality.get("penalty") or 0))
+    if isinstance(candidate, dict):
+        candidate["adaptive_score"] = adjusted
+    return quality
+
+
+def _adaptive_quality_row_payload_v745(quality):
+    quality = quality or {}
+    return {
+        "mode": quality.get("mode"),
+        "penalty": int(quality.get("penalty") or 0),
+        "reasons": [str(x)[:180] for x in list(quality.get("reasons") or [])[:5]],
+        "evidence": list(quality.get("evidence") or [])[:6],
+    }
+
+
+def _testnet_candidate_block_reason_v735(chat_id, candidate, active_positions=None, pos_err=None, today_count=None):
+    reason = _base_testnet_candidate_block_reason_v735_for_v745(
+        chat_id,
+        candidate,
+        active_positions=active_positions,
+        pos_err=pos_err,
+        today_count=today_count,
+    )
+    if reason:
+        return reason
+    candidate = candidate or {}
+    quality = _adaptive_quality_attach_v745(chat_id, candidate)
+    penalty = int(quality.get("penalty") or 0)
+    if penalty < ADAPTIVE_GATE_BLOCK_PENALTY_V745:
+        return None
+    ep = candidate.get("entry_plan") or {}
+    entry_now = int(ep.get("entry_now_score", ep.get("score", 0)) or 0)
+    setup = int(ep.get("setup_score", ep.get("score", 0)) or 0)
+    if min(entry_now, setup) >= ADAPTIVE_GATE_EXCEPTION_SCORE_V745:
+        return None
+    return "adaptive quality gate: waits for cleaner setup"
+
+
+def testnet_select_trade_candidate(chat_id):
+    tried = []
+    candidates = []
+    blocked = []
+    pairs = [(ticker, tf) for ticker in PAPER_TRADER_SCAN_TICKERS for tf in PAPER_TRADER_TFS]
+    workers = min(PAPER_SCAN_WORKERS, len(pairs)) or 1
+    active_positions, pos_err = _testnet_open_positions_v734()
+    today_count = _testnet_today_real_entry_count_v734(chat_id)
+
+    with _futures_v74.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="testnet-scan") as pool:
+        fut_to_pair = {
+            pool.submit(_paper_scan_one_v74, chat_id, ticker, tf): (ticker, tf)
+            for ticker, tf in pairs
+        }
+        for fut in _futures_v74.as_completed(fut_to_pair):
+            ticker, tf = fut_to_pair[fut]
+            try:
+                row, found = fut.result()
+                tried.append(row)
+                candidates.extend(found)
+            except Exception as e:
+                tried.append({"ticker": ticker, "tf": tf, "error": str(e)})
+
+    for cand in candidates:
+        quality = _adaptive_quality_attach_v745(chat_id, cand)
+        key = (cand.get("ticker"), cand.get("interval"))
+        for row in tried:
+            if (row.get("ticker"), row.get("tf")) == key:
+                current = row.get("adaptive_quality") or {}
+                if int(quality.get("penalty") or 0) > int(current.get("penalty") or -1):
+                    row["adaptive_quality"] = _adaptive_quality_row_payload_v745(quality)
+                break
+
+    candidates.sort(
+        key=lambda x: (
+            _safe_float(x.get("adaptive_score"), x.get("score", 0)) or 0,
+            _safe_float(x.get("score"), 0) or 0,
+        ),
+        reverse=True,
+    )
+    row_by_pair = {(row.get("ticker"), row.get("tf")): row for row in tried}
+    for cand in candidates:
+        reason = _testnet_candidate_block_reason_v735(
+            chat_id,
+            cand,
+            active_positions=active_positions,
+            pos_err=pos_err,
+            today_count=today_count,
+        )
+        key = (cand.get("ticker"), cand.get("interval"))
+        if reason:
+            blocked.append({
+                "ticker": cand.get("ticker"),
+                "tf": cand.get("interval"),
+                "strategy": cand.get("strategy"),
+                "score": cand.get("score"),
+                "adaptive_score": cand.get("adaptive_score"),
+                "adaptive_quality": _adaptive_quality_row_payload_v745(cand.get("adaptive_quality")),
+                "reason": reason,
+            })
+            if key in row_by_pair and not row_by_pair[key].get("testnet_gate"):
+                row_by_pair[key]["testnet_gate"] = reason
+            continue
+        cand["scan_total_candidates"] = len(candidates)
+        cand["scan_blocked"] = blocked[:PAPER_TRADER_MAX_CANDIDATES_SHOWN]
+        cand["scan_tried"] = tried
+        try:
+            data = cand.get("data") or {}
+            data["futures_context"] = build_futures_context(cand.get("ticker"), data.get("price"))
+        except Exception:
+            pass
+        return cand, tried
+
+    return None, tried
+
+
+def _demo_scan_row_for_storage_v736(row):
+    payload = _base_demo_scan_row_for_storage_v736_for_v745(row)
+    if (row or {}).get("adaptive_quality"):
+        payload["adaptive_quality"] = _adaptive_quality_row_payload_v745(row.get("adaptive_quality"))
+    return payload
+
+
+def _demo_candidate_for_storage_v736(candidate):
+    payload = _base_demo_candidate_for_storage_v736_for_v745(candidate)
+    if (candidate or {}).get("adaptive_quality"):
+        payload["adaptive_quality"] = _adaptive_quality_row_payload_v745(candidate.get("adaptive_quality"))
+        payload["adaptive_score"] = round(_safe_float(candidate.get("adaptive_score"), 0) or 0, 4)
+    return payload
+
+
+BOT_VERSION_LABEL = "v7.45 Adaptive Setup Quality Gate"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -21709,6 +22047,7 @@ RUNTIME_LAYERS = [
     ("v7.42", "closed Testnet trade PnL attribution by bot plan and Binance income window"),
     ("v7.43", "Testnet fill quality tracking and orphan protection-order cleanup"),
     ("v7.44", "compact Testnet trade lifecycle report for the public demo bot"),
+    ("v7.45", "adaptive setup quality gate from local Testnet lifecycle evidence"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -21756,6 +22095,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "testnet_pnl_attribution": _testnet_pnl_attribution_v742,
     "testnet_position_quality": _testnet_position_quality_v743,
     "format_testnet_lifecycle_report": format_testnet_lifecycle_report_v744,
+    "adaptive_quality_stats": _adaptive_quality_stats_v745,
+    "adaptive_quality_penalty": _adaptive_quality_penalty_v745,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -21942,6 +22283,10 @@ def validate_runtime_architecture():
         errors.append("testnet position quality helper is missing")
     if not callable(globals().get("format_testnet_lifecycle_report_v744")):
         errors.append("testnet lifecycle report helper is missing")
+    if not callable(globals().get("_adaptive_quality_stats_v745")):
+        errors.append("adaptive setup quality stats helper is missing")
+    if not callable(globals().get("_adaptive_quality_penalty_v745")):
+        errors.append("adaptive setup quality penalty helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):

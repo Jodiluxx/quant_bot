@@ -77,7 +77,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.44 Testnet Trade Lifecycle Report")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.45 Adaptive Setup Quality Gate")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -95,6 +95,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.42" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.43" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.44" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.45" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -110,6 +111,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("testnet_pnl_attribution", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_position_quality", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("format_testnet_lifecycle_report", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("adaptive_quality_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("adaptive_quality_penalty", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
