@@ -168,6 +168,60 @@ class AdaptiveQualityGateTests(unittest.TestCase):
         self.assertNotIn("adaptive", lines[0].lower())
         self.assertNotIn("WR", lines[0])
 
+    def test_candidate_selection_reads_adaptive_stats_once_per_scan(self) -> None:
+        old_tickers = self.bot.PAPER_TRADER_SCAN_TICKERS
+        old_tfs = self.bot.PAPER_TRADER_TFS
+        old_scan = self.bot._paper_scan_one_v74
+        old_rows = self.bot._adaptive_quality_local_rows_v745
+        old_open = self.bot._testnet_open_positions_v734
+        old_today = self.bot._testnet_today_real_entry_count_v734
+        old_base = self.bot._base_testnet_candidate_block_reason_v735_for_v745
+        old_context = self.bot.build_futures_context
+        calls = {"rows": 0}
+
+        def fake_scan(chat_id, ticker, tf):
+            cand = _candidate(ticker=ticker, interval=tf, score=91)
+            row = {
+                "ticker": ticker,
+                "tf": tf,
+                "signal": "LONG",
+                "status": "ENTER_NOW",
+                "entry_now": 91,
+                "setup": 91,
+                "rr": 1.67,
+                "gate": "",
+            }
+            return row, [cand]
+
+        def fake_rows(chat_id=None, limit=600):
+            calls["rows"] += 1
+            return []
+
+        self.bot.PAPER_TRADER_SCAN_TICKERS = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+        self.bot.PAPER_TRADER_TFS = ["15m"]
+        self.bot._paper_scan_one_v74 = fake_scan
+        self.bot._adaptive_quality_local_rows_v745 = fake_rows
+        self.bot._testnet_open_positions_v734 = lambda: ([], None)
+        self.bot._testnet_today_real_entry_count_v734 = lambda chat_id: 0
+        self.bot._base_testnet_candidate_block_reason_v735_for_v745 = lambda *args, **kwargs: None
+        self.bot.build_futures_context = lambda *args, **kwargs: {}
+        try:
+            selected, tried = self.bot.testnet_select_trade_candidate("chat-cache")
+        finally:
+            self.bot.PAPER_TRADER_SCAN_TICKERS = old_tickers
+            self.bot.PAPER_TRADER_TFS = old_tfs
+            self.bot._paper_scan_one_v74 = old_scan
+            self.bot._adaptive_quality_local_rows_v745 = old_rows
+            self.bot._testnet_open_positions_v734 = old_open
+            self.bot._testnet_today_real_entry_count_v734 = old_today
+            self.bot._base_testnet_candidate_block_reason_v735_for_v745 = old_base
+            self.bot.build_futures_context = old_context
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(len(tried), 3)
+        self.assertEqual(calls["rows"], 1)
+        self.assertFalse(self.bot._adaptive_quality_scan_stats_cache_v746)
+
 
 if __name__ == "__main__":
     unittest.main()

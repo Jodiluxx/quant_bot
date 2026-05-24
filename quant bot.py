@@ -21976,7 +21976,111 @@ def _demo_candidate_for_storage_v736(candidate):
     return payload
 
 
-BOT_VERSION_LABEL = "v7.45 Adaptive Setup Quality Gate"
+# ============================================================
+# v7.46 - ADAPTIVE GATE SCAN CACHE
+# ============================================================
+# A market scan can produce many candidates. The adaptive gate reads the local
+# lifecycle evidence once per scan, then reuses the same stats for every
+# candidate. This keeps the smarter gate from becoming a responsiveness cost.
+
+_base_adaptive_quality_penalty_v745_for_v746 = _adaptive_quality_penalty_v745
+_base_testnet_select_trade_candidate_v745_for_v746 = testnet_select_trade_candidate
+_adaptive_quality_scan_stats_cache_v746 = {}
+_adaptive_quality_scan_stats_lock_v746 = threading.RLock()
+
+
+def _adaptive_quality_cache_key_v746(chat_id):
+    try:
+        return _paper_chat_key(chat_id)
+    except Exception:
+        return str(chat_id)
+
+
+def _adaptive_quality_penalty_from_stats_v746(stats, candidate):
+    stats = stats or {}
+    penalty = 0
+    reasons = []
+    evidence = []
+    for key in _adaptive_quality_candidate_keys_v745(candidate):
+        bucket = stats.get(key)
+        if not bucket:
+            continue
+        closed = int(bucket.get("closed") or 0)
+        observed = int(bucket.get("observed") or 0)
+        key_penalty = 0
+        wr = bucket.get("winrate")
+        if closed >= ADAPTIVE_GATE_MIN_CLOSED_V745 and wr is not None:
+            if wr < 0.35:
+                key_penalty += 10
+            elif wr < 0.45:
+                key_penalty += 6
+            elif closed >= ADAPTIVE_GATE_STRONG_CLOSED_V745 and wr < 0.50:
+                key_penalty += 4
+            if key_penalty and closed >= ADAPTIVE_GATE_STRONG_CLOSED_V745:
+                key_penalty += 2
+            if key_penalty:
+                reasons.append(_adaptive_quality_reason_v745(key, bucket, "winrate"))
+        issue_rate = bucket.get("issue_rate")
+        if observed >= ADAPTIVE_GATE_MIN_CLOSED_V745 and issue_rate is not None:
+            if issue_rate >= 0.35:
+                key_penalty += 6
+            elif issue_rate >= 0.25:
+                key_penalty += 4
+            if issue_rate >= 0.25:
+                reasons.append(_adaptive_quality_reason_v745(key, bucket, "issues"))
+        if key_penalty:
+            key_penalty = min(10, key_penalty)
+            penalty += key_penalty
+            evidence.append({
+                "key": f"{key[0]}:{key[1]}",
+                "penalty": key_penalty,
+                "closed": closed,
+                "observed": observed,
+                "wins": int(bucket.get("wins") or 0),
+                "losses": int(bucket.get("losses") or 0),
+                "issues": int(bucket.get("issues") or 0),
+                "winrate": round(wr, 4) if wr is not None else None,
+                "issue_rate": round(issue_rate, 4) if issue_rate is not None else None,
+            })
+    penalty = min(ADAPTIVE_GATE_MAX_PENALTY_V745, int(penalty))
+    if penalty >= ADAPTIVE_GATE_BLOCK_PENALTY_V745:
+        mode = "strong_penalty"
+    elif penalty > 0:
+        mode = "soft_penalty"
+    else:
+        mode = "observe"
+    return {
+        "mode": mode,
+        "penalty": penalty,
+        "reasons": reasons[:5],
+        "evidence": evidence[:6],
+        "min_closed": ADAPTIVE_GATE_MIN_CLOSED_V745,
+        "max_penalty": ADAPTIVE_GATE_MAX_PENALTY_V745,
+    }
+
+
+def _adaptive_quality_penalty_v745(chat_id, candidate):
+    cache_key = _adaptive_quality_cache_key_v746(chat_id)
+    with _adaptive_quality_scan_stats_lock_v746:
+        stats = _adaptive_quality_scan_stats_cache_v746.get(cache_key)
+    if stats is None:
+        return _base_adaptive_quality_penalty_v745_for_v746(chat_id, candidate)
+    return _adaptive_quality_penalty_from_stats_v746(stats, candidate)
+
+
+def testnet_select_trade_candidate(chat_id):
+    cache_key = _adaptive_quality_cache_key_v746(chat_id)
+    stats = _adaptive_quality_stats_v745(chat_id)
+    with _adaptive_quality_scan_stats_lock_v746:
+        _adaptive_quality_scan_stats_cache_v746[cache_key] = stats
+    try:
+        return _base_testnet_select_trade_candidate_v745_for_v746(chat_id)
+    finally:
+        with _adaptive_quality_scan_stats_lock_v746:
+            _adaptive_quality_scan_stats_cache_v746.pop(cache_key, None)
+
+
+BOT_VERSION_LABEL = "v7.46 Adaptive Gate Scan Cache"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -22048,6 +22152,7 @@ RUNTIME_LAYERS = [
     ("v7.43", "Testnet fill quality tracking and orphan protection-order cleanup"),
     ("v7.44", "compact Testnet trade lifecycle report for the public demo bot"),
     ("v7.45", "adaptive setup quality gate from local Testnet lifecycle evidence"),
+    ("v7.46", "per-scan cache for adaptive setup quality evidence"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -22097,6 +22202,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_testnet_lifecycle_report": format_testnet_lifecycle_report_v744,
     "adaptive_quality_stats": _adaptive_quality_stats_v745,
     "adaptive_quality_penalty": _adaptive_quality_penalty_v745,
+    "adaptive_quality_penalty_from_stats": _adaptive_quality_penalty_from_stats_v746,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -22287,6 +22393,8 @@ def validate_runtime_architecture():
         errors.append("adaptive setup quality stats helper is missing")
     if not callable(globals().get("_adaptive_quality_penalty_v745")):
         errors.append("adaptive setup quality penalty helper is missing")
+    if not callable(globals().get("_adaptive_quality_penalty_from_stats_v746")):
+        errors.append("adaptive setup quality cached penalty helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):
