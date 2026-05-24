@@ -22241,7 +22241,72 @@ def _adaptive_quality_penalty_from_stats_v746(stats, candidate):
     }
 
 
-BOT_VERSION_LABEL = "v7.48 Adaptive Penalty Dedup"
+# ============================================================
+# v7.49 - BAYESIAN ADAPTIVE WINRATE SHRINKAGE
+# ============================================================
+# Small samples are noisy. Use a neutral prior for adaptive quality penalties
+# so 10 trades can warn the bot, but do not dominate the gate like 100 trades.
+
+_base_adaptive_quality_penalty_v745_for_v749 = _adaptive_quality_penalty_v745
+_base_adaptive_quality_raw_bucket_penalty_v748_for_v749 = _adaptive_quality_raw_bucket_penalty_v748
+
+ADAPTIVE_GATE_WINRATE_PRIOR_TRADES_V749 = int(os.getenv("ADAPTIVE_GATE_WINRATE_PRIOR_TRADES", "8"))
+ADAPTIVE_GATE_WINRATE_PRIOR_MEAN_V749 = float(os.getenv("ADAPTIVE_GATE_WINRATE_PRIOR_MEAN", "0.50"))
+
+
+def _adaptive_quality_adjusted_winrate_v749(bucket):
+    bucket = bucket or {}
+    closed = int(bucket.get("closed") or 0)
+    wins = int(bucket.get("wins") or 0)
+    prior_n = max(0, int(ADAPTIVE_GATE_WINRATE_PRIOR_TRADES_V749))
+    prior_mean = min(1.0, max(0.0, float(ADAPTIVE_GATE_WINRATE_PRIOR_MEAN_V749)))
+    if closed <= 0 and prior_n <= 0:
+        return None
+    return (wins + prior_n * prior_mean) / max(1, closed + prior_n)
+
+
+def _adaptive_quality_raw_bucket_penalty_v748(key, bucket):
+    closed = int((bucket or {}).get("closed") or 0)
+    observed = int((bucket or {}).get("observed") or 0)
+    key_penalty = 0
+    reasons = []
+    wr = _adaptive_quality_adjusted_winrate_v749(bucket)
+    if closed >= ADAPTIVE_GATE_MIN_CLOSED_V745 and wr is not None:
+        if wr < 0.35:
+            key_penalty += 10
+        elif wr < 0.45:
+            key_penalty += 6
+        elif closed >= ADAPTIVE_GATE_STRONG_CLOSED_V745 and wr < 0.50:
+            key_penalty += 4
+        if key_penalty and closed >= ADAPTIVE_GATE_STRONG_CLOSED_V745:
+            key_penalty += 2
+        if key_penalty:
+            raw_wr = (bucket or {}).get("winrate")
+            reason = _adaptive_quality_reason_v745(key, bucket, "winrate")
+            if raw_wr is not None:
+                reason += f" | adj {wr * 100:.0f}%"
+            reasons.append(reason)
+    issue_rate = (bucket or {}).get("issue_rate")
+    if observed >= ADAPTIVE_GATE_MIN_CLOSED_V745 and issue_rate is not None:
+        if issue_rate >= 0.35:
+            key_penalty += 6
+        elif issue_rate >= 0.25:
+            key_penalty += 4
+        if issue_rate >= 0.25:
+            reasons.append(_adaptive_quality_reason_v745(key, bucket, "issues"))
+    return min(10, key_penalty), reasons
+
+
+def _adaptive_quality_penalty_v745(chat_id, candidate):
+    cache_key = _adaptive_quality_cache_key_v746(chat_id)
+    with _adaptive_quality_scan_stats_lock_v746:
+        stats = _adaptive_quality_scan_stats_cache_v746.get(cache_key)
+    if stats is None:
+        stats = _adaptive_quality_stats_v745(chat_id)
+    return _adaptive_quality_penalty_from_stats_v746(stats, candidate)
+
+
+BOT_VERSION_LABEL = "v7.49 Bayesian Adaptive Gate"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -22316,6 +22381,7 @@ RUNTIME_LAYERS = [
     ("v7.46", "per-scan cache for adaptive setup quality evidence"),
     ("v7.47", "freshness window for adaptive setup quality evidence"),
     ("v7.48", "de-duplicate related adaptive setup quality penalties"),
+    ("v7.49", "Bayesian winrate shrinkage for adaptive setup quality"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -22368,6 +22434,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "adaptive_quality_penalty_from_stats": _adaptive_quality_penalty_from_stats_v746,
     "adaptive_quality_row_is_fresh": _adaptive_quality_row_is_fresh_v747,
     "adaptive_quality_bucket_group": _adaptive_quality_bucket_group_v748,
+    "adaptive_quality_adjusted_winrate": _adaptive_quality_adjusted_winrate_v749,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -22564,6 +22631,8 @@ def validate_runtime_architecture():
         errors.append("adaptive setup quality freshness helper is missing")
     if not callable(globals().get("_adaptive_quality_bucket_group_v748")):
         errors.append("adaptive setup quality bucket grouping helper is missing")
+    if not callable(globals().get("_adaptive_quality_adjusted_winrate_v749")):
+        errors.append("adaptive setup quality adjusted winrate helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):

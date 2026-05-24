@@ -269,6 +269,26 @@ class AdaptiveQualityGateTests(unittest.TestCase):
         self.assertLess(quality["penalty"], self.bot.ADAPTIVE_GATE_MAX_PENALTY_V745)
         self.assertEqual(len({item["group"] for item in quality["evidence"]}), len(quality["evidence"]))
 
+    def test_bayesian_winrate_shrinkage_softens_small_samples(self) -> None:
+        bucket = {
+            "wins": 3,
+            "losses": 7,
+            "flats": 0,
+            "issues": 0,
+            "closed": 10,
+            "observed": 10,
+            "winrate": 0.30,
+            "issue_rate": 0.0,
+        }
+
+        adjusted = self.bot._adaptive_quality_adjusted_winrate_v749(bucket)
+        penalty, reasons = self.bot._adaptive_quality_raw_bucket_penalty_v748(("ticker", "BTCUSDT"), bucket)
+
+        self.assertGreater(adjusted, bucket["winrate"])
+        self.assertLess(adjusted, 0.45)
+        self.assertEqual(penalty, 6)
+        self.assertIn("adj", reasons[0])
+
 
 if __name__ == "__main__":
     unittest.main()
