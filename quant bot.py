@@ -18406,7 +18406,11 @@ def format_signal_summary(data, ticker, interval):
     levels = _simple_risk_levels(data)
     confidence = int(data.get("confidence") or 0)
     prob = _prob_value_v712(data.get("prob")) if "_prob_value_v712" in globals() else data.get("prob")
-    prob_text = f"{prob * 100:.1f}%" if isinstance(prob, (int, float)) and prob > 0 else "n/a"
+    if decision in {"LONG", "SHORT"}:
+        prob_text = f"{prob * 100:.1f}%" if isinstance(prob, (int, float)) and prob > 0 else "нет оценки"
+        probability_line = f"• Confidence: <b>{confidence}/100</b> | Вероятность направления: <b>{prob_text}</b>"
+    else:
+        probability_line = f"• Confidence: <b>{confidence}/100</b> | Вероятность: <b>не считается для WAIT</b>"
     support, risks = _ui_directional_lists(data, idea.lower(), 2)
     status = _ui_status_plain(plan.get("status"))
 
@@ -18417,7 +18421,7 @@ def format_signal_summary(data, ticker, interval):
         "<b>Решение:</b>",
         f"• Сейчас: <b>{'вход возможен' if decision in {'LONG', 'SHORT'} else 'ждать'}</b>",
         f"• Причина: {_ui_short_text(_simple_entry_action(data), 120)}",
-        f"• Confidence: <b>{confidence}/100</b> | Вероятность: <b>{prob_text}</b>",
+        probability_line,
         "",
         "<b>Вход и риск:</b>",
         f"• Цена: <b>{fmt_price(levels.get('entry'), ticker)}</b>",
@@ -22306,7 +22310,7 @@ def _adaptive_quality_penalty_v745(chat_id, candidate):
     return _adaptive_quality_penalty_from_stats_v746(stats, candidate)
 
 
-BOT_VERSION_LABEL = "v7.49 Bayesian Adaptive Gate"
+BOT_VERSION_LABEL = "v7.50 WAIT Probability UI Clarity"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -22382,6 +22386,7 @@ RUNTIME_LAYERS = [
     ("v7.47", "freshness window for adaptive setup quality evidence"),
     ("v7.48", "de-duplicate related adaptive setup quality penalties"),
     ("v7.49", "Bayesian winrate shrinkage for adaptive setup quality"),
+    ("v7.50", "clear probability wording for WAIT signal cards"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
