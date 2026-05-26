@@ -277,13 +277,14 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.53 Auto Signals Match Demo Gate")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.54 Robust Testnet Submit Pipeline")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("send_or_edit", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("auto_signal_scan_candidates", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("auto_signal_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_stage_error", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
@@ -306,6 +307,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.51" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.52" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.53" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.54" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)

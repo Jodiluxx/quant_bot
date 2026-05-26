@@ -119,6 +119,78 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
         self.assertEqual(protection[0]["triggerPrice"], "653.35")
         self.assertEqual(protection[1]["quantity"], "0.01")
 
+    def test_submit_testnet_trade_runs_real_entry_after_validation(self) -> None:
+        plan = self._plan()
+        calls = []
+
+        old_build = self.bot._build_testnet_trade_plan_v734
+        old_entry_test = self.bot.submit_testnet_order_test
+        old_protection_test = self.bot.submit_testnet_protection_order_tests
+        old_leverage = self.bot.submit_testnet_set_leverage
+        old_real_entry = self.bot.submit_testnet_real_entry_order
+        old_real_protection = self.bot.submit_testnet_real_protection_orders
+        old_monitor = self.bot._testnet_monitor_for_plan_v737
+        old_record = self.bot._record_testnet_trade_attempt_v734
+
+        try:
+            self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: plan
+            self.bot.submit_testnet_order_test = lambda p: calls.append("entry_test") or {"ok": True, "submitted": True}
+            self.bot.submit_testnet_protection_order_tests = lambda p: calls.append("protection_test") or {"ok": True, "orders": [{"ok": True}]}
+            self.bot.submit_testnet_set_leverage = lambda p: calls.append("leverage") or {"ok": True}
+            self.bot.submit_testnet_real_entry_order = lambda p, validation: calls.append("real_entry") or {"ok": True, "submitted": True, "response": {"orderId": 1}}
+            self.bot.submit_testnet_real_protection_orders = lambda p, entry: calls.append("real_protection") or {"ok": True, "orders": [{"ok": True}]}
+            self.bot._testnet_monitor_for_plan_v737 = lambda p, delay_sec=0.2: {"status": "PROTECTED"}
+            self.bot._record_testnet_trade_attempt_v734 = lambda *args, **kwargs: calls.append("record")
+
+            result = self.bot._submit_testnet_trade_v734("1", {"ticker": "BTCUSDT"})
+        finally:
+            self.bot._build_testnet_trade_plan_v734 = old_build
+            self.bot.submit_testnet_order_test = old_entry_test
+            self.bot.submit_testnet_protection_order_tests = old_protection_test
+            self.bot.submit_testnet_set_leverage = old_leverage
+            self.bot.submit_testnet_real_entry_order = old_real_entry
+            self.bot.submit_testnet_real_protection_orders = old_real_protection
+            self.bot._testnet_monitor_for_plan_v737 = old_monitor
+            self.bot._record_testnet_trade_attempt_v734 = old_record
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stage"], "done")
+        self.assertEqual(
+            calls,
+            ["entry_test", "protection_test", "leverage", "real_entry", "real_protection", "record"],
+        )
+
+    def test_submit_testnet_trade_reports_protection_validation_exception(self) -> None:
+        plan = self._plan()
+        calls = []
+
+        old_build = self.bot._build_testnet_trade_plan_v734
+        old_entry_test = self.bot.submit_testnet_order_test
+        old_protection_test = self.bot.submit_testnet_protection_order_tests
+        old_record = self.bot._record_testnet_trade_attempt_v734
+
+        try:
+            self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: plan
+            self.bot.submit_testnet_order_test = lambda p: {"ok": True, "submitted": True}
+
+            def broken_protection(_plan):
+                raise RuntimeError("boom")
+
+            self.bot.submit_testnet_protection_order_tests = broken_protection
+            self.bot._record_testnet_trade_attempt_v734 = lambda *args, **kwargs: calls.append(args)
+
+            result = self.bot._submit_testnet_trade_v734("1", {"ticker": "BTCUSDT"})
+        finally:
+            self.bot._build_testnet_trade_plan_v734 = old_build
+            self.bot.submit_testnet_order_test = old_entry_test
+            self.bot.submit_testnet_protection_order_tests = old_protection_test
+            self.bot._record_testnet_trade_attempt_v734 = old_record
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "validation")
+        self.assertIn("protection_test exception", result["reason"])
+        self.assertEqual(len(calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

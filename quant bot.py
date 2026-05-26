@@ -22676,7 +22676,131 @@ def build_auto_signals_message(chat_id):
     return "\n".join(header) + "\n" + format_signal_summary(data, ticker, interval)
 
 
-BOT_VERSION_LABEL = "v7.53 Auto Signals Match Demo Gate"
+# ============================================================
+# v7.54 - ROBUST TESTNET SUBMIT PIPELINE
+# ============================================================
+# The demo bot must not stop after entry /order/test. Run and record every
+# stage explicitly so a valid candidate reaches real Testnet entry, or the user
+# sees the exact stage that blocked it.
+
+_base_submit_testnet_trade_v753_for_v754 = _submit_testnet_trade_v734
+
+
+def _testnet_stage_error_v754(plan, stage, exc):
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan_id": (plan or {}).get("plan_id"),
+        "mode": execution_mode().get("mode"),
+        "submitted": False,
+        "ok": False,
+        "skipped": True,
+        "stage": stage,
+        "reason": f"{stage} exception: {type(exc).__name__}: {str(exc)[:220]}",
+        "error": str(exc)[:500],
+    }
+
+
+def _testnet_result_reason_v754(result):
+    result = result or {}
+    reason = result.get("reason") or result.get("error")
+    response = result.get("response")
+    if isinstance(response, dict):
+        reason = reason or response.get("msg") or response.get("code")
+    orders = result.get("orders")
+    if not reason and isinstance(orders, list):
+        bad = [x for x in orders if not x.get("ok")]
+        if bad:
+            reason = "; ".join(
+                f"{x.get('label') or 'order'}: {x.get('reason') or x.get('status_code')}"
+                for x in bad[:3]
+            )
+    return str(reason or "unknown")[:500]
+
+
+def _submit_testnet_trade_v734(chat_id, candidate):
+    try:
+        plan = _build_testnet_trade_plan_v734(chat_id, candidate)
+    except Exception as e:
+        return {"ok": False, "stage": "plan", "plan": {}, "reason": f"plan exception: {type(e).__name__}: {str(e)[:220]}"}
+
+    if plan.get("blockers"):
+        _execution_record_plan_v715(plan)
+        return {"ok": False, "stage": "plan", "plan": plan, "reason": "; ".join(plan.get("blockers") or [])}
+
+    try:
+        entry_test = submit_testnet_order_test(plan)
+    except Exception as e:
+        entry_test = _testnet_stage_error_v754(plan, "entry_test", e)
+
+    try:
+        protection_test = submit_testnet_protection_order_tests(plan)
+    except Exception as e:
+        protection_test = _testnet_stage_error_v754(plan, "protection_test", e)
+
+    if not entry_test.get("ok") or not protection_test.get("ok"):
+        _record_testnet_trade_attempt_v734(plan, entry_test, protection_test)
+        return {
+            "ok": False,
+            "stage": "validation",
+            "plan": plan,
+            "entry_test": entry_test,
+            "protection_test": protection_test,
+            "reason": _testnet_result_reason_v754(entry_test)
+            if not entry_test.get("ok")
+            else _testnet_result_reason_v754(protection_test),
+        }
+
+    try:
+        leverage = submit_testnet_set_leverage(plan)
+    except Exception as e:
+        leverage = _testnet_stage_error_v754(plan, "leverage", e)
+
+    try:
+        entry = submit_testnet_real_entry_order(plan, {"entry_test_ok": True, "protection_test_ok": True})
+    except Exception as e:
+        entry = _testnet_stage_error_v754(plan, "real_entry", e)
+
+    protection = None
+    emergency = None
+    if entry.get("ok"):
+        try:
+            protection = submit_testnet_real_protection_orders(plan, entry)
+        except Exception as e:
+            protection = _testnet_stage_error_v754(plan, "real_protection", e)
+        if not protection.get("ok"):
+            try:
+                emergency = submit_testnet_emergency_close_order(plan, "protection_failed_after_entry")
+            except Exception as e:
+                emergency = _testnet_stage_error_v754(plan, "emergency_close", e)
+
+    _record_testnet_trade_attempt_v734(plan, entry_test, protection_test, leverage, entry, protection, emergency)
+
+    if not entry.get("ok"):
+        return {"ok": False, "stage": "entry", "plan": plan, "entry": entry, "reason": _testnet_result_reason_v754(entry)}
+    if not protection or not protection.get("ok"):
+        return {
+            "ok": False,
+            "stage": "protection",
+            "plan": plan,
+            "entry": entry,
+            "protection": protection,
+            "emergency": emergency,
+            "reason": _testnet_result_reason_v754(protection or {"reason": "protection order rejected"}),
+        }
+
+    monitor = _testnet_monitor_for_plan_v737(plan, delay_sec=0.2)
+    return {
+        "ok": True,
+        "stage": "done",
+        "plan": plan,
+        "entry": entry,
+        "protection": protection,
+        "leverage": leverage,
+        "monitor": monitor,
+    }
+
+
+BOT_VERSION_LABEL = "v7.54 Robust Testnet Submit Pipeline"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -22756,6 +22880,7 @@ RUNTIME_LAYERS = [
     ("v7.51", "clear Testnet lifecycle statuses and plan-only report rows"),
     ("v7.52", "multi-TF auto-signal scanner sends only actionable LONG/SHORT"),
     ("v7.53", "auto-signal alerts reuse the same Testnet gate as demo trading"),
+    ("v7.54", "robust Testnet submit pipeline records validation, entry and protection stages"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -22768,6 +22893,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_signal_summary": format_signal_summary,
     "auto_signal_scan_candidates": _auto_signal_scan_candidates_v752,
     "auto_signal_select_trade_candidate": _auto_signal_select_trade_candidate_v753,
+    "testnet_stage_error": _testnet_stage_error_v754,
     "format_signal_analysis_details": format_signal_analysis_details,
     "format_entry_plan_analysis": format_entry_plan_analysis,
     "format_auto_digest": format_auto_digest,
@@ -22988,6 +23114,8 @@ def validate_runtime_architecture():
         errors.append("multi-TF auto signal scanner is missing")
     if not callable(globals().get("_auto_signal_select_trade_candidate_v753")):
         errors.append("auto signal Testnet gate selector is missing")
+    if not callable(globals().get("_testnet_stage_error_v754")):
+        errors.append("robust Testnet submit error helper is missing")
     if not callable(globals().get("cancel_testnet_open_orders_v741")):
         errors.append("testnet cancel-open-orders helper is missing")
     if not callable(globals().get("cancel_testnet_algo_orders_v741")):
