@@ -46,6 +46,26 @@ if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_BOT_TOKEN)) {
     exit 1
 }
 
+$BotRuntimePattern = [Regex]::Escape($BotFile)
+$ExistingBots = @(
+    Get-CimInstance Win32_Process |
+        Where-Object {
+            $_.Name -match 'python' -and
+            $_.CommandLine -and
+            ($_.CommandLine -match $BotRuntimePattern)
+        }
+)
+if ($ExistingBots.Count -gt 0) {
+    Write-Host "[FAIL] Quant Bot is already running." -ForegroundColor Red
+    Write-Host "Stop the existing bot process before starting another one:"
+    foreach ($Process in $ExistingBots) {
+        Write-Host ("  PID {0}: {1}" -f $Process.ProcessId, $Process.CommandLine)
+    }
+    Write-Host 'PowerShell stop command:'
+    Write-Host '  Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match "bot_runtime.py" } | ForEach-Object { Stop-Process -Id $_.ProcessId }'
+    exit 1
+}
+
 Write-Host "Starting bot..." -ForegroundColor Green
 & $Python $BotFile
 exit $LASTEXITCODE
