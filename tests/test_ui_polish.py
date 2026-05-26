@@ -78,12 +78,123 @@ class TelegramUiPolishTests(unittest.TestCase):
         for callback in {"menu_signal", "menu_autobot", "paper_run_now", "auto_settings"}:
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
+    def test_auto_signal_defaults_scan_all_tf_every_15m(self) -> None:
+        chat_id = "auto-defaults-v752"
+        st = self.bot._get_auto_task_settings(chat_id, "signals")
+        st["send_interval"] = "30m"
+        st["tf"] = "30m"
+
+        self.bot._simple_sync_public_auto_settings(chat_id)
+
+        self.assertEqual(st["send_interval"], "15m")
+        self.assertIsNone(st["tf"])
+        self.assertEqual(self.bot.PAPER_TRADER_TFS, self.bot.AUTO_SIGNAL_SCAN_TFS_V752)
+        self.assertIn("4h", self.bot.AUTO_SIGNAL_SCAN_TFS_V752)
+        rows = self.bot.auto_task_keyboard(chat_id, "signals")["inline_keyboard"]
+        callbacks = [button["callback_data"] for row in rows for button in row]
+        self.assertNotIn("auto_choose_iv_signals", callbacks)
+
+    def test_auto_signal_scan_is_silent_when_no_actionable_signal(self) -> None:
+        old_tickers = self.bot.PAPER_TRADER_SCAN_TICKERS
+        old_tfs = self.bot.AUTO_SIGNAL_SCAN_TFS_V752
+        old_scan = self.bot._paper_scan_one_v74
+        calls = []
+
+        def fake_scan(chat_id, ticker, tf):
+            calls.append((ticker, tf))
+            return {
+                "ticker": ticker,
+                "tf": tf,
+                "status": "WAIT_RETEST",
+                "entry_now": 50,
+                "setup": 70,
+                "rr": 1.6,
+            }, []
+
+        self.bot.PAPER_TRADER_SCAN_TICKERS = ["BTCUSDT"]
+        self.bot.AUTO_SIGNAL_SCAN_TFS_V752 = ["5m", "15m", "4h"]
+        self.bot._paper_scan_one_v74 = fake_scan
+        try:
+            msg = self.bot.build_auto_signals_message("auto-silent-v752")
+        finally:
+            self.bot.PAPER_TRADER_SCAN_TICKERS = old_tickers
+            self.bot.AUTO_SIGNAL_SCAN_TFS_V752 = old_tfs
+            self.bot._paper_scan_one_v74 = old_scan
+
+        self.assertIsNone(msg)
+        self.assertCountEqual(calls, [("BTCUSDT", "5m"), ("BTCUSDT", "15m"), ("BTCUSDT", "4h")])
+
+    def test_auto_signal_sends_best_actionable_multi_tf_candidate(self) -> None:
+        old_tickers = self.bot.PAPER_TRADER_SCAN_TICKERS
+        old_tfs = self.bot.AUTO_SIGNAL_SCAN_TFS_V752
+        old_scan = self.bot._paper_scan_one_v74
+
+        def fake_scan(chat_id, ticker, tf):
+            row = {
+                "ticker": ticker,
+                "tf": tf,
+                "status": "ENTER_NOW" if tf == "4h" else "WAIT_RETEST",
+                "entry_now": 88 if tf == "4h" else 40,
+                "setup": 90 if tf == "4h" else 60,
+                "rr": 1.8 if tf == "4h" else 1.2,
+            }
+            if tf != "4h":
+                return row, []
+            data = {
+                "signal": "LONG",
+                "direction": "long",
+                "price": 100.0,
+                "confidence": 82,
+                "prob": 0.68,
+                "bull_args": ["Цена > EMA20"],
+                "bear_args": ["Цена внутри Bollinger Bands"],
+                "risk_levels": {"sl": 98.0, "tp1": 103.0, "tp2": 105.0, "rr_ratio": 1.8},
+                "risk_blockers": [],
+                "entry_plan": {
+                    "status": "ENTER_NOW",
+                    "entry_now_score": 88,
+                    "setup_score": 90,
+                    "rr_now": 1.8,
+                    "sl": 98.0,
+                    "tp1": 103.0,
+                    "tp2": 105.0,
+                },
+            }
+            candidate = {
+                "ticker": ticker,
+                "interval": tf,
+                "direction": "long",
+                "strategy": "strict_quality_v1",
+                "score": 110,
+                "data": data,
+                "entry_plan": data["entry_plan"],
+                "reason": "strict quality test",
+            }
+            return row, [candidate]
+
+        self.bot.PAPER_TRADER_SCAN_TICKERS = ["BTCUSDT"]
+        self.bot.AUTO_SIGNAL_SCAN_TFS_V752 = ["5m", "4h"]
+        self.bot._paper_scan_one_v74 = fake_scan
+        try:
+            msg = self.bot.build_auto_signals_message("auto-ready-v752")
+        finally:
+            self.bot.PAPER_TRADER_SCAN_TICKERS = old_tickers
+            self.bot.AUTO_SIGNAL_SCAN_TFS_V752 = old_tfs
+            self.bot._paper_scan_one_v74 = old_scan
+
+        self.assertIsNotNone(msg)
+        self.assertIn("Авто-сигнал", msg)
+        self.assertIn("BTCUSDT", msg)
+        self.assertIn("LONG", msg)
+        self.assertNotIn("WAIT", msg.splitlines()[0])
+
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.51 Testnet Lifecycle Status Clarity")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.52 Multi-TF Actionable Auto Signals")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("send_or_edit", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("auto_signal_scan_candidates", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
@@ -104,6 +215,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.49" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.50" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.51" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.52" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)

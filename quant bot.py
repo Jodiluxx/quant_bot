@@ -22423,7 +22423,217 @@ def format_testnet_lifecycle_report_v744(chat_id, limit=8):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.51 Testnet Lifecycle Status Clarity"
+# ============================================================
+# v7.52 - MULTI-TF ACTIONABLE AUTO SIGNALS
+# ============================================================
+# Auto signals now scan the same TF range as the demo bot and send nothing on
+# WAIT. Demo trading also includes 4h candidates while keeping Binance safety
+# validation mandatory before any Testnet order.
+
+_base_simple_sync_public_auto_settings_v751_for_v752 = _simple_sync_public_auto_settings
+_base_auto_task_keyboard_v751_for_v752 = auto_task_keyboard
+_base_build_auto_signals_message_v751_for_v752 = build_auto_signals_message
+_base_task_status_line_v751_for_v752 = _task_status_line
+_base_format_main_status_v751_for_v752 = format_main_status
+_base_auto_settings_text_v751_for_v752 = auto_settings_text
+
+AUTO_SIGNAL_SCAN_TFS_V752 = ["5m", "15m", "30m", "45m", "1h", "4h"]
+AUTO_SIGNAL_MIN_ENTRY_NOW_V752 = int(os.getenv("AUTO_SIGNAL_MIN_ENTRY_NOW", "75"))
+AUTO_SIGNAL_MIN_CONFIDENCE_V752 = int(os.getenv("AUTO_SIGNAL_MIN_CONFIDENCE", "65"))
+AUTO_SIGNAL_MIN_RR_V752 = float(os.getenv("AUTO_SIGNAL_MIN_RR", "1.50"))
+AUTO_SIGNAL_DUPLICATE_COOLDOWN_MIN_V752 = int(os.getenv("AUTO_SIGNAL_DUPLICATE_COOLDOWN_MIN", "60"))
+
+PAPER_TRADER_TFS = list(AUTO_SIGNAL_SCAN_TFS_V752)
+AUTO_DEFAULT_PLAN_V78["signals"] = {"enabled": True, "send_interval": "15m", "tf": None}
+if "signals" in AUTO_TASKS:
+    AUTO_TASKS["signals"]["default_interval"] = "15m"
+    AUTO_TASKS["signals"]["default_tf"] = None
+if "paper_trader" in AUTO_TASKS:
+    AUTO_TASKS["paper_trader"]["default_interval"] = "15m"
+    AUTO_TASKS["paper_trader"]["default_tf"] = None
+
+
+def _auto_scan_tf_label_v752():
+    return "5m-4h"
+
+
+def _simple_sync_public_auto_settings(chat_id):
+    _base_simple_sync_public_auto_settings_v751_for_v752(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    sig["enabled"] = bool(sig.get("enabled", True))
+    sig["send_interval"] = "15m"
+    sig["tf"] = None
+    paper = _get_auto_task_settings(chat_id, "paper_trader")
+    paper["enabled"] = bool(paper.get("enabled", True))
+    paper["send_interval"] = "15m"
+    paper["tf"] = None
+
+
+def _task_status_line(chat_id, task_key):
+    if task_key == "signals":
+        st = _get_auto_task_settings(chat_id, "signals")
+        enabled = "ON" if st.get("enabled") else "OFF"
+        return f"📡 Авто-сигналы: <b>{enabled}</b> | 15m | TF {_auto_scan_tf_label_v752()} | only LONG/SHORT"
+    if task_key == "paper_trader":
+        st = _get_auto_task_settings(chat_id, "paper_trader")
+        enabled = "ON" if st.get("enabled") else "OFF"
+        return f"🤖 Демо-бот: <b>{enabled}</b> | 15m | TF {_auto_scan_tf_label_v752()}"
+    return _base_task_status_line_v751_for_v752(chat_id, task_key)
+
+
+def format_main_status(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    positions = len(_paper_positions(chat_id)) if "_paper_positions" in globals() else 0
+    auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
+    sig = _get_auto_task_settings(chat_id, "signals")
+    paper = _get_auto_task_settings(chat_id, "paper_trader")
+    return "\n".join([
+        "🏠 <b>Главное меню</b>",
+        "",
+        f"Ручной сигнал: <b>{_ui_ticker_short(ticker)}USDT</b> | TF <b>{_ui_tf_short(interval)}</b>",
+        f"Авто: <b>{auto_state}</b> | Demo Testnet: <b>{_simple_demo_status()}</b>",
+        f"Позиции: <b>{positions}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        "",
+        "<b>Уведомления:</b>",
+        f"• Авто-сигналы: <b>{'ON' if sig.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | 15m | TF {_auto_scan_tf_label_v752()} | only LONG/SHORT",
+        f"• Демо-бот: <b>{'ON' if paper.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | 15m | TF {_auto_scan_tf_label_v752()}",
+    ])
+
+
+def auto_settings_text(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    return "\n".join([
+        "⚙️ <b>Уведомления</b>",
+        "",
+        f"Общий статус: <b>{'ON' if chat_id in auto_chat_ids else 'OFF'}</b>",
+        "• Авто-сигналы: <b>{}</b> | 15m | TF {} | только LONG/SHORT".format(
+            "ON" if _get_auto_task_settings(chat_id, "signals").get("enabled") else "OFF",
+            _auto_scan_tf_label_v752(),
+        ),
+        "• Демо-бот: <b>{}</b> | 15m | TF {}".format(
+            "ON" if _get_auto_task_settings(chat_id, "paper_trader").get("enabled") else "OFF",
+            _auto_scan_tf_label_v752(),
+        ),
+        "",
+        "WAIT-сигналы не отправляются. Если уверенного LONG/SHORT нет, бот молчит.",
+    ])
+
+
+def auto_task_keyboard(chat_id, task_key):
+    _simple_sync_public_auto_settings(chat_id)
+    if task_key == "signals":
+        st = _get_auto_task_settings(chat_id, "signals")
+        rows = [[{"text": "⛔ Выключить" if st.get("enabled") else "✅ Включить", "callback_data": f"auto_tog_{task_key}"}]]
+        rows += [
+            [{"text": f"⏰ Частота: 15m", "callback_data": f"auto_task_{task_key}"}],
+            [{"text": f"📊 TF scan: {_auto_scan_tf_label_v752()}", "callback_data": f"auto_task_{task_key}"}],
+            [{"text": "◀️ Уведомления", "callback_data": "auto_settings"}],
+            [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+        ]
+        return {"inline_keyboard": rows}
+    return _base_auto_task_keyboard_v751_for_v752(chat_id, task_key)
+
+
+def _auto_signal_candidate_passes_v752(candidate):
+    candidate = candidate or {}
+    data = candidate.get("data") or {}
+    ep = candidate.get("entry_plan") or {}
+    direction = str(candidate.get("direction") or data.get("direction") or "").lower()
+    status = str(ep.get("status") or "").upper()
+    entry_now = int(ep.get("entry_now_score", ep.get("score", 0)) or 0)
+    setup = int(ep.get("setup_score", ep.get("score", 0)) or 0)
+    confidence = int(data.get("confidence", 0) or 0)
+    rr = _safe_float(ep.get("rr_now"), 0) or _safe_float((data.get("risk_levels") or {}).get("rr_ratio"), 0) or 0
+    if direction not in {"long", "short"}:
+        return False
+    if status != "ENTER_NOW":
+        return False
+    if list(data.get("risk_blockers") or []):
+        return False
+    if entry_now < AUTO_SIGNAL_MIN_ENTRY_NOW_V752:
+        return False
+    if confidence < AUTO_SIGNAL_MIN_CONFIDENCE_V752:
+        return False
+    if rr < AUTO_SIGNAL_MIN_RR_V752:
+        return False
+    candidate["auto_signal_metrics"] = {
+        "entry_now": entry_now,
+        "setup": setup,
+        "confidence": confidence,
+        "rr": rr,
+    }
+    return True
+
+
+def _auto_signal_candidate_score_v752(candidate):
+    metrics = candidate.get("auto_signal_metrics") or {}
+    strategy = str(candidate.get("strategy") or "")
+    bonus = 8 if strategy == "strict_quality_v1" else (3 if strategy == "trend_follow_v1" else 0)
+    return (
+        _safe_float(candidate.get("score"), 0) or 0,
+        int(metrics.get("entry_now") or 0) + int(metrics.get("setup") or 0) + bonus,
+        _safe_float(metrics.get("rr"), 0) or 0,
+    )
+
+
+def _auto_signal_scan_candidates_v752(chat_id):
+    tried = []
+    candidates = []
+    pairs = [(ticker, tf) for ticker in PAPER_TRADER_SCAN_TICKERS for tf in AUTO_SIGNAL_SCAN_TFS_V752]
+    workers = min(PAPER_SCAN_WORKERS, len(pairs)) or 1
+    with _futures_v74.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="auto-signal-scan") as pool:
+        fut_to_pair = {
+            pool.submit(_paper_scan_one_v74, chat_id, ticker, tf): (ticker, tf)
+            for ticker, tf in pairs
+        }
+        for fut in _futures_v74.as_completed(fut_to_pair):
+            ticker, tf = fut_to_pair[fut]
+            try:
+                row, found = fut.result()
+                tried.append(row)
+                for cand in list(found or []):
+                    if _auto_signal_candidate_passes_v752(cand):
+                        candidates.append(cand)
+            except Exception as e:
+                print(f"  [auto-signal-v752] scan error {ticker} {tf}: {e}")
+                tried.append({"ticker": ticker, "tf": tf, "error": str(e)})
+    candidates.sort(key=_auto_signal_candidate_score_v752, reverse=True)
+    return candidates, tried
+
+
+def build_auto_signals_message(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    candidates, _ = _auto_signal_scan_candidates_v752(chat_id)
+    if not candidates:
+        return None
+    cooldown = AUTO_SIGNAL_DUPLICATE_COOLDOWN_MIN_V752 * 60
+    group_id = f"auto_signal_v752_{chat_id}"
+    selected = None
+    for cand in candidates:
+        ticker = cand.get("ticker")
+        interval = cand.get("interval")
+        direction = str(cand.get("direction") or "").upper()
+        strategy = str(cand.get("strategy") or "")
+        signature = f"{direction}:{strategy}"
+        if should_send_signal(ticker, interval, signature, cooldown, group_id):
+            selected = cand
+            break
+    if not selected:
+        return None
+    data = selected.get("data") or {}
+    ticker = selected.get("ticker")
+    interval = selected.get("interval")
+    header = [
+        "🔔 <b>Авто-сигнал</b>",
+        f"Scan: <b>{len(PAPER_TRADER_SCAN_TICKERS)} активов × {len(AUTO_SIGNAL_SCAN_TFS_V752)} TF</b> | каждые <b>15m</b>",
+        "",
+    ]
+    return "\n".join(header) + "\n" + format_signal_summary(data, ticker, interval)
+
+
+BOT_VERSION_LABEL = "v7.52 Multi-TF Actionable Auto Signals"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -22501,6 +22711,7 @@ RUNTIME_LAYERS = [
     ("v7.49", "Bayesian winrate shrinkage for adaptive setup quality"),
     ("v7.50", "clear probability wording for WAIT signal cards"),
     ("v7.51", "clear Testnet lifecycle statuses and plan-only report rows"),
+    ("v7.52", "multi-TF auto-signal scanner sends only actionable LONG/SHORT"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -22511,6 +22722,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "full_analyze": full_analyze,
     "format_msg": format_msg,
     "format_signal_summary": format_signal_summary,
+    "auto_signal_scan_candidates": _auto_signal_scan_candidates_v752,
     "format_signal_analysis_details": format_signal_analysis_details,
     "format_entry_plan_analysis": format_entry_plan_analysis,
     "format_auto_digest": format_auto_digest,
@@ -22727,6 +22939,8 @@ def validate_runtime_architecture():
         errors.append("telegram edit helper is missing")
     if not callable(globals().get("send_or_edit")):
         errors.append("telegram send_or_edit helper is missing")
+    if not callable(globals().get("_auto_signal_scan_candidates_v752")):
+        errors.append("multi-TF auto signal scanner is missing")
     if not callable(globals().get("cancel_testnet_open_orders_v741")):
         errors.append("testnet cancel-open-orders helper is missing")
     if not callable(globals().get("cancel_testnet_algo_orders_v741")):
