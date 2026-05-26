@@ -97,7 +97,10 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_auto_signal_scan_is_silent_when_no_actionable_signal(self) -> None:
         old_tickers = self.bot.PAPER_TRADER_SCAN_TICKERS
         old_tfs = self.bot.AUTO_SIGNAL_SCAN_TFS_V752
+        old_paper_tfs = self.bot.PAPER_TRADER_TFS
         old_scan = self.bot._paper_scan_one_v74
+        old_open = self.bot._testnet_open_positions_v734
+        old_today = self.bot._testnet_today_real_entry_count_v734
         calls = []
 
         def fake_scan(chat_id, ticker, tf):
@@ -113,13 +116,19 @@ class TelegramUiPolishTests(unittest.TestCase):
 
         self.bot.PAPER_TRADER_SCAN_TICKERS = ["BTCUSDT"]
         self.bot.AUTO_SIGNAL_SCAN_TFS_V752 = ["5m", "15m", "4h"]
+        self.bot.PAPER_TRADER_TFS = ["5m", "15m", "4h"]
         self.bot._paper_scan_one_v74 = fake_scan
+        self.bot._testnet_open_positions_v734 = lambda: ([], None)
+        self.bot._testnet_today_real_entry_count_v734 = lambda chat_id=None: 0
         try:
             msg = self.bot.build_auto_signals_message("auto-silent-v752")
         finally:
             self.bot.PAPER_TRADER_SCAN_TICKERS = old_tickers
             self.bot.AUTO_SIGNAL_SCAN_TFS_V752 = old_tfs
+            self.bot.PAPER_TRADER_TFS = old_paper_tfs
             self.bot._paper_scan_one_v74 = old_scan
+            self.bot._testnet_open_positions_v734 = old_open
+            self.bot._testnet_today_real_entry_count_v734 = old_today
 
         self.assertIsNone(msg)
         self.assertCountEqual(calls, [("BTCUSDT", "5m"), ("BTCUSDT", "15m"), ("BTCUSDT", "4h")])
@@ -127,7 +136,11 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_auto_signal_sends_best_actionable_multi_tf_candidate(self) -> None:
         old_tickers = self.bot.PAPER_TRADER_SCAN_TICKERS
         old_tfs = self.bot.AUTO_SIGNAL_SCAN_TFS_V752
+        old_paper_tfs = self.bot.PAPER_TRADER_TFS
         old_scan = self.bot._paper_scan_one_v74
+        old_open = self.bot._testnet_open_positions_v734
+        old_today = self.bot._testnet_today_real_entry_count_v734
+        old_plan = self.bot._build_testnet_trade_plan_v734
 
         def fake_scan(chat_id, ticker, tf):
             row = {
@@ -174,27 +187,103 @@ class TelegramUiPolishTests(unittest.TestCase):
 
         self.bot.PAPER_TRADER_SCAN_TICKERS = ["BTCUSDT"]
         self.bot.AUTO_SIGNAL_SCAN_TFS_V752 = ["5m", "4h"]
+        self.bot.PAPER_TRADER_TFS = ["5m", "4h"]
         self.bot._paper_scan_one_v74 = fake_scan
+        self.bot._testnet_open_positions_v734 = lambda: ([], None)
+        self.bot._testnet_today_real_entry_count_v734 = lambda chat_id=None: 0
+        self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: {"blockers": []}
         try:
             msg = self.bot.build_auto_signals_message("auto-ready-v752")
         finally:
             self.bot.PAPER_TRADER_SCAN_TICKERS = old_tickers
             self.bot.AUTO_SIGNAL_SCAN_TFS_V752 = old_tfs
+            self.bot.PAPER_TRADER_TFS = old_paper_tfs
             self.bot._paper_scan_one_v74 = old_scan
+            self.bot._testnet_open_positions_v734 = old_open
+            self.bot._testnet_today_real_entry_count_v734 = old_today
+            self.bot._build_testnet_trade_plan_v734 = old_plan
 
         self.assertIsNotNone(msg)
         self.assertIn("Авто-сигнал", msg)
         self.assertIn("BTCUSDT", msg)
         self.assertIn("LONG", msg)
+        self.assertIn("совпадает с демо-ботом", msg)
         self.assertNotIn("WAIT", msg.splitlines()[0])
 
+    def test_auto_signal_is_silent_when_demo_trade_gate_blocks_candidate(self) -> None:
+        old_tickers = self.bot.PAPER_TRADER_SCAN_TICKERS
+        old_tfs = self.bot.AUTO_SIGNAL_SCAN_TFS_V752
+        old_paper_tfs = self.bot.PAPER_TRADER_TFS
+        old_scan = self.bot._paper_scan_one_v74
+        old_open = self.bot._testnet_open_positions_v734
+        old_today = self.bot._testnet_today_real_entry_count_v734
+        old_plan = self.bot._build_testnet_trade_plan_v734
+
+        def fake_scan(chat_id, ticker, tf):
+            data = {
+                "signal": "SHORT",
+                "direction": "short",
+                "price": 1.0,
+                "confidence": 86,
+                "prob": 0.71,
+                "bull_args": ["test"],
+                "bear_args": ["test"],
+                "risk_levels": {"sl": 1.02, "tp1": 0.97, "tp2": 0.95, "rr_ratio": 1.67},
+                "risk_blockers": [],
+                "entry_plan": {
+                    "status": "ENTER_NOW",
+                    "entry_now_score": 97,
+                    "setup_score": 97,
+                    "rr_now": 1.67,
+                },
+            }
+            candidate = {
+                "ticker": ticker,
+                "interval": tf,
+                "direction": "short",
+                "strategy": "strict_quality_v1",
+                "score": 120,
+                "data": data,
+                "entry_plan": data["entry_plan"],
+                "reason": "strong test setup",
+            }
+            return {
+                "ticker": ticker,
+                "tf": tf,
+                "status": "ENTER_NOW",
+                "entry_now": 97,
+                "setup": 97,
+                "rr": 1.67,
+            }, [candidate]
+
+        self.bot.PAPER_TRADER_SCAN_TICKERS = ["XRPUSDT"]
+        self.bot.AUTO_SIGNAL_SCAN_TFS_V752 = ["45m"]
+        self.bot.PAPER_TRADER_TFS = ["45m"]
+        self.bot._paper_scan_one_v74 = fake_scan
+        self.bot._testnet_open_positions_v734 = lambda: ([{}] * self.bot.PAPER_TRADER_MAX_POSITIONS, None)
+        self.bot._testnet_today_real_entry_count_v734 = lambda chat_id=None: 0
+        self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: {"blockers": []}
+        try:
+            msg = self.bot.build_auto_signals_message("auto-blocked-v753")
+        finally:
+            self.bot.PAPER_TRADER_SCAN_TICKERS = old_tickers
+            self.bot.AUTO_SIGNAL_SCAN_TFS_V752 = old_tfs
+            self.bot.PAPER_TRADER_TFS = old_paper_tfs
+            self.bot._paper_scan_one_v74 = old_scan
+            self.bot._testnet_open_positions_v734 = old_open
+            self.bot._testnet_today_real_entry_count_v734 = old_today
+            self.bot._build_testnet_trade_plan_v734 = old_plan
+
+        self.assertIsNone(msg)
+
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.52 Multi-TF Actionable Auto Signals")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.53 Auto Signals Match Demo Gate")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("send_or_edit", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("auto_signal_scan_candidates", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("auto_signal_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
@@ -216,6 +305,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.50" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.51" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.52" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.53" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)

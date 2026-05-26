@@ -22633,7 +22633,50 @@ def build_auto_signals_message(chat_id):
     return "\n".join(header) + "\n" + format_signal_summary(data, ticker, interval)
 
 
-BOT_VERSION_LABEL = "v7.52 Multi-TF Actionable Auto Signals"
+# ============================================================
+# v7.53 - AUTO SIGNALS USE TESTNET TRADE GATE
+# ============================================================
+# A public "auto-signal" should not say "entry is possible" when the demo bot
+# would reject the same candidate. Reuse the Testnet candidate gate for the
+# alert, then keep the alert card compact.
+
+_base_build_auto_signals_message_v752_for_v753 = build_auto_signals_message
+
+
+def _auto_signal_select_trade_candidate_v753(chat_id):
+    candidate, tried = testnet_select_trade_candidate(chat_id)
+    if not candidate:
+        return None, tried
+    if not _auto_signal_candidate_passes_v752(candidate):
+        return None, tried
+    return candidate, tried
+
+
+def build_auto_signals_message(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    selected, _ = _auto_signal_select_trade_candidate_v753(chat_id)
+    if not selected:
+        return None
+    ticker = selected.get("ticker")
+    interval = selected.get("interval")
+    direction = str(selected.get("direction") or "").upper()
+    strategy = str(selected.get("strategy") or "")
+    signature = f"{direction}:{strategy}:trade_gate_ok"
+    cooldown = AUTO_SIGNAL_DUPLICATE_COOLDOWN_MIN_V752 * 60
+    group_id = f"auto_signal_v753_{chat_id}"
+    if not should_send_signal(ticker, interval, signature, cooldown, group_id):
+        return None
+    data = selected.get("data") or {}
+    header = [
+        "🔔 <b>Авто-сигнал</b>",
+        f"Scan: <b>{len(PAPER_TRADER_SCAN_TICKERS)} активов × {len(AUTO_SIGNAL_SCAN_TFS_V752)} TF</b> | каждые <b>15m</b>",
+        "Gate: <b>совпадает с демо-ботом</b>",
+        "",
+    ]
+    return "\n".join(header) + "\n" + format_signal_summary(data, ticker, interval)
+
+
+BOT_VERSION_LABEL = "v7.53 Auto Signals Match Demo Gate"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -22712,6 +22755,7 @@ RUNTIME_LAYERS = [
     ("v7.50", "clear probability wording for WAIT signal cards"),
     ("v7.51", "clear Testnet lifecycle statuses and plan-only report rows"),
     ("v7.52", "multi-TF auto-signal scanner sends only actionable LONG/SHORT"),
+    ("v7.53", "auto-signal alerts reuse the same Testnet gate as demo trading"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -22723,6 +22767,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_msg": format_msg,
     "format_signal_summary": format_signal_summary,
     "auto_signal_scan_candidates": _auto_signal_scan_candidates_v752,
+    "auto_signal_select_trade_candidate": _auto_signal_select_trade_candidate_v753,
     "format_signal_analysis_details": format_signal_analysis_details,
     "format_entry_plan_analysis": format_entry_plan_analysis,
     "format_auto_digest": format_auto_digest,
@@ -22941,6 +22986,8 @@ def validate_runtime_architecture():
         errors.append("telegram send_or_edit helper is missing")
     if not callable(globals().get("_auto_signal_scan_candidates_v752")):
         errors.append("multi-TF auto signal scanner is missing")
+    if not callable(globals().get("_auto_signal_select_trade_candidate_v753")):
+        errors.append("auto signal Testnet gate selector is missing")
     if not callable(globals().get("cancel_testnet_open_orders_v741")):
         errors.append("testnet cancel-open-orders helper is missing")
     if not callable(globals().get("cancel_testnet_algo_orders_v741")):
