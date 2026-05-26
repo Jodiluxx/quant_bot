@@ -5,7 +5,7 @@
 From PowerShell or CMD:
 
 ```powershell
-cd "D:\Trading project"
+cd "D:\Mine\Trading project"
 .\run_bot.bat -CheckOnly
 ```
 
@@ -14,13 +14,13 @@ This checks Python, dependencies, syntax, safe import, runtime architecture, and
 If you prefer direct PowerShell script execution:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\Trading project\run_bot.ps1" -CheckOnly
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\Mine\Trading project\run_bot.ps1" -CheckOnly
 ```
 
 ## 2. Install or update dependencies
 
 ```powershell
-cd "D:\Trading project"
+cd "D:\Mine\Trading project"
 .\run_bot.bat -Install -CheckOnly
 ```
 
@@ -45,14 +45,23 @@ The launcher starts `bot_runtime.py`. That entrypoint goes through the
 validates the active runtime before Telegram polling starts.
 
 ```powershell
-cd "D:\Trading project"
+cd "D:\Mine\Trading project"
+.\run_bot.bat
+```
+
+The launcher refuses to start a second `bot_runtime.py` process. If Telegram
+keeps showing old behaviour, stop all running bot processes first:
+
+```powershell
+cd "D:\Mine\Trading project"
+.\stop_bot.bat
 .\run_bot.bat
 ```
 
 Optional direct package launch:
 
 ```powershell
-cd "D:\Trading project"
+cd "D:\Mine\Trading project"
 python -m quant_bot
 ```
 
