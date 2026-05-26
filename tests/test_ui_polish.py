@@ -79,7 +79,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.50 WAIT Probability UI Clarity")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.51 Testnet Lifecycle Status Clarity")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -103,6 +103,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.48" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.49" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.50" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.51" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -118,6 +119,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("testnet_pnl_attribution", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_position_quality", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("format_testnet_lifecycle_report", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_lifecycle_display_status", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("adaptive_quality_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("adaptive_quality_penalty", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("adaptive_quality_penalty_from_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -318,6 +320,7 @@ class TelegramUiPolishTests(unittest.TestCase):
                     "ticker": "BTCUSDT",
                     "direction": "long",
                     "interval": "15m",
+                    "created_at": "2026-05-26T00:00:00+00:00",
                     "status": "CLOSED_WIN",
                     "pnl": {"status": "ATTRIBUTED", "outcome": "WIN", "realized_usdt": 1.25},
                 },
@@ -325,6 +328,7 @@ class TelegramUiPolishTests(unittest.TestCase):
                     "ticker": "ETHUSDT",
                     "direction": "short",
                     "interval": "30m",
+                    "created_at": "2026-05-26T00:15:00+00:00",
                     "status": "CLOSED_UNATTRIBUTED",
                     "monitor": {"status": "NO_POSITION"},
                     "pnl": {"status": "NO_INCOME_MATCH"},
@@ -342,6 +346,51 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("PNL_PENDING", text)
         self.assertNotIn("plan_id", text)
         self.assertNotIn("orderId", text)
+
+    def test_lifecycle_report_explains_plan_only_and_rejected_rows(self) -> None:
+        old_stats = self.bot._testnet_public_stats_v738
+        old_rows = self.bot._testnet_lifecycle_recent_v740
+        old_hint = self.bot._testnet_plan_failure_hint_v751
+        try:
+            self.bot._testnet_public_stats_v738 = lambda chat_id: {
+                "open": 0,
+                "bot_closed": 0,
+                "attributed_closed": 0,
+                "bot_winrate": None,
+                "bot_net": 0,
+            }
+            self.bot._testnet_lifecycle_recent_v740 = lambda chat_id=None, limit=50: [
+                {
+                    "plan_id": "old-plan",
+                    "ticker": "BNBUSDT",
+                    "direction": "short",
+                    "interval": "15m",
+                    "created_at": "2026-05-18T02:15:00+00:00",
+                    "status": "ENTRY_REJECTED",
+                    "pnl": {"status": "UNATTRIBUTED"},
+                },
+                {
+                    "plan_id": "new-plan",
+                    "ticker": "ETHUSDT",
+                    "direction": "long",
+                    "interval": "5m",
+                    "created_at": "2026-05-26T02:15:00+00:00",
+                    "status": "PLANNED",
+                    "pnl": {"status": "UNATTRIBUTED"},
+                },
+            ]
+            self.bot._testnet_plan_failure_hint_v751 = lambda plan_id: "Precision is over the maximum defined for this asset."
+            text = self.bot.format_testnet_lifecycle_report_v744(987654321)
+        finally:
+            self.bot._testnet_public_stats_v738 = old_stats
+            self.bot._testnet_lifecycle_recent_v740 = old_rows
+            self.bot._testnet_plan_failure_hint_v751 = old_hint
+
+        self.assertIn("PLAN_ONLY", text)
+        self.assertIn("plan only, order not sent", text)
+        self.assertIn("ENTRY_REJECTED", text)
+        self.assertIn("Precision is over", text)
+        self.assertLess(text.find("ETH"), text.find("BNB"))
 
     def test_autobot_keyboard_uses_report_button_without_new_callback(self) -> None:
         keyboard = self.bot.autobot_keyboard(987654321)

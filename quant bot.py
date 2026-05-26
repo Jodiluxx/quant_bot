@@ -22310,7 +22310,120 @@ def _adaptive_quality_penalty_v745(chat_id, candidate):
     return _adaptive_quality_penalty_from_stats_v746(stats, candidate)
 
 
-BOT_VERSION_LABEL = "v7.50 WAIT Probability UI Clarity"
+# ============================================================
+# v7.51 - TESTNET LIFECYCLE STATUS CLARITY
+# ============================================================
+# The public report should distinguish a local plan from an exchange-accepted
+# trade. It also sorts by plan creation time, not lifecycle rebuild time.
+
+_base_testnet_lifecycle_result_text_v744_for_v751 = _testnet_lifecycle_result_text_v744
+_base_format_testnet_lifecycle_report_v744_for_v751 = format_testnet_lifecycle_report_v744
+
+
+def _testnet_lifecycle_created_dt_v751(row):
+    row = row or {}
+    raw = row.get("created_at") or row.get("updated_at")
+    if not raw:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        dt = _safety_parse_dt_v716(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _testnet_lifecycle_display_status_v751(row):
+    status = _testnet_lifecycle_user_status_v744(row)
+    return {
+        "PLANNED": "PLAN_ONLY",
+        "ENTRY_ACCEPTED": "ENTRY_ACCEPTED",
+        "ENTRY_REJECTED": "ENTRY_REJECTED",
+        "OPEN_PROTECTED": "OPEN_PROTECTED",
+        "PNL_PENDING": "PNL_PENDING",
+        "ORPHAN_CLEANED": "ORPHAN_CLEANED",
+        "NEEDS_ATTENTION": "NEEDS_ATTENTION",
+        "EMERGENCY_CLOSED": "EMERGENCY_CLOSED",
+        "CLOSED_WIN": "CLOSED_WIN",
+        "CLOSED_LOSS": "CLOSED_LOSS",
+        "CLOSED_FLAT": "CLOSED_FLAT",
+    }.get(status, status or "PLAN_ONLY")
+
+
+def _testnet_plan_failure_hint_v751(plan_id):
+    if not plan_id:
+        return ""
+    try:
+        events = [
+            e for e in (_execution_load_state_v715().get("events") or [])
+            if e.get("plan_id") == plan_id
+            and e.get("ok") is False
+        ]
+    except Exception:
+        events = []
+    for event in events:
+        response = event.get("response") or {}
+        msg = response.get("msg") or event.get("reason")
+        code = response.get("code")
+        if msg:
+            prefix = f"{code}: " if code is not None else ""
+            return _ui_short_text(prefix + str(msg), 120)
+        for order in list(event.get("orders") or []):
+            response = order.get("response") or {}
+            msg = response.get("msg") or order.get("reason")
+            code = response.get("code")
+            if msg:
+                prefix = f"{code}: " if code is not None else ""
+                return _ui_short_text(prefix + str(msg), 120)
+    return ""
+
+
+def _testnet_lifecycle_result_text_v744(row):
+    status = _testnet_lifecycle_user_status_v744(row)
+    if status == "PLANNED":
+        return "plan only, order not sent"
+    if status == "ENTRY_REJECTED":
+        hint = _testnet_plan_failure_hint_v751((row or {}).get("plan_id"))
+        return "rejected" + (f": {hint}" if hint else "")
+    return _base_testnet_lifecycle_result_text_v744_for_v751(row)
+
+
+def format_testnet_lifecycle_report_v744(chat_id, limit=8):
+    stats = _testnet_public_stats_v738(chat_id)
+    rows = list(_testnet_lifecycle_recent_v740(chat_id, 50) or [])
+    rows.sort(key=_testnet_lifecycle_created_dt_v751, reverse=True)
+    linked = int(stats.get("attributed_closed") or 0)
+    pending = max(0, int(stats.get("bot_closed") or 0) - linked)
+    issues = _testnet_lifecycle_issue_count_v744(rows)
+    lines = [
+        "📒 <b>Demo Trade Report</b>",
+        "",
+        f"Открытые: <b>{stats.get('open', 0)}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"Закрытые: <b>{stats.get('bot_closed', 0)}</b> | PnL linked: <b>{linked}</b>",
+        _testnet_public_pnl_line_v738(stats),
+        f"Сверяется: <b>{pending}</b> | Проблемы в журнале: <b>{issues}</b>",
+        "",
+        "<b>Последние планы / сделки:</b>",
+    ]
+    if not rows:
+        lines.append("Пока нет Testnet-сделок бота.")
+        return "\n".join(lines)
+    for row in rows[: int(limit)]:
+        ticker = _ui_ticker_short(row.get("ticker"))
+        direction = str(row.get("direction") or "").upper()
+        interval = _ui_tf_short(row.get("interval"))
+        status = _testnet_lifecycle_display_status_v751(row)
+        result = _testnet_lifecycle_result_text_v744(row)
+        lines.append(f"• {ticker} {direction} {interval} | <b>{_ui_html(status)}</b> | {_ui_html(result)}")
+    if pending:
+        lines += ["", "PnL может появиться позже: Binance income иногда приходит не сразу."]
+    if issues:
+        lines += ["", "Проблемные статусы записаны локально. PLAN_ONLY не является открытой сделкой."]
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.51 Testnet Lifecycle Status Clarity"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -22387,6 +22500,7 @@ RUNTIME_LAYERS = [
     ("v7.48", "de-duplicate related adaptive setup quality penalties"),
     ("v7.49", "Bayesian winrate shrinkage for adaptive setup quality"),
     ("v7.50", "clear probability wording for WAIT signal cards"),
+    ("v7.51", "clear Testnet lifecycle statuses and plan-only report rows"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -22434,6 +22548,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "testnet_pnl_attribution": _testnet_pnl_attribution_v742,
     "testnet_position_quality": _testnet_position_quality_v743,
     "format_testnet_lifecycle_report": format_testnet_lifecycle_report_v744,
+    "testnet_lifecycle_display_status": _testnet_lifecycle_display_status_v751,
     "adaptive_quality_stats": _adaptive_quality_stats_v745,
     "adaptive_quality_penalty": _adaptive_quality_penalty_v745,
     "adaptive_quality_penalty_from_stats": _adaptive_quality_penalty_from_stats_v746,
@@ -22626,6 +22741,8 @@ def validate_runtime_architecture():
         errors.append("testnet position quality helper is missing")
     if not callable(globals().get("format_testnet_lifecycle_report_v744")):
         errors.append("testnet lifecycle report helper is missing")
+    if not callable(globals().get("_testnet_lifecycle_display_status_v751")):
+        errors.append("testnet lifecycle display status helper is missing")
     if not callable(globals().get("_adaptive_quality_stats_v745")):
         errors.append("adaptive setup quality stats helper is missing")
     if not callable(globals().get("_adaptive_quality_penalty_v745")):
