@@ -60,8 +60,10 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("📡 <b>BTCUSDT — WAIT</b>", text)
         self.assertIn("идея: <b>LONG</b>", text)
         self.assertIn("ждать ретест", text)
-        self.assertIn("Вероятность: <b>не считается для WAIT</b>", text)
-        self.assertNotIn("Вероятность: <b>n/a</b>", text)
+        self.assertIn("WAIT", text)
+        self.assertIn("SL/TP", text)
+        self.assertIn("не считается без сделки", text)
+        self.assertNotIn("n/a", text)
         self.assertIn("Цена &lt; EMA200", text)
         self.assertLessEqual(len(text.splitlines()), 28)
 
@@ -277,7 +279,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.55 Runtime Diagnostics Screen")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.56 Clear WAIT Signals + Exact Runtime Diagnostics")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -285,6 +287,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("auto_signal_scan_candidates", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("auto_signal_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_stage_error", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("runtime_bot_runtime_path", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("runtime_bot_processes", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("runtime_latest_chain", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("format_runtime_diagnostics", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -312,6 +315,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.53" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.54" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.55" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.56" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -381,7 +385,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot.execution_mode = old_mode
             self.bot._testnet_short_status_v733 = old_short_status
 
-        self.assertIn("v7.55", text)
+        self.assertIn("v7.56", text)
         self.assertIn("PID", text)
         self.assertIn("<b>2</b>", text)
         self.assertIn("BNB", text)
@@ -389,6 +393,28 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("real-entry", text)
         self.assertIn("entry:OK", text)
         self.assertIn("real:--", text)
+
+    def test_runtime_process_scan_matches_exact_project_bot_runtime(self) -> None:
+        old_rows = self.bot._runtime_python_process_rows_v756
+        old_path = self.bot._runtime_bot_runtime_path_v756
+        try:
+            self.bot._runtime_bot_runtime_path_v756 = lambda: os.path.normcase(r"D:\Mine\Trading project\bot_runtime.py")
+            self.bot._runtime_python_process_rows_v756 = lambda: [
+                {
+                    "ProcessId": 111,
+                    "CommandLine": r'D:\Mine\Trading project\.venv\Scripts\python.exe D:\Mine\Trading project\bot_runtime.py',
+                },
+                {
+                    "ProcessId": 222,
+                    "CommandLine": r'C:\Python314\python.exe C:\Temp\bot_runtime.py',
+                },
+            ]
+            processes = self.bot._runtime_bot_processes_v755()
+        finally:
+            self.bot._runtime_python_process_rows_v756 = old_rows
+            self.bot._runtime_bot_runtime_path_v756 = old_path
+
+        self.assertEqual([p["pid"] for p in processes], [111])
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
         calls = []

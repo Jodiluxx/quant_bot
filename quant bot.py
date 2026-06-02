@@ -18406,11 +18406,12 @@ def format_signal_summary(data, ticker, interval):
     levels = _simple_risk_levels(data)
     confidence = int(data.get("confidence") or 0)
     prob = _prob_value_v712(data.get("prob")) if "_prob_value_v712" in globals() else data.get("prob")
-    if decision in {"LONG", "SHORT"}:
+    is_actionable = decision in {"LONG", "SHORT"}
+    if is_actionable:
         prob_text = f"{prob * 100:.1f}%" if isinstance(prob, (int, float)) and prob > 0 else "нет оценки"
         probability_line = f"• Confidence: <b>{confidence}/100</b> | Вероятность направления: <b>{prob_text}</b>"
     else:
-        probability_line = f"• Confidence: <b>{confidence}/100</b> | Вероятность: <b>не считается для WAIT</b>"
+        probability_line = f"• Сила анализа: <b>{confidence}/100</b> | Вход: <b>WAIT</b>"
     support, risks = _ui_directional_lists(data, idea.lower(), 2)
     status = _ui_status_plain(plan.get("status"))
 
@@ -18419,21 +18420,28 @@ def format_signal_summary(data, ticker, interval):
         f"TF: <b>{_ui_tf_short(interval)}</b> | идея: <b>{idea}</b>",
         "",
         "<b>Решение:</b>",
-        f"• Сейчас: <b>{'вход возможен' if decision in {'LONG', 'SHORT'} else 'ждать'}</b>",
+        f"• Сейчас: <b>{'вход возможен' if is_actionable else 'ждать'}</b>",
         f"• Причина: {_ui_short_text(_simple_entry_action(data), 120)}",
         probability_line,
         "",
         "<b>Вход и риск:</b>",
-        f"• Цена: <b>{fmt_price(levels.get('entry'), ticker)}</b>",
     ]
-    if levels.get("zone_low") and levels.get("zone_high"):
-        lines.append(f"• Зона: <b>{fmt_price(levels.get('zone_low'), ticker)} — {fmt_price(levels.get('zone_high'), ticker)}</b>")
-    lines += [
-        f"• SL: <b>{fmt_price(levels.get('sl'), ticker)}</b>",
-        f"• TP1: <b>{fmt_price(levels.get('tp1'), ticker)}</b>",
-        f"• TP2: <b>{fmt_price(levels.get('tp2'), ticker)}</b>",
-        f"• RR: <b>{levels.get('rr', 0):.2f}x</b>",
-    ]
+    if is_actionable:
+        lines.append(f"• Цена: <b>{fmt_price(levels.get('entry'), ticker)}</b>")
+        if levels.get("zone_low") and levels.get("zone_high"):
+            lines.append(f"• Зона: <b>{fmt_price(levels.get('zone_low'), ticker)} — {fmt_price(levels.get('zone_high'), ticker)}</b>")
+        lines += [
+            f"• SL: <b>{fmt_price(levels.get('sl'), ticker)}</b>",
+            f"• TP1: <b>{fmt_price(levels.get('tp1'), ticker)}</b>",
+            f"• TP2: <b>{fmt_price(levels.get('tp2'), ticker)}</b>",
+            f"• RR: <b>{levels.get('rr', 0):.2f}x</b>",
+        ]
+    else:
+        lines += [
+            f"• Цена: <b>{fmt_price(levels.get('entry'), ticker)}</b>",
+            "• SL/TP: <b>нет, пока вход запрещён</b>",
+            "• RR: <b>не считается без сделки</b>",
+        ]
     if support:
         lines += ["", "<b>За идею:</b>"]
         lines += [f"• {_ui_short_text(x, 90)}" for x in support]
@@ -22811,38 +22819,50 @@ _base_autobot_keyboard_v754_for_v755 = autobot_keyboard
 _base_async_handle_update_v754_for_v755 = async_handle_update
 
 
+def _runtime_bot_runtime_path_v756():
+    return os.path.normcase(os.path.abspath(os.path.join(os.path.dirname(__file__), "bot_runtime.py")))
+
+
+def _runtime_python_process_rows_v756():
+    import subprocess
+    cmd = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.Name -match 'python' -and $_.CommandLine } | "
+        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", cmd],
+        capture_output=True,
+        text=True,
+        timeout=4,
+    )
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return []
+    payload = json.loads(raw)
+    return payload if isinstance(payload, list) else [payload]
+
+
 def _runtime_bot_processes_v755():
     current_pid = os.getpid()
     if os.name != "nt":
         return [{"pid": current_pid, "current": True, "command": "current python process"}]
     try:
-        import subprocess
-        cmd = (
-            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-            "Get-CimInstance Win32_Process | "
-            "Where-Object { $_.Name -match 'python' -and $_.CommandLine -match 'bot_runtime.py' } | "
-            "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
-        )
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", cmd],
-            capture_output=True,
-            text=True,
-            timeout=4,
-        )
-        raw = (result.stdout or "").strip()
-        if not raw:
-            return [{"pid": current_pid, "current": True, "command": "current python process"}]
-        payload = json.loads(raw)
-        rows = payload if isinstance(payload, list) else [payload]
+        runtime_path = _runtime_bot_runtime_path_v756()
         out = []
-        for row in rows:
+        for row in _runtime_python_process_rows_v756():
+            command = str(row.get("CommandLine") or "")
+            normalized_command = os.path.normcase(command.replace('"', ""))
+            if runtime_path not in normalized_command:
+                continue
             pid = int(row.get("ProcessId") or 0)
             out.append({
                 "pid": pid,
                 "current": pid == current_pid,
-                "command": str(row.get("CommandLine") or "")[:220],
+                "command": command[:220],
             })
-        return out or [{"pid": current_pid, "current": True, "command": "current python process"}]
+        return out or [{"pid": current_pid, "current": True, "command": f"current process; exact runtime path not found: {os.path.basename(runtime_path)}"}]
     except Exception as e:
         return [{"pid": current_pid, "current": True, "command": f"process scan failed: {type(e).__name__}"}]
 
@@ -22997,7 +23017,7 @@ async def async_handle_update(session, update, sem):
         raise
 
 
-BOT_VERSION_LABEL = "v7.55 Runtime Diagnostics Screen"
+BOT_VERSION_LABEL = "v7.56 Clear WAIT Signals + Exact Runtime Diagnostics"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -23079,6 +23099,7 @@ RUNTIME_LAYERS = [
     ("v7.53", "auto-signal alerts reuse the same Testnet gate as demo trading"),
     ("v7.54", "robust Testnet submit pipeline records validation, entry and protection stages"),
     ("v7.55", "runtime diagnostics for process count, Testnet flags and latest execution stage"),
+    ("v7.56", "clear WAIT signal cards and exact bot_runtime process matching"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -23092,6 +23113,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "auto_signal_scan_candidates": _auto_signal_scan_candidates_v752,
     "auto_signal_select_trade_candidate": _auto_signal_select_trade_candidate_v753,
     "testnet_stage_error": _testnet_stage_error_v754,
+    "runtime_bot_runtime_path": _runtime_bot_runtime_path_v756,
     "runtime_bot_processes": _runtime_bot_processes_v755,
     "runtime_latest_chain": _runtime_latest_chain_v755,
     "format_runtime_diagnostics": format_runtime_diagnostics,
@@ -23319,6 +23341,8 @@ def validate_runtime_architecture():
         errors.append("robust Testnet submit error helper is missing")
     if not callable(globals().get("_runtime_bot_processes_v755")):
         errors.append("runtime process diagnostics helper is missing")
+    if not callable(globals().get("_runtime_bot_runtime_path_v756")):
+        errors.append("runtime exact path diagnostics helper is missing")
     if not callable(globals().get("_runtime_latest_chain_v755")):
         errors.append("runtime execution-chain diagnostics helper is missing")
     if not callable(globals().get("format_runtime_diagnostics")):
