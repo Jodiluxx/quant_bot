@@ -22829,7 +22829,7 @@ def _runtime_python_process_rows_v756():
         "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
         "Get-CimInstance Win32_Process | "
         "Where-Object { $_.Name -match 'python' -and $_.CommandLine } | "
-        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+        "Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"
     )
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-Command", cmd],
@@ -22859,10 +22859,19 @@ def _runtime_bot_processes_v755():
             pid = int(row.get("ProcessId") or 0)
             out.append({
                 "pid": pid,
+                "parent_pid": int(row.get("ParentProcessId") or 0),
                 "current": pid == current_pid,
                 "command": command[:220],
             })
-        return out or [{"pid": current_pid, "current": True, "command": f"current process; exact runtime path not found: {os.path.basename(runtime_path)}"}]
+        if len(out) > 1:
+            exact_pids = {row["pid"] for row in out}
+            wrapper_parent_pids = {
+                row["parent_pid"]
+                for row in out
+                if row.get("parent_pid") in exact_pids
+            }
+            out = [row for row in out if row["pid"] not in wrapper_parent_pids]
+        return out or [{"pid": current_pid, "parent_pid": 0, "current": True, "command": f"current process; exact runtime path not found: {os.path.basename(runtime_path)}"}]
     except Exception as e:
         return [{"pid": current_pid, "current": True, "command": f"process scan failed: {type(e).__name__}"}]
 
@@ -23017,7 +23026,7 @@ async def async_handle_update(session, update, sem):
         raise
 
 
-BOT_VERSION_LABEL = "v7.56 Clear WAIT Signals + Exact Runtime Diagnostics"
+BOT_VERSION_LABEL = "v7.57 Runtime Wrapper Process Collapse"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -23100,6 +23109,7 @@ RUNTIME_LAYERS = [
     ("v7.54", "robust Testnet submit pipeline records validation, entry and protection stages"),
     ("v7.55", "runtime diagnostics for process count, Testnet flags and latest execution stage"),
     ("v7.56", "clear WAIT signal cards and exact bot_runtime process matching"),
+    ("v7.57", "collapse Python launcher wrappers in runtime diagnostics process count"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

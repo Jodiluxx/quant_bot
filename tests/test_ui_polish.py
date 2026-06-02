@@ -279,7 +279,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.56 Clear WAIT Signals + Exact Runtime Diagnostics")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.57 Runtime Wrapper Process Collapse")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -316,6 +316,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.54" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.55" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.56" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.57" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -385,7 +386,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot.execution_mode = old_mode
             self.bot._testnet_short_status_v733 = old_short_status
 
-        self.assertIn("v7.56", text)
+        self.assertIn("v7.57", text)
         self.assertIn("PID", text)
         self.assertIn("<b>2</b>", text)
         self.assertIn("BNB", text)
@@ -402,10 +403,12 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._runtime_python_process_rows_v756 = lambda: [
                 {
                     "ProcessId": 111,
+                    "ParentProcessId": 1,
                     "CommandLine": r'D:\Mine\Trading project\.venv\Scripts\python.exe D:\Mine\Trading project\bot_runtime.py',
                 },
                 {
                     "ProcessId": 222,
+                    "ParentProcessId": 2,
                     "CommandLine": r'C:\Python314\python.exe C:\Temp\bot_runtime.py',
                 },
             ]
@@ -415,6 +418,30 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._runtime_bot_runtime_path_v756 = old_path
 
         self.assertEqual([p["pid"] for p in processes], [111])
+
+    def test_runtime_process_scan_collapses_python_launcher_wrapper(self) -> None:
+        old_rows = self.bot._runtime_python_process_rows_v756
+        old_path = self.bot._runtime_bot_runtime_path_v756
+        try:
+            self.bot._runtime_bot_runtime_path_v756 = lambda: os.path.normcase(r"D:\Mine\Trading project\bot_runtime.py")
+            self.bot._runtime_python_process_rows_v756 = lambda: [
+                {
+                    "ProcessId": 19832,
+                    "ParentProcessId": 19980,
+                    "CommandLine": r'"D:\Mine\Trading project\.venv\Scripts\python.exe" "D:\Mine\Trading project\bot_runtime.py"',
+                },
+                {
+                    "ProcessId": 16276,
+                    "ParentProcessId": 19832,
+                    "CommandLine": r'"C:\Users\12345\AppData\Roaming\uv\python\cpython-3.14-windows-x86_64-none\python.exe" "D:\Mine\Trading project\bot_runtime.py"',
+                },
+            ]
+            processes = self.bot._runtime_bot_processes_v755()
+        finally:
+            self.bot._runtime_python_process_rows_v756 = old_rows
+            self.bot._runtime_bot_runtime_path_v756 = old_path
+
+        self.assertEqual([p["pid"] for p in processes], [16276])
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
         calls = []
