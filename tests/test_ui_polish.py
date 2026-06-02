@@ -25,7 +25,7 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_autobot_keyboard_uses_existing_callbacks(self) -> None:
         rows = self.bot.autobot_keyboard(987654321)["inline_keyboard"]
         callbacks = {button["callback_data"] for row in rows for button in row}
-        for callback in {"paper_run_now", "paper_open_positions", "paper_closed_menu", "auto_settings", "back_main"}:
+        for callback in {"paper_run_now", "paper_open_positions", "paper_closed_menu", "auto_settings", "runtime_diagnostics", "back_main"}:
             self.assertIn(callback, callbacks)
         for hidden in {"setup_analytics", "prob_calibration", "bot_quality", "execution_status", "live_readiness"}:
             self.assertNotIn(hidden, callbacks)
@@ -75,7 +75,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(self.bot.simple_public_mode_enabled())
         for callback in {"menu_analytics", "execution_status", "sig_analysis", "market_heatmap"}:
             self.assertTrue(self.bot._simple_hidden_callback_v731(callback))
-        for callback in {"menu_signal", "menu_autobot", "paper_run_now", "auto_settings"}:
+        for callback in {"menu_signal", "menu_autobot", "paper_run_now", "auto_settings", "runtime_diagnostics"}:
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
     def test_auto_signal_defaults_scan_all_tf_every_15m(self) -> None:
@@ -277,7 +277,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.54 Robust Testnet Submit Pipeline")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.55 Runtime Diagnostics Screen")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -285,6 +285,9 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("auto_signal_scan_candidates", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("auto_signal_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_stage_error", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("runtime_bot_processes", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("runtime_latest_chain", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("format_runtime_diagnostics", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
@@ -308,6 +311,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.52" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.53" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.54" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.55" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -331,6 +335,60 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("adaptive_quality_bucket_group", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("adaptive_quality_adjusted_winrate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+
+    def test_runtime_diagnostics_shows_duplicate_processes_and_stage_gap(self) -> None:
+        old_processes = self.bot._runtime_bot_processes_v755
+        old_state = self.bot._execution_load_state_v715
+        old_mode = self.bot.execution_mode
+        old_short_status = self.bot._testnet_short_status_v733
+        try:
+            self.bot._runtime_bot_processes_v755 = lambda: [
+                {"pid": 111, "current": True, "command": "python bot_runtime.py"},
+                {"pid": 222, "current": False, "command": "python bot_runtime.py"},
+            ]
+            self.bot._execution_load_state_v715 = lambda: {
+                "plans": [
+                    {
+                        "plan_id": "diag-plan-1",
+                        "chat_id": "987654321",
+                        "ticker": "BNBUSDT",
+                        "interval": "4h",
+                        "direction": "short",
+                        "created_at": "2026-05-26T14:45:00+00:00",
+                    }
+                ],
+                "events": [
+                    {
+                        "type": "testnet_order_test",
+                        "plan_id": "diag-plan-1",
+                        "chat_id": "987654321",
+                        "ok": True,
+                        "ts": "2026-05-26T14:45:01+00:00",
+                    }
+                ],
+            }
+            self.bot.execution_mode = lambda: {
+                "mode": "testnet",
+                "testnet_keys_present": True,
+                "testnet_submit_requested": True,
+                "testnet_real_submit_requested": True,
+            }
+            self.bot._testnet_short_status_v733 = lambda: "READY"
+            text = self.bot.format_runtime_diagnostics(987654321)
+        finally:
+            self.bot._runtime_bot_processes_v755 = old_processes
+            self.bot._execution_load_state_v715 = old_state
+            self.bot.execution_mode = old_mode
+            self.bot._testnet_short_status_v733 = old_short_status
+
+        self.assertIn("v7.55", text)
+        self.assertIn("PID", text)
+        self.assertIn("<b>2</b>", text)
+        self.assertIn("BNB", text)
+        self.assertIn("entry-test", text)
+        self.assertIn("real-entry", text)
+        self.assertIn("entry:OK", text)
+        self.assertIn("real:--", text)
 
     def test_async_edit_message_text_uses_edit_endpoint(self) -> None:
         calls = []

@@ -22800,7 +22800,204 @@ def _submit_testnet_trade_v734(chat_id, candidate):
     }
 
 
-BOT_VERSION_LABEL = "v7.54 Robust Testnet Submit Pipeline"
+# ============================================================
+# v7.55 - RUNTIME DIAGNOSTICS SCREEN
+# ============================================================
+# Compact Telegram diagnostics for the exact problems that hurt live Testnet
+# verification: stale duplicate processes, real-submit flags and last execution
+# stage. No secrets are displayed.
+
+_base_autobot_keyboard_v754_for_v755 = autobot_keyboard
+_base_async_handle_update_v754_for_v755 = async_handle_update
+
+
+def _runtime_bot_processes_v755():
+    current_pid = os.getpid()
+    if os.name != "nt":
+        return [{"pid": current_pid, "current": True, "command": "current python process"}]
+    try:
+        import subprocess
+        cmd = (
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -match 'python' -and $_.CommandLine -match 'bot_runtime.py' } | "
+            "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", cmd],
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+        raw = (result.stdout or "").strip()
+        if not raw:
+            return [{"pid": current_pid, "current": True, "command": "current python process"}]
+        payload = json.loads(raw)
+        rows = payload if isinstance(payload, list) else [payload]
+        out = []
+        for row in rows:
+            pid = int(row.get("ProcessId") or 0)
+            out.append({
+                "pid": pid,
+                "current": pid == current_pid,
+                "command": str(row.get("CommandLine") or "")[:220],
+            })
+        return out or [{"pid": current_pid, "current": True, "command": "current python process"}]
+    except Exception as e:
+        return [{"pid": current_pid, "current": True, "command": f"process scan failed: {type(e).__name__}"}]
+
+
+def _runtime_latest_chain_v755(chat_id=None):
+    try:
+        state = _execution_load_state_v715()
+    except Exception as e:
+        return {"error": f"execution state load failed: {e}"}
+    key = _paper_chat_key(chat_id) if chat_id is not None else None
+    plans = list(state.get("plans") or [])
+    if key is not None:
+        plans = [p for p in plans if str(p.get("chat_id")) == key]
+    plans.sort(key=lambda p: str(p.get("created_at") or p.get("ts") or ""))
+    plan = plans[-1] if plans else None
+    if not plan:
+        return {"plan": None, "events": [], "hint": "ещё нет ордер-планов"}
+    plan_id = plan.get("plan_id")
+    events = [
+        e for e in list(state.get("events") or [])
+        if e.get("plan_id") == plan_id
+    ]
+    events.sort(key=lambda e: str(e.get("ts") or ""))
+    latest = events[-1] if events else None
+    stages = {
+        "entry_test": False,
+        "protection_test": False,
+        "real_entry": False,
+        "real_protection": False,
+        "monitor": False,
+    }
+    for event in events:
+        event_type = str(event.get("type") or "")
+        kind = str(event.get("kind") or "")
+        ok = bool(event.get("ok"))
+        if event_type == "testnet_order_test":
+            stages["entry_test"] = stages["entry_test"] or ok
+        elif event_type == "testnet_protection_order_test" or kind in {"protection", "real_protection"}:
+            if kind == "real_protection":
+                stages["real_protection"] = stages["real_protection"] or ok
+            else:
+                stages["protection_test"] = stages["protection_test"] or ok
+        elif event_type == "testnet_real_order":
+            if kind == "real_entry":
+                stages["real_entry"] = stages["real_entry"] or ok
+            elif kind == "real_protection":
+                stages["real_protection"] = stages["real_protection"] or ok
+        elif event_type == TESTNET_MONITOR_EVENTS_FILE_KIND:
+            stages["monitor"] = True
+    if stages["real_entry"]:
+        hint = "real entry записан"
+        if stages["real_protection"]:
+            hint += " + защита записана"
+        elif stages["protection_test"]:
+            hint += ", но real protection ещё не записан"
+    elif stages["protection_test"]:
+        hint = "валидация защиты OK, real entry не записан"
+    elif stages["entry_test"]:
+        hint = "entry-test OK, но protection/real-entry не записаны; возможен старый процесс"
+    else:
+        hint = "реальный entry ещё не доходил до проверки"
+    return {"plan": plan, "events": events, "latest": latest, "stages": stages, "hint": hint}
+
+
+def _runtime_event_label_v755(event):
+    if not event:
+        return "нет событий"
+    name = event.get("kind") or event.get("type") or "event"
+    status = "OK" if event.get("ok") else ("SKIP" if event.get("skipped") else "BLOCK")
+    reason = _testnet_result_reason_v754(event) if not event.get("ok") else ""
+    if reason and reason != "unknown":
+        return f"{name} | {status} | {_ui_short_text(reason, 120)}"
+    return f"{name} | {status}"
+
+
+def format_runtime_diagnostics(chat_id):
+    info = execution_mode()
+    processes = _runtime_bot_processes_v755()
+    chain = _runtime_latest_chain_v755(chat_id)
+    plan = chain.get("plan") or {}
+    latest = chain.get("latest")
+    stages = chain.get("stages") or {}
+    duplicate_warning = len(processes) > 1
+    lines = [
+        "🩺 <b>Диагностика бота</b>",
+        "",
+        f"Runtime: <b>{_ui_html(BOT_VERSION_LABEL)}</b>",
+        f"PID: <b>{os.getpid()}</b> | процессов bot_runtime: <b>{len(processes)}</b>",
+        f"Дубликаты: <b>{'ДА' if duplicate_warning else 'нет'}</b>",
+        "",
+        "<b>Binance Testnet:</b>",
+        f"Mode: <b>{str(info.get('mode')).upper()}</b>",
+        f"Keys: <b>{'есть' if info.get('testnet_keys_present') else 'нет'}</b>",
+        f"Order test: <b>{'ON' if info.get('testnet_submit_requested') else 'OFF'}</b>",
+        f"Real submit: <b>{'ON' if info.get('testnet_real_submit_requested') else 'OFF'}</b>",
+        f"Connection: <b>{_ui_html(_testnet_short_status_v733())}</b>",
+        "",
+        "<b>Последняя цепочка:</b>",
+        f"План: <b>{_ui_ticker_short(plan.get('ticker'))} {str(plan.get('direction') or '').upper()} {_ui_tf_short(plan.get('interval'))}</b>",
+        f"Событие: <b>{_ui_html(_runtime_event_label_v755(latest))}</b>",
+        f"Итог: <b>{_ui_html(chain.get('hint') or chain.get('error') or 'нет данных')}</b>",
+        "Stages: "
+        + " | ".join(
+            f"{name}:{'OK' if ok else '--'}"
+            for name, ok in (
+                ("entry", stages.get("entry_test")),
+                ("protect", stages.get("protection_test")),
+                ("real", stages.get("real_entry")),
+                ("SLTP", stages.get("real_protection")),
+            )
+        ),
+    ]
+    if duplicate_warning:
+        lines += [
+            "",
+            "⚠️ <b>Что сделать:</b>",
+            "Запусти <code>stop_bot.bat</code>, потом один свежий <code>run_bot.bat</code>.",
+        ]
+    return "\n".join(lines)
+
+
+def runtime_diagnostics_keyboard_v755():
+    return {"inline_keyboard": [
+        [{"text": "🔄 Обновить", "callback_data": "runtime_diagnostics"}],
+        [{"text": "◀️ Демо-бот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def autobot_keyboard(chat_id):
+    keyboard = _base_autobot_keyboard_v754_for_v755(chat_id)
+    rows = list(keyboard.get("inline_keyboard") or [])
+    if not any(any(button.get("callback_data") == "runtime_diagnostics" for button in row) for row in rows):
+        insert_at = max(0, len(rows) - 1)
+        rows.insert(insert_at, [{"text": "🩺 Диагностика", "callback_data": "runtime_diagnostics"}])
+    return {"inline_keyboard": rows}
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            if data == "runtime_diagnostics":
+                chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+                callback_id = cb.get("id")
+                await _answer_callback_once_v732(session, callback_id, "Диагностика")
+                await send_or_edit(session, update, format_runtime_diagnostics(chat_id), runtime_diagnostics_keyboard_v755())
+                return
+        await _base_async_handle_update_v754_for_v755(session, update, sem)
+    except Exception:
+        raise
+
+
+BOT_VERSION_LABEL = "v7.55 Runtime Diagnostics Screen"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -22881,6 +23078,7 @@ RUNTIME_LAYERS = [
     ("v7.52", "multi-TF auto-signal scanner sends only actionable LONG/SHORT"),
     ("v7.53", "auto-signal alerts reuse the same Testnet gate as demo trading"),
     ("v7.54", "robust Testnet submit pipeline records validation, entry and protection stages"),
+    ("v7.55", "runtime diagnostics for process count, Testnet flags and latest execution stage"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -22894,6 +23092,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "auto_signal_scan_candidates": _auto_signal_scan_candidates_v752,
     "auto_signal_select_trade_candidate": _auto_signal_select_trade_candidate_v753,
     "testnet_stage_error": _testnet_stage_error_v754,
+    "runtime_bot_processes": _runtime_bot_processes_v755,
+    "runtime_latest_chain": _runtime_latest_chain_v755,
+    "format_runtime_diagnostics": format_runtime_diagnostics,
     "format_signal_analysis_details": format_signal_analysis_details,
     "format_entry_plan_analysis": format_entry_plan_analysis,
     "format_auto_digest": format_auto_digest,
@@ -23116,6 +23317,12 @@ def validate_runtime_architecture():
         errors.append("auto signal Testnet gate selector is missing")
     if not callable(globals().get("_testnet_stage_error_v754")):
         errors.append("robust Testnet submit error helper is missing")
+    if not callable(globals().get("_runtime_bot_processes_v755")):
+        errors.append("runtime process diagnostics helper is missing")
+    if not callable(globals().get("_runtime_latest_chain_v755")):
+        errors.append("runtime execution-chain diagnostics helper is missing")
+    if not callable(globals().get("format_runtime_diagnostics")):
+        errors.append("runtime diagnostics formatter is missing")
     if not callable(globals().get("cancel_testnet_open_orders_v741")):
         errors.append("testnet cancel-open-orders helper is missing")
     if not callable(globals().get("cancel_testnet_algo_orders_v741")):
