@@ -72,6 +72,68 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
         self.assertTrue(result["skipped"])
         self.assertIn("entry /order/test", result["reason"])
 
+    def test_signed_payload_uses_testnet_server_time_offset(self) -> None:
+        old_local_time = self.bot._testnet_local_time_ms_v758
+        old_sync = self.bot._testnet_sync_server_time_v758
+        try:
+            self.bot._testnet_local_time_ms_v758 = lambda: 2_000_000
+            self.bot._testnet_sync_server_time_v758 = lambda force=False: {"offset_ms": -1500, "error": None}
+            signed, _ = self.bot._testnet_signed_payload_v719({"symbol": "BTCUSDT"}, "secret")
+        finally:
+            self.bot._testnet_local_time_ms_v758 = old_local_time
+            self.bot._testnet_sync_server_time_v758 = old_sync
+
+        expected = 2_000_000 - 1500 - self.bot.TESTNET_TIME_SYNC_SAFETY_MS
+        self.assertEqual(signed["timestamp"], str(expected))
+
+    def test_signed_post_retries_timestamp_error_after_forced_time_sync(self) -> None:
+        class FakeResponse:
+            def __init__(self, status_code: int, payload: dict):
+                self.status_code = status_code
+                self._payload = payload
+                self.text = "{}"
+                self.headers = {}
+
+            def json(self) -> dict:
+                return self._payload
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def post(self, url, data=None, headers=None, timeout=None):
+                self.requests.append(dict(data or {}))
+                if len(self.requests) == 1:
+                    return FakeResponse(400, {"code": -1021, "msg": "Timestamp for this request was ahead"})
+                return FakeResponse(200, {"orderId": 123})
+
+        env = {
+            "BINANCE_FUTURES_TESTNET_API_KEY": "key",
+            "BINANCE_FUTURES_TESTNET_API_SECRET": "secret",
+        }
+        fake_session = FakeSession()
+        force_calls = []
+        old_session = self.bot._session
+        old_timestamp = self.bot._testnet_timestamp_ms_v758
+        try:
+            self.bot._session = fake_session
+
+            def fake_timestamp(force_sync=False):
+                force_calls.append(force_sync)
+                return 2_000 if force_sync else 1_000
+
+            self.bot._testnet_timestamp_ms_v758 = fake_timestamp
+            with patch.dict(os.environ, env, clear=False):
+                result = self.bot._testnet_post_signed_v719("/fapi/v1/order/test", {"symbol": "BTCUSDT"})
+        finally:
+            self.bot._session = old_session
+            self.bot._testnet_timestamp_ms_v758 = old_timestamp
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["retried_after_time_sync"])
+        self.assertEqual(force_calls, [False, True])
+        self.assertEqual([row["timestamp"] for row in fake_session.requests], ["1000", "2000"])
+
     def test_real_protection_order_builder_uses_real_endpoint_shape(self) -> None:
         params, geometry = self.bot._real_protection_order_params_v729(self._plan())
         self.assertTrue(geometry["ok"])

@@ -15270,6 +15270,11 @@ _base_async_handle_update_v718 = async_handle_update
 
 TESTNET_ORDER_TEST_PATH = "/fapi/v1/order/test"
 TESTNET_RECV_WINDOW_MS = int(os.getenv("BINANCE_TESTNET_RECV_WINDOW", "5000"))
+TESTNET_SERVER_TIME_PATH = "/fapi/v1/time"
+TESTNET_TIME_SYNC_TTL_SEC = float(os.getenv("BINANCE_TESTNET_TIME_SYNC_TTL_SEC", "30"))
+TESTNET_TIME_SYNC_SAFETY_MS = int(os.getenv("BINANCE_TESTNET_TIME_SYNC_SAFETY_MS", "100"))
+_testnet_time_sync_v758 = {"offset_ms": 0, "server_time": None, "synced_at": 0.0, "error": None}
+_testnet_time_sync_lock_v758 = threading.RLock()
 
 
 def _testnet_keys_v719():
@@ -15301,7 +15306,73 @@ def _format_decimal_v719(value, max_decimals=8):
     return text or "0"
 
 
-def _testnet_signed_payload_v719(params, secret):
+def _testnet_local_time_ms_v758():
+    return int(time.time() * 1000)
+
+
+def _testnet_sync_server_time_v758(force=False):
+    now = time.time()
+    with _testnet_time_sync_lock_v758:
+        cached = dict(_testnet_time_sync_v758)
+        if not force and now - float(cached.get("synced_at") or 0) < TESTNET_TIME_SYNC_TTL_SEC:
+            return cached
+    try:
+        start_ms = _testnet_local_time_ms_v758()
+        response = _session.get(
+            BINANCE_FUTURES_TESTNET_REST.rstrip("/") + TESTNET_SERVER_TIME_PATH,
+            timeout=5,
+        )
+        end_ms = _testnet_local_time_ms_v758()
+        payload = response.json() if response.text else {}
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}: {payload}")
+        server_time = int(payload.get("serverTime"))
+        midpoint_ms = (start_ms + end_ms) // 2
+        offset_ms = server_time - midpoint_ms
+        with _testnet_time_sync_lock_v758:
+            _testnet_time_sync_v758.update({
+                "offset_ms": int(offset_ms),
+                "server_time": server_time,
+                "synced_at": time.time(),
+                "error": None,
+            })
+            return dict(_testnet_time_sync_v758)
+    except Exception as e:
+        with _testnet_time_sync_lock_v758:
+            _testnet_time_sync_v758["error"] = str(e)
+            _testnet_time_sync_v758.setdefault("synced_at", 0.0)
+            return dict(_testnet_time_sync_v758)
+
+
+def _testnet_timestamp_ms_v758(force_sync=False):
+    sync = _testnet_sync_server_time_v758(force=force_sync)
+    offset_ms = int(sync.get("offset_ms") or 0)
+    return _testnet_local_time_ms_v758() + offset_ms - TESTNET_TIME_SYNC_SAFETY_MS
+
+
+def _testnet_is_timestamp_error_v758(payload):
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("code") == -1021:
+        return True
+    return "-1021" in str(payload) or "Timestamp for this request" in str(payload)
+
+
+def _testnet_response_dict_v758(response):
+    payload = response.json() if response.text else {}
+    return {
+        "ok": response.status_code < 400,
+        "status_code": response.status_code,
+        "payload": payload,
+        "headers": {
+            "order_count_10s": response.headers.get("X-MBX-ORDER-COUNT-10S"),
+            "order_count_1m": response.headers.get("X-MBX-ORDER-COUNT-1M"),
+            "used_weight_1m": response.headers.get("X-MBX-USED-WEIGHT-1M"),
+        },
+    }
+
+
+def _testnet_signed_payload_v719(params, secret, force_time_sync=False):
     clean = {}
     for key, value in (params or {}).items():
         if value is None:
@@ -15310,7 +15381,7 @@ def _testnet_signed_payload_v719(params, secret):
             value = "true" if value else "false"
         clean[key] = str(value)
     clean.setdefault("recvWindow", str(TESTNET_RECV_WINDOW_MS))
-    clean.setdefault("timestamp", str(int(time.time() * 1000)))
+    clean.setdefault("timestamp", str(_testnet_timestamp_ms_v758(force_sync=force_time_sync)))
     query = urlencode(clean)
     signature = hmac.new(secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
     clean["signature"] = signature
@@ -15321,26 +15392,27 @@ def _testnet_post_signed_v719(path, params):
     api_key, secret = _testnet_keys_v719()
     if not api_key or not secret:
         return {"ok": False, "skipped": True, "reason": "testnet API key/secret не заданы"}
-    signed, _ = _testnet_signed_payload_v719(params, secret)
     url = BINANCE_FUTURES_TESTNET_REST.rstrip("/") + path
     try:
+        signed, _ = _testnet_signed_payload_v719(params, secret)
         response = _session.post(
             url,
             data=signed,
             headers={"X-MBX-APIKEY": api_key},
             timeout=15,
         )
-        payload = response.json() if response.text else {}
-        return {
-            "ok": response.status_code < 400,
-            "status_code": response.status_code,
-            "payload": payload,
-            "headers": {
-                "order_count_10s": response.headers.get("X-MBX-ORDER-COUNT-10S"),
-                "order_count_1m": response.headers.get("X-MBX-ORDER-COUNT-1M"),
-                "used_weight_1m": response.headers.get("X-MBX-USED-WEIGHT-1M"),
-            },
-        }
+        result = _testnet_response_dict_v758(response)
+        if not result.get("ok") and _testnet_is_timestamp_error_v758(result.get("payload")):
+            signed, _ = _testnet_signed_payload_v719(params, secret, force_time_sync=True)
+            response = _session.post(
+                url,
+                data=signed,
+                headers={"X-MBX-APIKEY": api_key},
+                timeout=15,
+            )
+            result = _testnet_response_dict_v758(response)
+            result["retried_after_time_sync"] = True
+        return result
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -17914,24 +17986,27 @@ def _testnet_get_signed_v730(path, params=None):
     api_key, secret = _testnet_keys_v719()
     if not api_key or not secret:
         return {"ok": False, "skipped": True, "reason": "testnet API key/secret не заданы"}
-    signed, _ = _testnet_signed_payload_v719(params or {}, secret)
     url = BINANCE_FUTURES_TESTNET_REST.rstrip("/") + path
     try:
+        signed, _ = _testnet_signed_payload_v719(params or {}, secret)
         response = _session.get(
             url,
             params=signed,
             headers={"X-MBX-APIKEY": api_key},
             timeout=15,
         )
-        payload = response.json() if response.text else {}
-        return {
-            "ok": response.status_code < 400,
-            "status_code": response.status_code,
-            "payload": payload,
-            "headers": {
-                "used_weight_1m": response.headers.get("X-MBX-USED-WEIGHT-1M"),
-            },
-        }
+        result = _testnet_response_dict_v758(response)
+        if not result.get("ok") and _testnet_is_timestamp_error_v758(result.get("payload")):
+            signed, _ = _testnet_signed_payload_v719(params or {}, secret, force_time_sync=True)
+            response = _session.get(
+                url,
+                params=signed,
+                headers={"X-MBX-APIKEY": api_key},
+                timeout=15,
+            )
+            result = _testnet_response_dict_v758(response)
+            result["retried_after_time_sync"] = True
+        return result
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -20943,26 +21018,27 @@ def _testnet_delete_signed_v741(path, params=None):
     api_key, secret = _testnet_keys_v719()
     if not api_key or not secret:
         return {"ok": False, "skipped": True, "reason": "testnet API key/secret not set"}
-    signed, _ = _testnet_signed_payload_v719(params or {}, secret)
     url = BINANCE_FUTURES_TESTNET_REST.rstrip("/") + path
     try:
+        signed, _ = _testnet_signed_payload_v719(params or {}, secret)
         response = _session.delete(
             url,
             params=signed,
             headers={"X-MBX-APIKEY": api_key},
             timeout=15,
         )
-        payload = response.json() if response.text else {}
-        return {
-            "ok": response.status_code < 400,
-            "status_code": response.status_code,
-            "payload": payload,
-            "headers": {
-                "order_count_10s": response.headers.get("X-MBX-ORDER-COUNT-10S"),
-                "order_count_1m": response.headers.get("X-MBX-ORDER-COUNT-1M"),
-                "used_weight_1m": response.headers.get("X-MBX-USED-WEIGHT-1M"),
-            },
-        }
+        result = _testnet_response_dict_v758(response)
+        if not result.get("ok") and _testnet_is_timestamp_error_v758(result.get("payload")):
+            signed, _ = _testnet_signed_payload_v719(params or {}, secret, force_time_sync=True)
+            response = _session.delete(
+                url,
+                params=signed,
+                headers={"X-MBX-APIKEY": api_key},
+                timeout=15,
+            )
+            result = _testnet_response_dict_v758(response)
+            result["retried_after_time_sync"] = True
+        return result
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -22951,6 +23027,7 @@ def format_runtime_diagnostics(chat_id):
     info = execution_mode()
     processes = _runtime_bot_processes_v755()
     chain = _runtime_latest_chain_v755(chat_id)
+    time_sync = _testnet_sync_server_time_v758(force=False)
     plan = chain.get("plan") or {}
     latest = chain.get("latest")
     stages = chain.get("stages") or {}
@@ -22968,6 +23045,7 @@ def format_runtime_diagnostics(chat_id):
         f"Order test: <b>{'ON' if info.get('testnet_submit_requested') else 'OFF'}</b>",
         f"Real submit: <b>{'ON' if info.get('testnet_real_submit_requested') else 'OFF'}</b>",
         f"Connection: <b>{_ui_html(_testnet_short_status_v733())}</b>",
+        f"Time sync: <b>{int(time_sync.get('offset_ms') or 0)} ms</b>{' | error: ' + _ui_html(_ui_short_text(time_sync.get('error'), 90)) if time_sync.get('error') else ''}",
         "",
         "<b>Последняя цепочка:</b>",
         f"План: <b>{_ui_ticker_short(plan.get('ticker'))} {str(plan.get('direction') or '').upper()} {_ui_tf_short(plan.get('interval'))}</b>",
@@ -23026,7 +23104,7 @@ async def async_handle_update(session, update, sem):
         raise
 
 
-BOT_VERSION_LABEL = "v7.57 Runtime Wrapper Process Collapse"
+BOT_VERSION_LABEL = "v7.58 Binance Testnet Time Sync"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -23110,6 +23188,7 @@ RUNTIME_LAYERS = [
     ("v7.55", "runtime diagnostics for process count, Testnet flags and latest execution stage"),
     ("v7.56", "clear WAIT signal cards and exact bot_runtime process matching"),
     ("v7.57", "collapse Python launcher wrappers in runtime diagnostics process count"),
+    ("v7.58", "Binance Testnet server-time offset and -1021 retry for signed requests"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -23123,6 +23202,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "auto_signal_scan_candidates": _auto_signal_scan_candidates_v752,
     "auto_signal_select_trade_candidate": _auto_signal_select_trade_candidate_v753,
     "testnet_stage_error": _testnet_stage_error_v754,
+    "testnet_sync_server_time": _testnet_sync_server_time_v758,
+    "testnet_timestamp_ms": _testnet_timestamp_ms_v758,
     "runtime_bot_runtime_path": _runtime_bot_runtime_path_v756,
     "runtime_bot_processes": _runtime_bot_processes_v755,
     "runtime_latest_chain": _runtime_latest_chain_v755,
@@ -23349,6 +23430,10 @@ def validate_runtime_architecture():
         errors.append("auto signal Testnet gate selector is missing")
     if not callable(globals().get("_testnet_stage_error_v754")):
         errors.append("robust Testnet submit error helper is missing")
+    if not callable(globals().get("_testnet_sync_server_time_v758")):
+        errors.append("Testnet server-time sync helper is missing")
+    if not callable(globals().get("_testnet_timestamp_ms_v758")):
+        errors.append("Testnet timestamp helper is missing")
     if not callable(globals().get("_runtime_bot_processes_v755")):
         errors.append("runtime process diagnostics helper is missing")
     if not callable(globals().get("_runtime_bot_runtime_path_v756")):
