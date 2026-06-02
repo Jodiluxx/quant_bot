@@ -23453,7 +23453,124 @@ async def async_handle_update(session, update, sem):
         raise
 
 
-BOT_VERSION_LABEL = "v7.60 Last Testnet Attempt Report"
+# ============================================================
+# v7.61 - RUNTIME CACHE MAINTENANCE + SHARED FEAR/GREED SESSION
+# ============================================================
+# Keeps long-running bot memory bounded without changing signal rules. The
+# user only sees the same compact Telegram cards; maintenance stays backstage.
+
+_base_get_ohlcv_v760_for_v761 = get_ohlcv
+_base_get_price_v760_for_v761 = get_price
+_base_full_analyze_v760_for_v761 = full_analyze
+
+RUNTIME_CACHE_MAX_ITEMS_V761 = max(32, int(os.getenv("RUNTIME_CACHE_MAX_ITEMS", "256")))
+RUNTIME_CACHE_MAX_AGE_SEC_V761 = max(300.0, float(os.getenv("RUNTIME_CACHE_MAX_AGE_SEC", "3600")))
+RUNTIME_CACHE_PRUNE_INTERVAL_SEC_V761 = max(10.0, float(os.getenv("RUNTIME_CACHE_PRUNE_INTERVAL_SEC", "60")))
+FEAR_GREED_CACHE_TTL_SEC_V761 = max(300.0, float(os.getenv("FEAR_GREED_CACHE_TTL_SEC", "3600")))
+_runtime_cache_last_prune_v761 = 0.0
+
+
+def _cache_entry_ts_v761(entry):
+    try:
+        if isinstance(entry, dict):
+            return float(entry.get("ts") or 0)
+        if isinstance(entry, (tuple, list)) and entry:
+            return float(entry[0] or 0)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+def _prune_cache_dict_v761(cache, now_ts, max_items=RUNTIME_CACHE_MAX_ITEMS_V761, max_age_sec=RUNTIME_CACHE_MAX_AGE_SEC_V761):
+    if not isinstance(cache, dict):
+        return 0
+    removed = 0
+    for key, entry in list(cache.items()):
+        ts = _cache_entry_ts_v761(entry)
+        if ts and now_ts - ts > max_age_sec:
+            cache.pop(key, None)
+            removed += 1
+    if max_items and len(cache) > max_items:
+        overflow = len(cache) - max_items
+        oldest = sorted(cache.items(), key=lambda item: _cache_entry_ts_v761(item[1]))[:overflow]
+        for key, _ in oldest:
+            cache.pop(key, None)
+            removed += 1
+    return removed
+
+
+def prune_runtime_caches_v761(force=False):
+    global _runtime_cache_last_prune_v761
+    now_ts = time.time()
+    if not force and now_ts - _runtime_cache_last_prune_v761 < RUNTIME_CACHE_PRUNE_INTERVAL_SEC_V761:
+        return {"skipped": True, "removed": {}, "sizes": {}}
+
+    removed = {}
+    sizes = {}
+    with _runtime_cache_lock_v74:
+        cache_map = {
+            "ohlcv": _ohlcv_cache,
+            "price": _price_cache_v74,
+            "analysis": _analysis_cache_v74,
+            "scan_analysis": _scan_analysis_cache_v74,
+        }
+        for name, cache in cache_map.items():
+            removed[name] = _prune_cache_dict_v761(cache, now_ts)
+            sizes[name] = len(cache) if isinstance(cache, dict) else 0
+    _runtime_cache_last_prune_v761 = now_ts
+    return {"skipped": False, "removed": removed, "sizes": sizes}
+
+
+def _runtime_cache_tick_v761():
+    try:
+        prune_runtime_caches_v761(force=False)
+    except Exception as e:
+        print(f"  [cache] prune skipped: {e}")
+
+
+def get_ohlcv(ticker, interval):
+    _runtime_cache_tick_v761()
+    return _base_get_ohlcv_v760_for_v761(ticker, interval)
+
+
+def get_price(ticker):
+    _runtime_cache_tick_v761()
+    return _base_get_price_v760_for_v761(ticker)
+
+
+def full_analyze(ticker, interval, force_refresh=False):
+    _runtime_cache_tick_v761()
+    return _base_full_analyze_v760_for_v761(ticker, interval, force_refresh=force_refresh)
+
+
+def get_fear_greed():
+    global _fear_greed_cache
+    now_ts = time.time()
+    if _fear_greed_cache["value"] is not None and (now_ts - _fear_greed_cache["ts"]) < FEAR_GREED_CACHE_TTL_SEC_V761:
+        return _fear_greed_cache["value"], _fear_greed_cache["label"], _fear_greed_cache.get("history", [])
+    try:
+        r = _session.get("https://api.alternative.me/fng/?limit=8", timeout=10)
+        r.raise_for_status()
+        payload = r.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not data:
+            raise ValueError(f"empty Fear&Greed payload: {payload}")
+        current = data[0]
+        value = int(current["value"])
+        label = current["value_classification"]
+        history = []
+        for item in data[1:8]:
+            ts = int(item["timestamp"])
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d.%m")
+            history.append({"date": dt, "value": int(item["value"]), "label": item["value_classification"]})
+        _fear_greed_cache = {"value": value, "label": label, "ts": now_ts, "history": history}
+        return value, label, history
+    except Exception as e:
+        print(f"  [FG] Ошибка: {e}")
+        return None, None, []
+
+
+BOT_VERSION_LABEL = "v7.61 Runtime Cache Maintenance"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -23540,11 +23657,14 @@ RUNTIME_LAYERS = [
     ("v7.58", "Binance Testnet server-time offset and -1021 retry for signed requests"),
     ("v7.59", "compact all-asset manual signal scan and version-free Telegram diagnostics"),
     ("v7.60", "compact last Testnet attempt report for demo trading"),
+    ("v7.61", "bounded runtime caches and shared Fear & Greed HTTP session"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
     "get_ohlcv": get_ohlcv,
     "get_price": get_price,
+    "get_fear_greed": get_fear_greed,
+    "prune_runtime_caches": prune_runtime_caches_v761,
     "futures_api_symbol": futures_api_symbol,
     "_binance_ohlcv": _binance_ohlcv,
     "full_analyze": full_analyze,
@@ -23805,6 +23925,10 @@ def validate_runtime_architecture():
         errors.append("last trade attempt formatter is missing")
     if not callable(globals().get("last_trade_attempt_keyboard_v760")):
         errors.append("last trade attempt keyboard is missing")
+    if not callable(globals().get("prune_runtime_caches_v761")):
+        errors.append("runtime cache pruning helper is missing")
+    if not callable(globals().get("get_fear_greed")):
+        errors.append("Fear & Greed getter is missing")
     if not callable(globals().get("cancel_testnet_open_orders_v741")):
         errors.append("testnet cancel-open-orders helper is missing")
     if not callable(globals().get("cancel_testnet_algo_orders_v741")):
