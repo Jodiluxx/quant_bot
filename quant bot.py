@@ -20234,11 +20234,17 @@ def paper_trader_cycle(chat_id, manual=False):
         "Режим: <b>только Binance Futures Testnet</b>",
     ]
     candidate, tried = testnet_select_trade_candidate(chat_id)
+    expected_checks = len(PAPER_TRADER_SCAN_TICKERS) * len(PAPER_TRADER_TFS)
+    lines += [
+        "",
+        f"Скан: <b>{len(PAPER_TRADER_SCAN_TICKERS)}</b> активов × <b>{len(PAPER_TRADER_TFS)}</b> TF",
+        f"Проверено: <b>{len(tried)}/{expected_checks}</b>",
+    ]
     if not candidate:
         lines += ["", "<b>Решение:</b>", "Сделка на Binance Testnet не открыта.", _testnet_best_gate_message_v735(tried)]
         best = _format_scan_rows(tried)
         if best:
-            lines += ["", "<b>Лучшие проверки:</b>"] + best[:3]
+            lines += ["", "<b>Лучшие проверки:</b>"] + best[:5]
         return "\n".join(lines)
     result = _submit_testnet_trade_v734(chat_id, candidate)
     plan = result.get("plan") or {}
@@ -20255,6 +20261,10 @@ def paper_trader_cycle(chat_id, manual=False):
         ]
         if ticker and direction:
             lines.append(f"План: <b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}")
+        if manual:
+            best = _format_scan_rows(tried)
+            if best:
+                lines += ["", "<b>Лучшие проверки:</b>"] + best[:5]
         return "\n".join(lines)
     entry_order = plan.get("entry_order") or {}
     protection = result.get("protection") or {}
@@ -23104,7 +23114,150 @@ async def async_handle_update(session, update, sem):
         raise
 
 
-BOT_VERSION_LABEL = "v7.58 Binance Testnet Time Sync"
+# ============================================================
+# v7.59 - COMPACT ALL-ASSET SIGNAL SCAN + CLEAN USER MESSAGES
+# ============================================================
+# Keep versions in console/setup-check, but remove them from Telegram cards.
+# Add a manual all-asset signal scan that shows only LONG / SHORT / WAIT.
+
+_base_signal_menu_keyboard_v758_for_v759 = signal_menu_keyboard
+_base_compact_signal_keyboard_v758_for_v759 = compact_signal_keyboard
+_base_format_signal_menu_text_v758_for_v759 = format_signal_menu_text
+_base_format_runtime_diagnostics_v758_for_v759 = format_runtime_diagnostics
+_base_async_handle_update_v758_for_v759 = async_handle_update
+
+
+def _insert_signal_scan_all_row_v759(keyboard):
+    rows = [list(row) for row in (keyboard or {}).get("inline_keyboard", [])]
+    if not any(any(button.get("callback_data") == "signal_scan_all" for button in row) for row in rows):
+        rows.insert(1, [{"text": "🔎 Скан всех активов", "callback_data": "signal_scan_all"}])
+    return {"inline_keyboard": rows}
+
+
+def signal_menu_keyboard(chat_id):
+    return _insert_signal_scan_all_row_v759(_base_signal_menu_keyboard_v758_for_v759(chat_id))
+
+
+def compact_signal_keyboard(open_callback=None):
+    return _insert_signal_scan_all_row_v759(_base_compact_signal_keyboard_v758_for_v759(open_callback))
+
+
+def format_signal_menu_text(chat_id):
+    return _base_format_signal_menu_text_v758_for_v759(chat_id) + "\n\n🔎 Скан всех — кратко проверит все активы на выбранном TF."
+
+
+def _signal_scan_tickers_v759():
+    return list(dict.fromkeys(PAPER_TRADER_SCAN_TICKERS or AUTO_CRYPTO_TICKERS))
+
+
+def _signal_scan_short_reason_v759(data):
+    plan = (data or {}).get("entry_plan") or {}
+    status = _ui_status_plain(plan.get("status"))
+    if status == "READY":
+        return "вход возможен"
+    if status == "WAIT RETEST":
+        return "ждать ретест"
+    if status == "WAIT CONFIRM":
+        return "ждать подтверждение"
+    return "ждать"
+
+
+def _signal_scan_one_asset_v759(chat_id, ticker, interval):
+    data = full_analyze(ticker, interval)
+    return {
+        "ticker": ticker,
+        "interval": interval,
+        "decision": _simple_signal_decision(data),
+        "reason": _signal_scan_short_reason_v759(data),
+    }
+
+
+def _signal_scan_all_assets_v759(chat_id):
+    interval = user_intervals.get(chat_id, "15m")
+    tickers = _signal_scan_tickers_v759()
+    rows = []
+    workers = min(PAPER_SCAN_WORKERS, len(tickers)) or 1
+    with _futures_v74.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="signal-all-scan") as pool:
+        fut_to_ticker = {
+            pool.submit(_signal_scan_one_asset_v759, chat_id, ticker, interval): ticker
+            for ticker in tickers
+        }
+        for fut in _futures_v74.as_completed(fut_to_ticker):
+            ticker = fut_to_ticker[fut]
+            try:
+                rows.append(fut.result())
+            except Exception as e:
+                rows.append({"ticker": ticker, "interval": interval, "decision": "ERROR", "reason": str(e)})
+    order = {ticker: idx for idx, ticker in enumerate(tickers)}
+    rows.sort(key=lambda row: order.get(row.get("ticker"), 999))
+    return rows
+
+
+def format_signal_scan_all_v759(chat_id):
+    interval = user_intervals.get(chat_id, "15m")
+    rows = _signal_scan_all_assets_v759(chat_id)
+    lines = [
+        "🔎 <b>Скан всех активов</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b> | Проверено: <b>{len(rows)}/{len(_signal_scan_tickers_v759())}</b>",
+        "",
+    ]
+    for row in rows:
+        ticker = _ui_ticker_short(row.get("ticker"))
+        decision = str(row.get("decision") or "WAIT").upper()
+        reason = _ui_short_text(row.get("reason"), 42)
+        if decision == "ERROR":
+            lines.append(f"{ticker} — <b>ERROR</b> | данные")
+        else:
+            lines.append(f"{ticker} — <b>{_ui_html(decision)}</b> | {_ui_html(reason)}")
+    lines += [
+        "",
+        "LONG/SHORT — идея есть. WAIT — лучше не входить сейчас.",
+    ]
+    return "\n".join(lines)
+
+
+def signal_scan_all_keyboard_v759(chat_id):
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    return {"inline_keyboard": [
+        [{"text": "🔄 Скан всех активов", "callback_data": "signal_scan_all"}],
+        [{"text": f"📡 Сигнал: {_ui_ticker_short(ticker)}USDT / {_ui_tf_short(interval)}", "callback_data": "get_signal"}],
+        [
+            {"text": "🪙 Актив", "callback_data": "sig_change_ticker"},
+            {"text": "⏱ TF", "callback_data": "sig_change_interval"},
+        ],
+        [{"text": "◀️ Назад к сигналу", "callback_data": "menu_signal"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def format_runtime_diagnostics(chat_id):
+    lines = _base_format_runtime_diagnostics_v758_for_v759(chat_id).splitlines()
+    cleaned = [line for line in lines if not line.startswith("Runtime:")]
+    while len(cleaned) > 2 and cleaned[1] == "" and cleaned[2] == "":
+        cleaned.pop(1)
+    return "\n".join(cleaned)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            if data == "signal_scan_all":
+                chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+                callback_id = cb.get("id")
+                await _answer_callback_once_v732(session, callback_id, "Скан всех")
+                await send_or_edit(session, update, "🔎 <b>Скан всех активов</b>\n\nПроверяю активы на выбранном TF...", signal_scan_all_keyboard_v759(chat_id))
+                text = await asyncio.to_thread(format_signal_scan_all_v759, chat_id)
+                await send_or_edit(session, update, text, signal_scan_all_keyboard_v759(chat_id))
+                return
+        await _base_async_handle_update_v758_for_v759(session, update, sem)
+    except Exception:
+        raise
+
+
+BOT_VERSION_LABEL = "v7.59 Compact Signal Scan UI"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -23189,6 +23342,7 @@ RUNTIME_LAYERS = [
     ("v7.56", "clear WAIT signal cards and exact bot_runtime process matching"),
     ("v7.57", "collapse Python launcher wrappers in runtime diagnostics process count"),
     ("v7.58", "Binance Testnet server-time offset and -1021 retry for signed requests"),
+    ("v7.59", "compact all-asset manual signal scan and version-free Telegram diagnostics"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -23208,6 +23362,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "runtime_bot_processes": _runtime_bot_processes_v755,
     "runtime_latest_chain": _runtime_latest_chain_v755,
     "format_runtime_diagnostics": format_runtime_diagnostics,
+    "format_signal_scan_all": format_signal_scan_all_v759,
+    "signal_scan_all_keyboard": signal_scan_all_keyboard_v759,
     "format_signal_analysis_details": format_signal_analysis_details,
     "format_entry_plan_analysis": format_entry_plan_analysis,
     "format_auto_digest": format_auto_digest,
@@ -23442,6 +23598,10 @@ def validate_runtime_architecture():
         errors.append("runtime execution-chain diagnostics helper is missing")
     if not callable(globals().get("format_runtime_diagnostics")):
         errors.append("runtime diagnostics formatter is missing")
+    if not callable(globals().get("format_signal_scan_all_v759")):
+        errors.append("all-asset signal scan formatter is missing")
+    if not callable(globals().get("signal_scan_all_keyboard_v759")):
+        errors.append("all-asset signal scan keyboard is missing")
     if not callable(globals().get("cancel_testnet_open_orders_v741")):
         errors.append("testnet cancel-open-orders helper is missing")
     if not callable(globals().get("cancel_testnet_algo_orders_v741")):

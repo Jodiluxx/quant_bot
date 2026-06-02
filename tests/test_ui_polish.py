@@ -30,6 +30,12 @@ class TelegramUiPolishTests(unittest.TestCase):
         for hidden in {"setup_analytics", "prob_calibration", "bot_quality", "execution_status", "live_readiness"}:
             self.assertNotIn(hidden, callbacks)
 
+    def test_signal_menu_exposes_all_asset_scan(self) -> None:
+        rows = self.bot.signal_menu_keyboard(987654321)["inline_keyboard"]
+        callbacks = {button["callback_data"] for row in rows for button in row}
+        self.assertIn("get_signal", callbacks)
+        self.assertIn("signal_scan_all", callbacks)
+
     def test_signal_card_is_compact_and_html_escapes_dynamic_text(self) -> None:
         text = self.bot.format_signal_summary(
             {
@@ -279,7 +285,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.58 Binance Testnet Time Sync")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.59 Compact Signal Scan UI")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -293,6 +299,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("runtime_bot_processes", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("runtime_latest_chain", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("format_runtime_diagnostics", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("format_signal_scan_all", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("signal_scan_all_keyboard", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
@@ -320,6 +328,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.56" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.57" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.58" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.59" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -392,7 +401,8 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_short_status_v733 = old_short_status
             self.bot._testnet_sync_server_time_v758 = old_time_sync
 
-        self.assertIn("v7.58", text)
+        self.assertNotIn("Runtime:", text)
+        self.assertNotIn("v7.59", text)
         self.assertIn("PID", text)
         self.assertIn("<b>2</b>", text)
         self.assertIn("Time sync", text)
@@ -401,6 +411,31 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("real-entry", text)
         self.assertIn("entry:OK", text)
         self.assertIn("real:--", text)
+
+    def test_signal_scan_all_formats_every_asset_compactly(self) -> None:
+        old_tickers = self.bot.PAPER_TRADER_SCAN_TICKERS
+        old_interval = dict(self.bot.user_intervals)
+        old_scan = self.bot._signal_scan_one_asset_v759
+        try:
+            self.bot.PAPER_TRADER_SCAN_TICKERS = ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
+            self.bot.user_intervals["scan-all-test"] = "1h"
+
+            def fake_scan(chat_id, ticker, interval):
+                decisions = {"BTCUSDT": "WAIT", "ETHUSDT": "LONG", "XRPUSDT": "SHORT"}
+                return {"ticker": ticker, "interval": interval, "decision": decisions[ticker], "reason": "test"}
+
+            self.bot._signal_scan_one_asset_v759 = fake_scan
+            text = self.bot.format_signal_scan_all_v759("scan-all-test")
+        finally:
+            self.bot.PAPER_TRADER_SCAN_TICKERS = old_tickers
+            self.bot.user_intervals.clear()
+            self.bot.user_intervals.update(old_interval)
+            self.bot._signal_scan_one_asset_v759 = old_scan
+
+        self.assertIn("Проверено: <b>3/3</b>", text)
+        self.assertIn("BTC — <b>WAIT</b>", text)
+        self.assertIn("ETH — <b>LONG</b>", text)
+        self.assertIn("XRP — <b>SHORT</b>", text)
 
     def test_runtime_process_scan_matches_exact_project_bot_runtime(self) -> None:
         old_rows = self.bot._runtime_python_process_rows_v756
