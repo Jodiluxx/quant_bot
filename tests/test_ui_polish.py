@@ -25,7 +25,7 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_autobot_keyboard_uses_existing_callbacks(self) -> None:
         rows = self.bot.autobot_keyboard(987654321)["inline_keyboard"]
         callbacks = {button["callback_data"] for row in rows for button in row}
-        for callback in {"paper_run_now", "paper_open_positions", "paper_closed_menu", "auto_settings", "runtime_diagnostics", "back_main"}:
+        for callback in {"paper_run_now", "paper_open_positions", "paper_closed_menu", "auto_settings", "runtime_diagnostics", "testnet_last_attempt", "back_main"}:
             self.assertIn(callback, callbacks)
         for hidden in {"setup_analytics", "prob_calibration", "bot_quality", "execution_status", "live_readiness"}:
             self.assertNotIn(hidden, callbacks)
@@ -285,7 +285,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.59 Compact Signal Scan UI")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.60 Last Testnet Attempt Report")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -301,6 +301,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("format_runtime_diagnostics", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("format_signal_scan_all", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("signal_scan_all_keyboard", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("format_last_trade_attempt", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("last_trade_attempt_keyboard", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
@@ -329,6 +331,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.57" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.58" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.59" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.60" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -352,6 +355,67 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("adaptive_quality_bucket_group", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("adaptive_quality_adjusted_winrate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+
+    def test_last_trade_attempt_report_explains_risk_gate_and_chain(self) -> None:
+        old_cycles = self.bot._demo_analysis_recent_cycles_v736
+        old_chain = self.bot._runtime_latest_chain_v755
+        try:
+            self.bot._demo_analysis_recent_cycles_v736 = lambda chat_id=None, limit=10: [
+                {
+                    "ts": "2026-06-02T17:36:00+00:00",
+                    "user_visible": {
+                        "status": "NO_TRADE",
+                        "reason": "Лучший сетап WAIT RETEST, но Testnet-gate остановил вход",
+                    },
+                    "selected": {
+                        "ticker": "XRPUSDT",
+                        "direction": "short",
+                        "interval": "15m",
+                        "entry_now": 69,
+                        "setup": 74,
+                    },
+                    "result": {"stage": "gate"},
+                    "scan": {
+                        "total_rows": 42,
+                        "top": [
+                            {
+                                "ticker": "XRPUSDT",
+                                "tf": "15m",
+                                "status": "WAIT RETEST",
+                                "entry_now": 69,
+                                "setup": 74,
+                            }
+                        ],
+                    },
+                }
+            ]
+            self.bot._runtime_latest_chain_v755 = lambda chat_id=None: {
+                "plan": {"ticker": "BNBUSDT", "direction": "long", "interval": "15m"},
+                "events": [
+                    {"type": "testnet_order_test", "ok": True, "submitted": True},
+                    {
+                        "type": "testnet_protection_order_test",
+                        "ok": False,
+                        "submitted": True,
+                        "reason": "protection price is invalid",
+                    },
+                ],
+            }
+
+            text = self.bot.format_last_trade_attempt_v760(987654321)
+        finally:
+            self.bot._demo_analysis_recent_cycles_v736 = old_cycles
+            self.bot._runtime_latest_chain_v755 = old_chain
+
+        self.assertIn("Последняя попытка", text)
+        self.assertIn("Проверено: <b>42</b>", text)
+        self.assertIn("XRP", text)
+        self.assertIn("NO_TRADE", text)
+        self.assertIn("Entry test", text)
+        self.assertIn("OK", text)
+        self.assertIn("Protection test", text)
+        self.assertIn("FAIL", text)
+        self.assertIn("не ошибка Binance", text)
 
     def test_runtime_diagnostics_shows_duplicate_processes_and_stage_gap(self) -> None:
         old_processes = self.bot._runtime_bot_processes_v755

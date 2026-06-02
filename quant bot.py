@@ -23257,7 +23257,203 @@ async def async_handle_update(session, update, sem):
         raise
 
 
-BOT_VERSION_LABEL = "v7.59 Compact Signal Scan UI"
+# ============================================================
+# v7.60 - LAST TESTNET TRADE ATTEMPT CARD
+# ============================================================
+# A compact user-facing report for the last demo bot cycle and the latest
+# exchange execution chain. It separates risk-gate WAIT/RETEST decisions from
+# actual Binance API rejections.
+
+_base_autobot_keyboard_v759_for_v760 = autobot_keyboard
+_base_async_handle_update_v759_for_v760 = async_handle_update
+
+
+def _last_demo_cycle_v760(chat_id):
+    rows = _demo_analysis_recent_cycles_v736(chat_id, 1)
+    return rows[0] if rows else None
+
+
+def _attempt_event_map_v760(chain):
+    out = {}
+    for event in list((chain or {}).get("events") or []):
+        event_type = str(event.get("type") or "")
+        kind = str(event.get("kind") or "")
+        if event_type == "testnet_order_test":
+            out["entry_test"] = event
+        elif event_type == "testnet_protection_order_test":
+            out["protection_test"] = event
+        elif event_type == TESTNET_REAL_EVENTS_FILE_KIND:
+            if kind in {"real_leverage", "real_entry", "real_protection", "real_emergency_close"}:
+                out[kind] = event
+        elif event_type == TESTNET_MONITOR_EVENTS_FILE_KIND:
+            out["monitor"] = event
+    return out
+
+
+def _attempt_status_v760(event):
+    if not event:
+        return "—"
+    if event.get("ok"):
+        return "OK"
+    if event.get("skipped") or event.get("submitted") is False:
+        return "BLOCK"
+    return "FAIL"
+
+
+def _attempt_reason_v760(event):
+    if not event:
+        return ""
+    reason = event.get("reason") or event.get("error")
+    response = event.get("response")
+    if not reason and isinstance(response, dict):
+        reason = response.get("msg") or response.get("code")
+    if not reason and isinstance(event.get("orders"), list):
+        bad = [x for x in event.get("orders") if not x.get("ok")]
+        if bad:
+            reason = bad[0].get("reason") or bad[0].get("status_code")
+    return _ui_short_text(reason, 110) if reason else ""
+
+
+def _attempt_stage_line_v760(label, event):
+    status = _attempt_status_v760(event)
+    reason = _attempt_reason_v760(event)
+    if reason and status != "OK":
+        return f"• {label}: <b>{status}</b> — {_ui_html(reason)}"
+    return f"• {label}: <b>{status}</b>"
+
+
+def _attempt_best_scan_line_v760(cycle):
+    scan = (cycle or {}).get("scan") or {}
+    top = list(scan.get("top") or [])
+    if not top:
+        return "Лучший сетап: данных нет"
+    row = top[0]
+    return (
+        "Лучший сетап: "
+        f"<b>{_ui_ticker_short(row.get('ticker'))} {_ui_tf_short(row.get('tf'))} {_ui_html(_ui_status_plain(row.get('status')))}</b> "
+        f"| Entry {row.get('entry_now', 0)}/100 | Setup {row.get('setup', 0)}/100"
+    )
+
+
+def _attempt_selected_line_v760(cycle):
+    selected = (cycle or {}).get("selected") or {}
+    if not selected:
+        return None
+    return (
+        "Выбран: "
+        f"<b>{_ui_ticker_short(selected.get('ticker'))} {str(selected.get('direction') or '').upper()} {_ui_tf_short(selected.get('interval'))}</b> "
+        f"| Entry {selected.get('entry_now', 0)}/100 | Setup {selected.get('setup', 0)}/100"
+    )
+
+
+def _attempt_meaning_v760(cycle, events):
+    decision = (cycle or {}).get("user_visible") or {}
+    status = str(decision.get("status") or "").upper()
+    reason = str(decision.get("reason") or "")
+    if status == "NO_TRADE":
+        return "Это не ошибка Binance: бот не нашёл READY-сетап и ждёт лучший вход."
+    if "WAIT" in reason or "ретест" in reason.lower() or "retest" in reason.lower():
+        return "Это risk-gate: идея есть, но вход сейчас не в лучшей зоне."
+    real_entry = events.get("real_entry")
+    if real_entry and not real_entry.get("ok"):
+        return "Это уже этап Binance/Testnet: смотри причину real-entry."
+    real_protection = events.get("real_protection")
+    if real_protection and not real_protection.get("ok"):
+        return "Entry мог пройти, но защита SL/TP не принята. Бот должен закрыть риск."
+    if real_entry and real_entry.get("ok") and real_protection and real_protection.get("ok"):
+        return "Цепочка принята: entry и защита прошли. Дальше важен монитор позиции."
+    return "Если real-entry не запускался, значит сетап/валидация остановили вход до биржи."
+
+
+def format_last_trade_attempt_v760(chat_id):
+    cycle = _last_demo_cycle_v760(chat_id)
+    chain = _runtime_latest_chain_v755(chat_id)
+    events = _attempt_event_map_v760(chain)
+    decision = (cycle or {}).get("user_visible") or {}
+    result = (cycle or {}).get("result") or {}
+    selected = _attempt_selected_line_v760(cycle)
+    plan = chain.get("plan") or {}
+    lines = ["🧾 <b>Последняя попытка сделки</b>"]
+    if not cycle and not plan:
+        return "\n".join(lines + ["", "Пока нет записанных попыток. Нажми <b>Скан сейчас</b>."])
+    if cycle:
+        ts = str(cycle.get("ts") or "")[:16].replace("T", " ")
+        status = str(decision.get("status") or result.get("stage") or "UNKNOWN").upper()
+        lines += [
+            "",
+            f"Цикл: <b>{_ui_html(ts)}</b>",
+            f"Решение: <b>{_ui_html(status)}</b>",
+        ]
+        if selected:
+            lines.append(selected)
+        else:
+            lines.append(_attempt_best_scan_line_v760(cycle))
+        reason = decision.get("reason") or result.get("reason")
+        if reason:
+            lines.append("Причина: " + _ui_html(_ui_short_text(reason, 180)))
+        scan = cycle.get("scan") or {}
+        lines.append(f"Проверено: <b>{scan.get('total_rows', 0)}</b> вариантов")
+    if plan:
+        lines += [
+            "",
+            "<b>Биржевая цепочка:</b>",
+            f"План: <b>{_ui_ticker_short(plan.get('ticker'))} {str(plan.get('direction') or '').upper()} {_ui_tf_short(plan.get('interval'))}</b>",
+            _attempt_stage_line_v760("Entry test", events.get("entry_test")),
+            _attempt_stage_line_v760("Protection test", events.get("protection_test")),
+            _attempt_stage_line_v760("Leverage", events.get("real_leverage")),
+            _attempt_stage_line_v760("Real entry", events.get("real_entry")),
+            _attempt_stage_line_v760("Real SL/TP", events.get("real_protection")),
+        ]
+        if events.get("real_emergency_close"):
+            lines.append(_attempt_stage_line_v760("Emergency close", events.get("real_emergency_close")))
+        if events.get("monitor"):
+            lines.append(_attempt_stage_line_v760("Monitor", events.get("monitor")))
+    lines += ["", "<b>Итог:</b>", _ui_html(_attempt_meaning_v760(cycle, events))]
+    return "\n".join(lines)
+
+
+def last_trade_attempt_keyboard_v760():
+    return {"inline_keyboard": [
+        [{"text": "🔄 Обновить", "callback_data": "testnet_last_attempt"}],
+        [{"text": "▶️ Скан сейчас", "callback_data": "paper_run_now"}],
+        [{"text": "◀️ Демо-бот", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def autobot_keyboard(chat_id):
+    keyboard = _base_autobot_keyboard_v759_for_v760(chat_id)
+    rows = [list(row) for row in keyboard.get("inline_keyboard") or []]
+    if not any(any(button.get("callback_data") == "testnet_last_attempt" for button in row) for row in rows):
+        insert_at = 0
+        for idx, row in enumerate(rows):
+            if any(button.get("callback_data") == "runtime_diagnostics" for button in row):
+                insert_at = idx
+                break
+        else:
+            insert_at = max(0, len(rows) - 1)
+        rows.insert(insert_at, [{"text": "🧾 Последняя попытка", "callback_data": "testnet_last_attempt"}])
+    return {"inline_keyboard": rows}
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            if data == "testnet_last_attempt":
+                chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+                callback_id = cb.get("id")
+                await _answer_callback_once_v732(session, callback_id, "Последняя попытка")
+                text = await asyncio.to_thread(format_last_trade_attempt_v760, chat_id)
+                await send_or_edit(session, update, text, last_trade_attempt_keyboard_v760())
+                return
+        await _base_async_handle_update_v759_for_v760(session, update, sem)
+    except Exception:
+        raise
+
+
+BOT_VERSION_LABEL = "v7.60 Last Testnet Attempt Report"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -23343,6 +23539,7 @@ RUNTIME_LAYERS = [
     ("v7.57", "collapse Python launcher wrappers in runtime diagnostics process count"),
     ("v7.58", "Binance Testnet server-time offset and -1021 retry for signed requests"),
     ("v7.59", "compact all-asset manual signal scan and version-free Telegram diagnostics"),
+    ("v7.60", "compact last Testnet attempt report for demo trading"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -23364,6 +23561,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "format_runtime_diagnostics": format_runtime_diagnostics,
     "format_signal_scan_all": format_signal_scan_all_v759,
     "signal_scan_all_keyboard": signal_scan_all_keyboard_v759,
+    "format_last_trade_attempt": format_last_trade_attempt_v760,
+    "last_trade_attempt_keyboard": last_trade_attempt_keyboard_v760,
     "format_signal_analysis_details": format_signal_analysis_details,
     "format_entry_plan_analysis": format_entry_plan_analysis,
     "format_auto_digest": format_auto_digest,
@@ -23602,6 +23801,10 @@ def validate_runtime_architecture():
         errors.append("all-asset signal scan formatter is missing")
     if not callable(globals().get("signal_scan_all_keyboard_v759")):
         errors.append("all-asset signal scan keyboard is missing")
+    if not callable(globals().get("format_last_trade_attempt_v760")):
+        errors.append("last trade attempt formatter is missing")
+    if not callable(globals().get("last_trade_attempt_keyboard_v760")):
+        errors.append("last trade attempt keyboard is missing")
     if not callable(globals().get("cancel_testnet_open_orders_v741")):
         errors.append("testnet cancel-open-orders helper is missing")
     if not callable(globals().get("cancel_testnet_algo_orders_v741")):
