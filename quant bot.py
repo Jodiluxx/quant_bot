@@ -23614,7 +23614,161 @@ def _record_testnet_journal_event_v721(kind, plan, result):
     return _testnet_journal_record_v721(kind, plan, result)
 
 
-BOT_VERSION_LABEL = "v7.62 Testnet Journal Compatibility"
+# ============================================================
+# v7.63 - TESTNET EXPLORATION GATE
+# ============================================================
+# Testnet is for learning execution. Keep real-risk discipline, but allow a
+# small class of strong WAIT_RETEST setups to be tested on demo when there are
+# no risk blockers and exchange validation can still protect the position.
+
+_base_paper_strategy_candidates_v762_for_v763 = _paper_strategy_candidates
+_base_testnet_candidate_block_reason_v762_for_v763 = _testnet_candidate_block_reason_v735
+
+TESTNET_EXPLORE_WAIT_RETEST_ENABLED_V763 = os.getenv("TESTNET_EXPLORE_WAIT_RETEST", "1").strip().lower() not in {"0", "false", "off", "no"}
+TESTNET_EXPLORE_MIN_ENTRY_NOW_V763 = int(os.getenv("TESTNET_EXPLORE_MIN_ENTRY_NOW", "68"))
+TESTNET_EXPLORE_MIN_SETUP_V763 = int(os.getenv("TESTNET_EXPLORE_MIN_SETUP", "74"))
+TESTNET_EXPLORE_MIN_RR_V763 = float(os.getenv("TESTNET_EXPLORE_MIN_RR", "1.60"))
+TESTNET_EXPLORE_MIN_CONFIDENCE_V763 = int(os.getenv("TESTNET_EXPLORE_MIN_CONFIDENCE", "58"))
+TESTNET_EXPLORE_MAX_WARNINGS_V763 = int(os.getenv("TESTNET_EXPLORE_MAX_WARNINGS", "2"))
+
+
+def _testnet_exploration_status_ok_v763(status):
+    return str(status or "").upper() in {"WAIT_RETEST", "WAIT RETEST"}
+
+
+def _testnet_exploration_metrics_v763(data):
+    data = data or {}
+    ep = data.get("entry_plan") or {}
+    risk = data.get("risk_levels") or {}
+    return {
+        "status": str(ep.get("status") or "").upper(),
+        "direction": str(data.get("direction") or "").lower(),
+        "rr": _safe_float(ep.get("rr_now"), 0) or _safe_float(risk.get("rr_ratio"), 0) or 0,
+        "entry_now": int(ep.get("entry_now_score", ep.get("score", 0)) or 0),
+        "setup": int(ep.get("setup_score", ep.get("score", 0)) or 0),
+        "confidence": int(data.get("confidence", 0) or 0),
+        "risk_blockers": list(data.get("risk_blockers") or []),
+        "warnings": list(data.get("risk_warnings") or []),
+    }
+
+
+def _testnet_exploration_data_block_v763(data):
+    if not TESTNET_EXPLORE_WAIT_RETEST_ENABLED_V763:
+        return "Testnet exploration выключен"
+    m = _testnet_exploration_metrics_v763(data)
+    if not _testnet_exploration_status_ok_v763(m["status"]):
+        return "entry status не WAIT RETEST"
+    if m["direction"] not in {"long", "short"}:
+        return "нет направления long/short"
+    if m["risk_blockers"]:
+        return "risk blocker: " + str(m["risk_blockers"][0])[:140]
+    if m["rr"] < TESTNET_EXPLORE_MIN_RR_V763:
+        return f"RR {m['rr']:.2f}x ниже exploration минимума {TESTNET_EXPLORE_MIN_RR_V763:.2f}x"
+    if m["entry_now"] < TESTNET_EXPLORE_MIN_ENTRY_NOW_V763:
+        return f"EntryNow {m['entry_now']}/100 ниже exploration минимума {TESTNET_EXPLORE_MIN_ENTRY_NOW_V763}/100"
+    if m["setup"] < TESTNET_EXPLORE_MIN_SETUP_V763:
+        return f"Setup {m['setup']}/100 ниже exploration минимума {TESTNET_EXPLORE_MIN_SETUP_V763}/100"
+    if m["confidence"] < TESTNET_EXPLORE_MIN_CONFIDENCE_V763:
+        return f"Confidence {m['confidence']}/100 ниже exploration минимума {TESTNET_EXPLORE_MIN_CONFIDENCE_V763}/100"
+    if len(m["warnings"]) > TESTNET_EXPLORE_MAX_WARNINGS_V763:
+        return f"слишком много warning-факторов: {len(m['warnings'])}"
+    return None
+
+
+def _paper_strategy_candidates(chat_id, ticker, interval, data):
+    rows = list(_base_paper_strategy_candidates_v762_for_v763(chat_id, ticker, interval, data) or [])
+    if rows:
+        return rows
+    block = _testnet_exploration_data_block_v763(data)
+    if block:
+        return rows
+
+    ep = data.get("entry_plan") or {}
+    m = _testnet_exploration_metrics_v763(data)
+    score = m["entry_now"] + max(0, m["setup"] - 70) + min(8, max(0, m["confidence"] - 60) // 4)
+    rows.append({
+        "strategy": "retest_explore_v1",
+        "score": score,
+        "ticker": ticker,
+        "interval": interval,
+        "direction": m["direction"],
+        "data": data,
+        "entry_plan": ep,
+        "testnet_exploration": True,
+        "reason": (
+            "Testnet exploration: WAIT RETEST, но метрики сильные "
+            f"EntryNow {m['entry_now']}/100, Setup {m['setup']}/100, RR {m['rr']:.2f}x"
+        ),
+        "metrics": {
+            "entry_now": m["entry_now"],
+            "setup": m["setup"],
+            "confidence": m["confidence"],
+            "rr": m["rr"],
+            "mode": "wait_retest_exploration",
+        },
+    })
+    return rows
+
+
+def _testnet_exploration_quality_block_v763(chat_id, candidate):
+    quality = _adaptive_quality_attach_v745(chat_id, candidate)
+    penalty = int(quality.get("penalty") or 0)
+    if penalty < ADAPTIVE_GATE_BLOCK_PENALTY_V745:
+        return None
+    ep = candidate.get("entry_plan") or {}
+    entry_now = int(ep.get("entry_now_score", ep.get("score", 0)) or 0)
+    setup = int(ep.get("setup_score", ep.get("score", 0)) or 0)
+    if min(entry_now, setup) >= ADAPTIVE_GATE_EXCEPTION_SCORE_V745:
+        return None
+    return "adaptive quality gate: waits for cleaner setup"
+
+
+def _testnet_candidate_block_reason_v735(chat_id, candidate, active_positions=None, pos_err=None, today_count=None):
+    if not (candidate or {}).get("testnet_exploration"):
+        return _base_testnet_candidate_block_reason_v762_for_v763(
+            chat_id,
+            candidate,
+            active_positions=active_positions,
+            pos_err=pos_err,
+            today_count=today_count,
+        )
+
+    data_block = _testnet_exploration_data_block_v763((candidate or {}).get("data") or {})
+    if data_block:
+        return data_block
+
+    candidate = candidate or {}
+    ticker = candidate.get("ticker")
+    direction = str(candidate.get("direction") or "").lower()
+    if active_positions is None:
+        active_positions, pos_err = _testnet_open_positions_v734()
+    if pos_err:
+        return "не удалось проверить открытые Testnet позиции: " + str(pos_err)[:120]
+    if len(active_positions) >= PAPER_TRADER_MAX_POSITIONS:
+        return f"достигнут лимит Testnet позиций {len(active_positions)}/{PAPER_TRADER_MAX_POSITIONS}"
+    same_dir = [
+        p for p in active_positions
+        if _testnet_position_direction_v735(p) == direction
+    ]
+    if len(same_dir) >= PAPER_TRADER_MAX_SAME_DIRECTION:
+        return f"уже есть Testnet позиция в сторону {direction.upper()}"
+    group = _paper_corr_group(ticker)
+    for pos in active_positions:
+        pos_ticker = _testnet_position_ticker_v735(pos)
+        if pos_ticker in group and _testnet_position_direction_v735(pos) == direction:
+            return f"коррелированный Testnet актив уже открыт: {_ui_ticker_short(pos_ticker)} {direction.upper()}"
+    if today_count is None:
+        today_count = _testnet_today_real_entry_count_v734(chat_id)
+    if today_count >= PAPER_TRADER_MAX_TRADES_PER_DAY:
+        return f"достигнут дневной лимит Testnet сделок {today_count}/{PAPER_TRADER_MAX_TRADES_PER_DAY}"
+
+    plan = _build_testnet_trade_plan_v734(chat_id, candidate)
+    if plan.get("blockers"):
+        return "; ".join(str(x) for x in plan.get("blockers")[:3])
+    return _testnet_exploration_quality_block_v763(chat_id, candidate)
+
+
+BOT_VERSION_LABEL = "v7.63 Testnet Exploration Gate"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -23703,6 +23857,7 @@ RUNTIME_LAYERS = [
     ("v7.60", "compact last Testnet attempt report for demo trading"),
     ("v7.61", "bounded runtime caches and shared Fear & Greed HTTP session"),
     ("v7.62", "compatibility alias for Testnet journal event recording"),
+    ("v7.63", "Testnet exploration gate for strong WAIT RETEST demo setups"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -23773,6 +23928,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "adaptive_quality_row_is_fresh": _adaptive_quality_row_is_fresh_v747,
     "adaptive_quality_bucket_group": _adaptive_quality_bucket_group_v748,
     "adaptive_quality_adjusted_winrate": _adaptive_quality_adjusted_winrate_v749,
+    "testnet_exploration_data_block": _testnet_exploration_data_block_v763,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -24005,6 +24161,8 @@ def validate_runtime_architecture():
         errors.append("adaptive setup quality bucket grouping helper is missing")
     if not callable(globals().get("_adaptive_quality_adjusted_winrate_v749")):
         errors.append("adaptive setup quality adjusted winrate helper is missing")
+    if not callable(globals().get("_testnet_exploration_data_block_v763")):
+        errors.append("Testnet exploration gate helper is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):

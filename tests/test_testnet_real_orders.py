@@ -279,6 +279,88 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
         self.assertEqual(len(state.get("events") or []), 1)
         self.assertTrue(callable(self.bot._record_testnet_journal_event_v721))
 
+    def test_testnet_exploration_adds_strong_wait_retest_candidate(self) -> None:
+        data = {
+            "direction": "long",
+            "confidence": 76,
+            "risk_blockers": [],
+            "risk_warnings": ["minor warning"],
+            "risk_levels": {"rr_ratio": 1.67},
+            "entry_plan": {
+                "status": "WAIT_RETEST",
+                "entry_now_score": 69,
+                "setup_score": 76,
+                "rr_now": 1.67,
+                "sl": 95.0,
+                "tp1": 110.0,
+                "tp2": 120.0,
+            },
+        }
+
+        rows = self.bot._paper_strategy_candidates("1", "BTCUSDT", "15m", data)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["strategy"], "retest_explore_v1")
+        self.assertTrue(rows[0]["testnet_exploration"])
+        self.assertEqual(rows[0]["direction"], "long")
+
+    def test_testnet_exploration_does_not_add_weak_wait_candidate(self) -> None:
+        data = {
+            "direction": "short",
+            "confidence": 80,
+            "risk_blockers": [],
+            "risk_levels": {"rr_ratio": 1.67},
+            "entry_plan": {
+                "status": "WAIT_RETEST",
+                "entry_now_score": 55,
+                "setup_score": 80,
+                "rr_now": 1.67,
+            },
+        }
+
+        rows = self.bot._paper_strategy_candidates("1", "BTCUSDT", "15m", data)
+
+        self.assertEqual(rows, [])
+        self.assertIn("EntryNow", self.bot._testnet_exploration_data_block_v763(data))
+
+    def test_testnet_exploration_candidate_can_pass_testnet_gate(self) -> None:
+        data = {
+            "direction": "long",
+            "confidence": 76,
+            "risk_blockers": [],
+            "risk_warnings": [],
+            "risk_levels": {"rr_ratio": 1.67},
+            "entry_plan": {
+                "status": "WAIT_RETEST",
+                "entry_now_score": 70,
+                "setup_score": 76,
+                "rr_now": 1.67,
+                "live_price": 100.0,
+                "sl": 95.0,
+                "tp1": 110.0,
+                "tp2": 120.0,
+            },
+        }
+        candidate = self.bot._paper_strategy_candidates("1", "BTCUSDT", "15m", data)[0]
+        old_plan = self.bot._build_testnet_trade_plan_v734
+        old_quality = self.bot._adaptive_quality_attach_v745
+        try:
+            self.bot._build_testnet_trade_plan_v734 = lambda chat_id, cand: {"blockers": []}
+            self.bot._adaptive_quality_attach_v745 = lambda chat_id, cand: {"penalty": 0}
+
+            reason = self.bot._testnet_candidate_block_reason_v735(
+                "1",
+                candidate,
+                active_positions=[],
+                pos_err=None,
+                today_count=0,
+            )
+        finally:
+            self.bot._build_testnet_trade_plan_v734 = old_plan
+            self.bot._adaptive_quality_attach_v745 = old_quality
+
+        self.assertIsNone(reason)
+
 
 if __name__ == "__main__":
     unittest.main()
