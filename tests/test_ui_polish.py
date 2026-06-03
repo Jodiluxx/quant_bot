@@ -5,6 +5,7 @@ import os
 import tempfile
 
 import unittest
+from datetime import datetime, timezone
 
 from quant_bot.legacy import load_bot_module
 
@@ -34,7 +35,12 @@ class TelegramUiPolishTests(unittest.TestCase):
         rows = self.bot.signal_menu_keyboard(987654321)["inline_keyboard"]
         callbacks = {button["callback_data"] for row in rows for button in row}
         self.assertIn("get_signal", callbacks)
-        self.assertIn("signal_scan_all", callbacks)
+        self.assertIn("signal_scan_crypto", callbacks)
+        self.assertIn("signal_scan_stocks", callbacks)
+        self.assertIn("signal_scan_commodities", callbacks)
+        self.assertIn("sig_crypto_tickers", callbacks)
+        self.assertIn("sig_stock_tickers", callbacks)
+        self.assertIn("sig_commodity_tickers", callbacks)
 
     def test_signal_card_is_compact_and_html_escapes_dynamic_text(self) -> None:
         text = self.bot.format_signal_summary(
@@ -86,7 +92,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         for callback in {"menu_signal", "menu_autobot", "paper_run_now", "auto_settings", "runtime_diagnostics"}:
             self.assertFalse(self.bot._simple_hidden_callback_v731(callback))
 
-    def test_auto_signal_defaults_scan_all_tf_every_15m(self) -> None:
+    def test_auto_signal_defaults_scan_all_tf_every_5m(self) -> None:
         chat_id = "auto-defaults-v752"
         st = self.bot._get_auto_task_settings(chat_id, "signals")
         st["send_interval"] = "30m"
@@ -94,7 +100,7 @@ class TelegramUiPolishTests(unittest.TestCase):
 
         self.bot._simple_sync_public_auto_settings(chat_id)
 
-        self.assertEqual(st["send_interval"], "15m")
+        self.assertEqual(st["send_interval"], "5m")
         self.assertIsNone(st["tf"])
         self.assertEqual(self.bot.PAPER_TRADER_TFS, self.bot.AUTO_SIGNAL_SCAN_TFS_V752)
         self.assertIn("4h", self.bot.AUTO_SIGNAL_SCAN_TFS_V752)
@@ -109,6 +115,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         old_scan = self.bot._paper_scan_one_v74
         old_open = self.bot._testnet_open_positions_v734
         old_today = self.bot._testnet_today_real_entry_count_v734
+        old_auto_tickers = self.bot._auto_signal_scan_tickers_v764
         calls = []
 
         def fake_scan(chat_id, ticker, tf):
@@ -128,6 +135,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.bot._paper_scan_one_v74 = fake_scan
         self.bot._testnet_open_positions_v734 = lambda: ([], None)
         self.bot._testnet_today_real_entry_count_v734 = lambda chat_id=None: 0
+        self.bot._auto_signal_scan_tickers_v764 = lambda now_utc=None: ["BTCUSDT"]
         try:
             msg = self.bot.build_auto_signals_message("auto-silent-v752")
         finally:
@@ -137,6 +145,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._paper_scan_one_v74 = old_scan
             self.bot._testnet_open_positions_v734 = old_open
             self.bot._testnet_today_real_entry_count_v734 = old_today
+            self.bot._auto_signal_scan_tickers_v764 = old_auto_tickers
 
         self.assertIsNone(msg)
         self.assertCountEqual(calls, [("BTCUSDT", "5m"), ("BTCUSDT", "15m"), ("BTCUSDT", "4h")])
@@ -149,6 +158,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         old_open = self.bot._testnet_open_positions_v734
         old_today = self.bot._testnet_today_real_entry_count_v734
         old_plan = self.bot._build_testnet_trade_plan_v734
+        old_auto_tickers = self.bot._auto_signal_scan_tickers_v764
+        old_auto_tickers = self.bot._auto_signal_scan_tickers_v764
 
         def fake_scan(chat_id, ticker, tf):
             row = {
@@ -200,6 +211,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.bot._testnet_open_positions_v734 = lambda: ([], None)
         self.bot._testnet_today_real_entry_count_v734 = lambda chat_id=None: 0
         self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: {"blockers": []}
+        self.bot._auto_signal_scan_tickers_v764 = lambda now_utc=None: ["BTCUSDT"]
         try:
             msg = self.bot.build_auto_signals_message("auto-ready-v752")
         finally:
@@ -210,12 +222,12 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_open_positions_v734 = old_open
             self.bot._testnet_today_real_entry_count_v734 = old_today
             self.bot._build_testnet_trade_plan_v734 = old_plan
+            self.bot._auto_signal_scan_tickers_v764 = old_auto_tickers
 
         self.assertIsNotNone(msg)
         self.assertIn("Авто-сигнал", msg)
         self.assertIn("BTCUSDT", msg)
         self.assertIn("LONG", msg)
-        self.assertIn("совпадает с демо-ботом", msg)
         self.assertNotIn("WAIT", msg.splitlines()[0])
 
     def test_auto_signal_is_silent_when_demo_trade_gate_blocks_candidate(self) -> None:
@@ -226,6 +238,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         old_open = self.bot._testnet_open_positions_v734
         old_today = self.bot._testnet_today_real_entry_count_v734
         old_plan = self.bot._build_testnet_trade_plan_v734
+        old_auto_tickers = self.bot._auto_signal_scan_tickers_v764
 
         def fake_scan(chat_id, ticker, tf):
             data = {
@@ -271,6 +284,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.bot._testnet_open_positions_v734 = lambda: ([{}] * self.bot.PAPER_TRADER_MAX_POSITIONS, None)
         self.bot._testnet_today_real_entry_count_v734 = lambda chat_id=None: 0
         self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: {"blockers": []}
+        self.bot._auto_signal_scan_tickers_v764 = lambda now_utc=None: ["XRPUSDT"]
         try:
             msg = self.bot.build_auto_signals_message("auto-blocked-v753")
         finally:
@@ -281,11 +295,12 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_open_positions_v734 = old_open
             self.bot._testnet_today_real_entry_count_v734 = old_today
             self.bot._build_testnet_trade_plan_v734 = old_plan
+            self.bot._auto_signal_scan_tickers_v764 = old_auto_tickers
 
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.63 Testnet Exploration Gate")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.65 Delay-Aware Stocks and Commodities")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -307,6 +322,11 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("prune_runtime_caches", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("record_testnet_journal_event", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_exploration_data_block", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("nyse_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("commodities_market_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("stock_ohlcv", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("auto_signal_scan_tickers", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("auto_signal_scan_pairs", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
@@ -339,6 +359,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.61" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.62" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.63" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.64" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.65" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -487,8 +509,10 @@ class TelegramUiPolishTests(unittest.TestCase):
         old_tickers = self.bot.PAPER_TRADER_SCAN_TICKERS
         old_interval = dict(self.bot.user_intervals)
         old_scan = self.bot._signal_scan_one_asset_v759
+        old_auto_tickers = self.bot._auto_signal_scan_tickers_v764
         try:
             self.bot.PAPER_TRADER_SCAN_TICKERS = ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
+            self.bot._auto_signal_scan_tickers_v764 = lambda now_utc=None: ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
             self.bot.user_intervals["scan-all-test"] = "1h"
 
             def fake_scan(chat_id, ticker, interval):
@@ -502,11 +526,89 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot.user_intervals.clear()
             self.bot.user_intervals.update(old_interval)
             self.bot._signal_scan_one_asset_v759 = old_scan
+            self.bot._auto_signal_scan_tickers_v764 = old_auto_tickers
 
         self.assertIn("Проверено: <b>3/3</b>", text)
         self.assertIn("BTC — <b>WAIT</b>", text)
         self.assertIn("ETH — <b>LONG</b>", text)
         self.assertIn("XRP — <b>SHORT</b>", text)
+
+    def test_stock_and_commodity_universe_is_signal_only_and_session_gated(self) -> None:
+        self.assertEqual(self.bot.STOCK_SIGNAL_TICKERS_V764, ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL"])
+        self.assertEqual(self.bot.COMMODITY_SIGNAL_TICKERS_V765, ["XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD", "USOIL", "UKOIL", "COPPER"])
+        self.assertEqual(self.bot.YAHOO_SIGNAL_SYMBOLS_V765["XAUUSD"], "GC=F")
+        self.assertEqual(self.bot.YAHOO_SIGNAL_SYMBOLS_V765["XAGUSD"], "SI=F")
+        self.assertFalse(any(ticker in self.bot.PAPER_TRADER_SCAN_TICKERS for ticker in self.bot.STOCK_SIGNAL_TICKERS_V764))
+        self.assertFalse(any(ticker in self.bot.PAPER_TRADER_SCAN_TICKERS for ticker in self.bot.COMMODITY_SIGNAL_TICKERS_V765))
+        self.assertEqual(self.bot.DELAYED_YAHOO_SIGNAL_TFS_V765, ["30m", "45m", "1h", "4h"])
+        self.assertNotIn("5m", self.bot.DELAYED_YAHOO_SIGNAL_TFS_V765)
+        self.assertNotIn("15m", self.bot.DELAYED_YAHOO_SIGNAL_TFS_V765)
+
+        old_force = os.environ.pop("STOCK_SIGNALS_FORCE_NYSE_OPEN", None)
+        old_commodity_force = os.environ.pop("COMMODITY_SIGNALS_FORCE_OPEN", None)
+        try:
+            before_open = datetime(2026, 6, 3, 13, 0, tzinfo=timezone.utc)
+            regular_session = datetime(2026, 6, 3, 14, 30, tzinfo=timezone.utc)
+            saturday = datetime(2026, 6, 6, 12, 0, tzinfo=timezone.utc)
+            self.assertFalse(self.bot.nyse_is_open_v764(before_open))
+            self.assertTrue(self.bot.nyse_is_open_v764(regular_session))
+            self.assertTrue(self.bot.commodities_market_is_open_v765(before_open))
+            self.assertFalse(self.bot.commodities_market_is_open_v765(saturday))
+            self.assertNotIn("AAPL", self.bot._auto_signal_scan_tickers_v764(before_open))
+            self.assertIn("XAUUSD", self.bot._auto_signal_scan_tickers_v764(before_open))
+            self.assertIn("AAPL", self.bot._auto_signal_scan_tickers_v764(regular_session))
+            self.assertNotIn("XAUUSD", self.bot._auto_signal_scan_tickers_v764(saturday))
+        finally:
+            if old_force is not None:
+                os.environ["STOCK_SIGNALS_FORCE_NYSE_OPEN"] = old_force
+            if old_commodity_force is not None:
+                os.environ["COMMODITY_SIGNALS_FORCE_OPEN"] = old_commodity_force
+
+    def test_delayed_yahoo_assets_use_slow_timeframes_in_auto_scan(self) -> None:
+        old_force = os.environ.get("STOCK_SIGNALS_FORCE_NYSE_OPEN")
+        old_commodity_force = os.environ.get("COMMODITY_SIGNALS_FORCE_OPEN")
+        try:
+            os.environ["STOCK_SIGNALS_FORCE_NYSE_OPEN"] = "1"
+            os.environ["COMMODITY_SIGNALS_FORCE_OPEN"] = "1"
+            pairs = self.bot._auto_signal_scan_pairs_v765()
+            aapl_tfs = [tf for ticker, tf in pairs if ticker == "AAPL"]
+            xau_tfs = [tf for ticker, tf in pairs if ticker == "XAUUSD"]
+            btc_tfs = [tf for ticker, tf in pairs if ticker == "BTCUSDT"]
+            self.assertEqual(aapl_tfs, ["30m", "45m", "1h", "4h"])
+            self.assertEqual(xau_tfs, ["30m", "45m", "1h", "4h"])
+            self.assertIn("5m", btc_tfs)
+            self.assertIn("15m", btc_tfs)
+        finally:
+            if old_force is None:
+                os.environ.pop("STOCK_SIGNALS_FORCE_NYSE_OPEN", None)
+            else:
+                os.environ["STOCK_SIGNALS_FORCE_NYSE_OPEN"] = old_force
+            if old_commodity_force is None:
+                os.environ.pop("COMMODITY_SIGNALS_FORCE_OPEN", None)
+            else:
+                os.environ["COMMODITY_SIGNALS_FORCE_OPEN"] = old_commodity_force
+
+    def test_stock_chart_parser_supports_manual_signals(self) -> None:
+        old_fetch = self.bot._stock_fetch_yahoo_chart_v764
+        try:
+            timestamps = list(range(1, 121))
+            quote = {
+                "open": [100.0 + i * 0.1 for i in range(120)],
+                "high": [100.5 + i * 0.1 for i in range(120)],
+                "low": [99.5 + i * 0.1 for i in range(120)],
+                "close": [100.2 + i * 0.1 for i in range(120)],
+                "volume": [1000 + i for i in range(120)],
+            }
+            fake_result = {"timestamp": timestamps, "indicators": {"quote": [quote]}, "meta": {"regularMarketPrice": 112.34}}
+            seen = []
+            self.bot._stock_fetch_yahoo_chart_v764 = lambda ticker, interval: seen.append((ticker, interval)) or fake_result
+            data = self.bot.get_ohlcv("AAPL", "5m")
+            self.assertEqual(len(data), 5)
+            self.assertGreaterEqual(len(data[3]), 50)
+            self.assertEqual(self.bot.get_price("AAPL"), 112.34)
+            self.assertIn(("AAPL", "1h"), seen)
+        finally:
+            self.bot._stock_fetch_yahoo_chart_v764 = old_fetch
 
     def test_runtime_process_scan_matches_exact_project_bot_runtime(self) -> None:
         old_rows = self.bot._runtime_python_process_rows_v756

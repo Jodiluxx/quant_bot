@@ -23768,7 +23768,691 @@ def _testnet_candidate_block_reason_v735(chat_id, candidate, active_positions=No
     return _testnet_exploration_quality_block_v763(chat_id, candidate)
 
 
-BOT_VERSION_LABEL = "v7.63 Testnet Exploration Gate"
+# ============================================================
+# v7.64/v7.65 - DELAY-AWARE STOCK AND COMMODITY SIGNAL UNIVERSE
+# ============================================================
+# Stocks and commodities are signal-only assets. Binance Testnet execution remains crypto-only.
+
+_base_get_ohlcv_v763_for_v764 = get_ohlcv
+_base_get_price_v763_for_v764 = get_price
+_base_format_main_status_v763_for_v764 = format_main_status
+_base_signal_menu_keyboard_v763_for_v764 = signal_menu_keyboard
+_base_compact_signal_keyboard_v763_for_v764 = compact_signal_keyboard
+_base_format_signal_menu_text_v763_for_v764 = format_signal_menu_text
+_base_format_signal_summary_v763_for_v764 = format_signal_summary
+_base_signal_ticker_keyboard_v763_for_v764 = signal_ticker_keyboard
+_base_simple_sync_public_auto_settings_v763_for_v764 = _simple_sync_public_auto_settings
+_base_auto_settings_text_v763_for_v764 = auto_settings_text
+_base_auto_task_keyboard_v763_for_v764 = auto_task_keyboard
+_base_task_status_line_v763_for_v764 = _task_status_line
+_base_async_handle_update_v763_for_v764 = async_handle_update
+
+STOCK_SIGNAL_TICKERS_V764 = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL"]
+COMMODITY_SIGNAL_TICKERS_V765 = ["XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD", "USOIL", "UKOIL", "COPPER"]
+YAHOO_SIGNAL_SYMBOLS_V765 = {
+    "XAUUSD": "GC=F",
+    "XAGUSD": "SI=F",
+    "XPTUSD": "PL=F",
+    "XPDUSD": "PA=F",
+    "USOIL": "CL=F",
+    "UKOIL": "BZ=F",
+    "COPPER": "HG=F",
+}
+COMMODITY_SIGNAL_LABELS_V765 = {
+    "XAUUSD": "🥇 XAUUSD",
+    "XAGUSD": "🥈 XAGUSD",
+    "XPTUSD": "⚪ XPTUSD",
+    "XPDUSD": "⚙️ XPDUSD",
+    "USOIL": "🛢 USOIL",
+    "UKOIL": "🛢 UKOIL",
+    "COPPER": "🟠 COPPER",
+}
+SIGNAL_CRYPTO_TICKERS_V764 = list(AUTO_CRYPTO_TICKERS)
+DELAYED_YAHOO_SIGNAL_TFS_V765 = ["30m", "45m", "1h", "4h"]
+DELAYED_YAHOO_DEFAULT_TF_V765 = "1h"
+STOCK_YAHOO_CHART_URL_V764 = "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+STOCK_CHART_RANGE_V764 = {
+    "5m": ("5m", "10d"),
+    "15m": ("15m", "30d"),
+    "30m": ("30m", "60d"),
+    "1h": ("60m", "730d"),
+    "1d": ("1d", "2y"),
+}
+STOCK_AGG_INTERVALS_V764 = {
+    "45m": ("15m", 3),
+    "4h": ("1h", 4),
+}
+NYSE_HOLIDAYS_2026_V764 = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+    "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+    "2026-11-26", "2026-12-25",
+}
+
+for _stock_symbol_v764 in STOCK_SIGNAL_TICKERS_V764:
+    TICKERS.setdefault(_stock_symbol_v764, {"label": f"📈 {_stock_symbol_v764}", "type": "stock"})
+for _commodity_symbol_v765 in COMMODITY_SIGNAL_TICKERS_V765:
+    TICKERS.setdefault(_commodity_symbol_v765, {"label": COMMODITY_SIGNAL_LABELS_V765[_commodity_symbol_v765], "type": "commodity"})
+
+
+def _is_stock_ticker_v764(ticker):
+    return str(ticker or "").upper() in STOCK_SIGNAL_TICKERS_V764
+
+
+def _is_commodity_ticker_v765(ticker):
+    return str(ticker or "").upper() in COMMODITY_SIGNAL_TICKERS_V765
+
+
+def _is_delayed_yahoo_signal_ticker_v765(ticker):
+    return _is_stock_ticker_v764(ticker) or _is_commodity_ticker_v765(ticker)
+
+
+def _is_crypto_ticker_v764(ticker):
+    return str(ticker or "").upper() in SIGNAL_CRYPTO_TICKERS_V764
+
+
+def _ui_signal_symbol_v764(ticker):
+    short = _ui_ticker_short(ticker)
+    return short if _is_delayed_yahoo_signal_ticker_v765(ticker) else f"{short}USDT"
+
+
+def _asset_group_label_v764(ticker):
+    if _is_stock_ticker_v764(ticker):
+        return "акция"
+    if _is_commodity_ticker_v765(ticker):
+        return "сырьё"
+    return "крипто"
+
+
+def _safe_signal_interval_v765(ticker, interval):
+    if _is_delayed_yahoo_signal_ticker_v765(ticker) and interval not in DELAYED_YAHOO_SIGNAL_TFS_V765:
+        return DELAYED_YAHOO_DEFAULT_TF_V765
+    return interval
+
+
+def _signal_tfs_for_asset_v765(ticker):
+    if _is_delayed_yahoo_signal_ticker_v765(ticker):
+        return list(DELAYED_YAHOO_SIGNAL_TFS_V765)
+    return list(AUTO_SIGNAL_SCAN_TFS_V752)
+
+
+def nyse_is_open_v764(now_utc=None):
+    override = os.getenv("STOCK_SIGNALS_FORCE_NYSE_OPEN", "").strip().lower()
+    if override in {"1", "true", "on", "yes"}:
+        return True
+    if override in {"0", "false", "off", "no"}:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        now_utc = now_utc or datetime.now(timezone.utc)
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=timezone.utc)
+        ny = now_utc.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        now_utc = now_utc or datetime.now(timezone.utc)
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=timezone.utc)
+        ny = now_utc - timedelta(hours=4)
+    if ny.weekday() >= 5:
+        return False
+    if ny.date().isoformat() in NYSE_HOLIDAYS_2026_V764:
+        return False
+    current = ny.time()
+    return current >= datetime.strptime("09:30", "%H:%M").time() and current < datetime.strptime("16:00", "%H:%M").time()
+
+
+def commodities_market_is_open_v765(now_utc=None):
+    override = os.getenv("COMMODITY_SIGNALS_FORCE_OPEN", "").strip().lower()
+    if override in {"1", "true", "on", "yes"}:
+        return True
+    if override in {"0", "false", "off", "no"}:
+        return False
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    weekday = now_utc.weekday()
+    if weekday == 5:
+        return False
+    if weekday == 6:
+        return now_utc.hour >= 22
+    if weekday == 4:
+        return now_utc.hour < 22
+    return True
+
+
+def _stock_fetch_yahoo_chart_v764(ticker, interval):
+    ticker = str(ticker or "").upper()
+    yahoo_symbol = YAHOO_SIGNAL_SYMBOLS_V765.get(ticker, ticker)
+    if interval in STOCK_AGG_INTERVALS_V764:
+        base_interval, _ = STOCK_AGG_INTERVALS_V764[interval]
+    else:
+        base_interval = interval
+    if base_interval not in STOCK_CHART_RANGE_V764:
+        raise ValueError(f"Stock interval is unsupported: {interval}")
+    yahoo_interval, range_value = STOCK_CHART_RANGE_V764[base_interval]
+    response = _session.get(
+        STOCK_YAHOO_CHART_URL_V764.format(symbol=yahoo_symbol),
+        params={
+            "interval": yahoo_interval,
+            "range": range_value,
+            "includePrePost": "false",
+            "events": "history",
+        },
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    chart = payload.get("chart") if isinstance(payload, dict) else None
+    if not isinstance(chart, dict):
+        raise ValueError(f"Yahoo chart error: {payload}")
+    if chart.get("error"):
+        raise ValueError(f"Yahoo chart error: {chart.get('error')}")
+    result = (chart.get("result") or [None])[0]
+    if not isinstance(result, dict):
+        raise ValueError(f"Yahoo chart returned no data for {ticker}")
+    return result
+
+
+def _stock_arrays_from_yahoo_result_v764(result):
+    timestamps = list((result or {}).get("timestamp") or [])
+    quote = (((result or {}).get("indicators") or {}).get("quote") or [{}])[0]
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    volumes = quote.get("volume") or [0] * len(timestamps)
+    rows = []
+    for idx, ts in enumerate(timestamps):
+        try:
+            row = (
+                int(ts),
+                float(opens[idx]),
+                float(highs[idx]),
+                float(lows[idx]),
+                float(closes[idx]),
+                float(volumes[idx] or 0),
+            )
+        except (TypeError, ValueError, IndexError):
+            continue
+        if all(math.isfinite(x) for x in row[1:5]):
+            rows.append(row)
+    rows.sort(key=lambda x: x[0])
+    if len(rows) < 50:
+        raise ValueError(f"Not enough stock candles: {len(rows)}")
+    rows = rows[-600:]
+    return (
+        [x[1] for x in rows],
+        [x[2] for x in rows],
+        [x[3] for x in rows],
+        [x[4] for x in rows],
+        [x[5] for x in rows],
+    )
+
+
+def _aggregate_stock_ohlcv_v764(data, group_size):
+    opens, highs, lows, closes, volumes = data
+    grouped = []
+    total = min(len(opens), len(highs), len(lows), len(closes), len(volumes))
+    start = total % int(group_size)
+    for idx in range(start, total, int(group_size)):
+        end = idx + int(group_size)
+        if end > total:
+            break
+        grouped.append((
+            opens[idx],
+            max(highs[idx:end]),
+            min(lows[idx:end]),
+            closes[end - 1],
+            sum(volumes[idx:end]),
+        ))
+    if len(grouped) < 50:
+        raise ValueError(f"Not enough aggregated stock candles: {len(grouped)}")
+    grouped = grouped[-500:]
+    return (
+        [x[0] for x in grouped],
+        [x[1] for x in grouped],
+        [x[2] for x in grouped],
+        [x[3] for x in grouped],
+        [x[4] for x in grouped],
+    )
+
+
+def _stock_ohlcv_v764(ticker, interval):
+    ticker = str(ticker or "").upper()
+    if interval in STOCK_AGG_INTERVALS_V764:
+        base_interval, group_size = STOCK_AGG_INTERVALS_V764[interval]
+        result = _stock_fetch_yahoo_chart_v764(ticker, base_interval)
+        return _aggregate_stock_ohlcv_v764(_stock_arrays_from_yahoo_result_v764(result), group_size)
+    result = _stock_fetch_yahoo_chart_v764(ticker, interval)
+    arrays = _stock_arrays_from_yahoo_result_v764(result)
+    return tuple(part[-500:] for part in arrays)
+
+
+def _stock_price_v764(ticker):
+    result = _stock_fetch_yahoo_chart_v764(ticker, "5m")
+    meta = result.get("meta") or {}
+    for key in ("regularMarketPrice", "previousClose", "chartPreviousClose"):
+        value = _safe_float(meta.get(key), None)
+        if value and value > 0:
+            return value
+    return _stock_arrays_from_yahoo_result_v764(result)[3][-1]
+
+
+def get_ohlcv(ticker, interval):
+    if _is_delayed_yahoo_signal_ticker_v765(ticker):
+        return _stock_ohlcv_v764(ticker, _safe_signal_interval_v765(ticker, interval))
+    return _base_get_ohlcv_v763_for_v764(ticker, interval)
+
+
+def get_price(ticker):
+    if _is_delayed_yahoo_signal_ticker_v765(ticker):
+        return _stock_price_v764(ticker)
+    return _base_get_price_v763_for_v764(ticker)
+
+
+def _signal_universe_for_group_v764(group):
+    if group == "stocks":
+        return list(STOCK_SIGNAL_TICKERS_V764)
+    if group == "commodities":
+        return list(COMMODITY_SIGNAL_TICKERS_V765)
+    if group == "crypto":
+        return list(SIGNAL_CRYPTO_TICKERS_V764)
+    return _auto_signal_scan_tickers_v764()
+
+
+def _auto_signal_scan_tickers_v764(now_utc=None):
+    tickers = list(SIGNAL_CRYPTO_TICKERS_V764)
+    if commodities_market_is_open_v765(now_utc):
+        tickers.extend(COMMODITY_SIGNAL_TICKERS_V765)
+    if nyse_is_open_v764(now_utc):
+        tickers.extend(STOCK_SIGNAL_TICKERS_V764)
+    return tickers
+
+
+def _auto_signal_scan_pairs_v765(now_utc=None):
+    pairs = []
+    for ticker in _auto_signal_scan_tickers_v764(now_utc):
+        pairs.extend((ticker, tf) for tf in _signal_tfs_for_asset_v765(ticker))
+    return pairs
+
+
+def _auto_signal_universe_label_v765(now_utc=None):
+    groups = ["крипто"]
+    if commodities_market_is_open_v765(now_utc):
+        groups.append("сырьё")
+    if nyse_is_open_v764(now_utc):
+        groups.append("акции")
+    return " + ".join(groups)
+
+
+def format_main_status(chat_id):
+    text = _base_format_main_status_v763_for_v764(chat_id)
+    nyse_open = nyse_is_open_v764()
+    commodity_open = commodities_market_is_open_v765()
+    nyse_state = "открыта" if nyse_open else "закрыта"
+    commodity_state = "ON" if commodity_open else "OFF"
+    return text + f"\n• Акции: <b>{'ON' if nyse_open else 'OFF'}</b> | NYSE {nyse_state}\n• Сырьё: <b>{commodity_state}</b> | 24/5"
+
+
+def _ticker_category_keyboard_v764():
+    return {"inline_keyboard": [
+        [{"text": "🪙 Крипто", "callback_data": "sig_crypto_tickers"}],
+        [{"text": "📈 Акции", "callback_data": "sig_stock_tickers"}],
+        [{"text": "⛏ Сырьё", "callback_data": "sig_commodity_tickers"}],
+        [{"text": "◀️ Назад к сигналу", "callback_data": "menu_signal"}],
+    ]}
+
+
+def _ticker_list_keyboard_v764(tickers, back_callback="sig_change_ticker"):
+    rows = []
+    for idx in range(0, len(tickers), 2):
+        rows.append([
+            {"text": TICKERS[k]["label"], "callback_data": f"sig_ticker_{k}"}
+            for k in tickers[idx:idx + 2]
+        ])
+    rows.append([{"text": "◀️ Категории", "callback_data": back_callback}])
+    rows.append([{"text": "🏠 Главное меню", "callback_data": "back_main"}])
+    return {"inline_keyboard": rows}
+
+
+def signal_ticker_keyboard():
+    return _ticker_category_keyboard_v764()
+
+
+def signal_crypto_ticker_keyboard_v764():
+    return _ticker_list_keyboard_v764(SIGNAL_CRYPTO_TICKERS_V764)
+
+
+def signal_stock_ticker_keyboard_v764():
+    return _ticker_list_keyboard_v764(STOCK_SIGNAL_TICKERS_V764)
+
+
+def signal_commodity_ticker_keyboard_v765():
+    return _ticker_list_keyboard_v764(COMMODITY_SIGNAL_TICKERS_V765)
+
+
+def delayed_signal_interval_keyboard_v765():
+    rows = []
+    for idx in range(0, len(DELAYED_YAHOO_SIGNAL_TFS_V765), 2):
+        rows.append([
+            {"text": INTERVALS[iv]["label"], "callback_data": f"sig_interval_{iv}"}
+            for iv in DELAYED_YAHOO_SIGNAL_TFS_V765[idx:idx + 2]
+        ])
+    rows.append([{"text": "◀️ Назад к сигналу", "callback_data": "menu_signal"}])
+    rows.append([{"text": "🏠 Главное меню", "callback_data": "back_main"}])
+    return {"inline_keyboard": rows}
+
+
+def signal_menu_keyboard(chat_id):
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = _safe_signal_interval_v765(ticker, user_intervals.get(chat_id, "15m"))
+    return {"inline_keyboard": [
+        [{"text": f"📡 Сигнал: {_ui_signal_symbol_v764(ticker)} / {_ui_tf_short(interval)}", "callback_data": "get_signal"}],
+        [
+            {"text": "🔎 Скан крипто", "callback_data": "signal_scan_crypto"},
+            {"text": "🔎 Скан акций", "callback_data": "signal_scan_stocks"},
+        ],
+        [{"text": "🔎 Скан сырья", "callback_data": "signal_scan_commodities"}],
+        [
+            {"text": "🪙 Крипто", "callback_data": "sig_crypto_tickers"},
+            {"text": "📈 Акции", "callback_data": "sig_stock_tickers"},
+        ],
+        [{"text": "⛏ Сырьё", "callback_data": "sig_commodity_tickers"}],
+        [
+            {"text": "🧭 Актив", "callback_data": "sig_change_ticker"},
+            {"text": "⏱ TF", "callback_data": "sig_change_interval"},
+        ],
+        [{"text": "⚙️ Уведомления", "callback_data": "auto_settings"}],
+        [{"text": "◀️ Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def compact_signal_keyboard(open_callback=None):
+    ticker = None
+    return {"inline_keyboard": [
+        [{"text": "🔄 Обновить сигнал", "callback_data": "get_signal"}],
+        [
+            {"text": "🔎 Скан крипто", "callback_data": "signal_scan_crypto"},
+            {"text": "🔎 Скан акций", "callback_data": "signal_scan_stocks"},
+        ],
+        [{"text": "🔎 Скан сырья", "callback_data": "signal_scan_commodities"}],
+        [
+            {"text": "🧭 Актив", "callback_data": "sig_change_ticker"},
+            {"text": "⏱ TF", "callback_data": "sig_change_interval"},
+        ],
+        [{"text": "◀️ Назад к сигналу", "callback_data": "menu_signal"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def format_signal_menu_text(chat_id):
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = _safe_signal_interval_v765(ticker, user_intervals.get(chat_id, "15m"))
+    return "\n".join([
+        "📡 <b>Сигнал</b>",
+        "",
+        f"Актив: <b>{_ui_signal_symbol_v764(ticker)}</b> | тип: <b>{_asset_group_label_v764(ticker)}</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b>",
+        "",
+        "Крипта доступна всегда. Акции идут только во время NYSE.",
+        "Акции/сырьё через Yahoo анализируются на TF 30м+ из-за задержки данных.",
+    ])
+
+
+def format_signal_summary(data, ticker, interval):
+    text = _base_format_signal_summary_v763_for_v764(data, ticker, interval)
+    if _is_delayed_yahoo_signal_ticker_v765(ticker):
+        text = text.replace(f"{_ui_ticker_short(ticker)}USDT", _ui_signal_symbol_v764(ticker))
+        text = text.replace("Futures Context", "Market Context")
+    return text
+
+
+def _signal_scan_tickers_v759():
+    return _auto_signal_scan_tickers_v764()
+
+
+def _signal_scan_all_assets_group_v764(chat_id, group):
+    sample_ticker = (_signal_universe_for_group_v764(group) or ["BTCUSDT"])[0]
+    interval = _safe_signal_interval_v765(sample_ticker, user_intervals.get(chat_id, "15m"))
+    tickers = _signal_universe_for_group_v764(group)
+    rows = []
+    workers = min(PAPER_SCAN_WORKERS, len(tickers)) or 1
+    with _futures_v74.ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"signal-{group}-scan") as pool:
+        fut_to_ticker = {
+            pool.submit(_signal_scan_one_asset_v759, chat_id, ticker, interval): ticker
+            for ticker in tickers
+        }
+        for fut in _futures_v74.as_completed(fut_to_ticker):
+            ticker = fut_to_ticker[fut]
+            try:
+                rows.append(fut.result())
+            except Exception as e:
+                rows.append({"ticker": ticker, "interval": interval, "decision": "ERROR", "reason": str(e)})
+    order = {ticker: idx for idx, ticker in enumerate(tickers)}
+    rows.sort(key=lambda row: order.get(row.get("ticker"), 999))
+    return rows, tickers
+
+
+def format_signal_scan_group_v764(chat_id, group):
+    rows, tickers = _signal_scan_all_assets_group_v764(chat_id, group)
+    sample_ticker = (tickers or ["BTCUSDT"])[0]
+    interval = _safe_signal_interval_v765(sample_ticker, user_intervals.get(chat_id, "15m"))
+    title = {"crypto": "крипты", "stocks": "акций", "commodities": "сырья"}.get(group, "активов")
+    lines = [
+        f"🔎 <b>Скан {title}</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b> | Проверено: <b>{len(rows)}/{len(tickers)}</b>",
+        "",
+    ]
+    for row in rows:
+        ticker = _ui_signal_symbol_v764(row.get("ticker"))
+        decision = str(row.get("decision") or "WAIT").upper()
+        reason = _ui_short_text(row.get("reason"), 46)
+        if decision == "ERROR":
+            lines.append(f"{ticker} — <b>ERROR</b> | {_ui_html(reason)}")
+        else:
+            lines.append(f"{ticker} — <b>{_ui_html(decision)}</b> | {_ui_html(reason)}")
+    lines += ["", "LONG/SHORT — уверенная идея. WAIT — лучше не входить сейчас."]
+    return "\n".join(lines)
+
+
+def signal_scan_group_keyboard_v764(group):
+    cb = {"crypto": "signal_scan_crypto", "stocks": "signal_scan_stocks", "commodities": "signal_scan_commodities"}.get(group, "signal_scan_crypto")
+    return {"inline_keyboard": [
+        [{"text": "🔄 Обновить скан", "callback_data": cb}],
+        [
+            {"text": "🔎 Крипто", "callback_data": "signal_scan_crypto"},
+            {"text": "🔎 Акции", "callback_data": "signal_scan_stocks"},
+        ],
+        [{"text": "🔎 Сырьё", "callback_data": "signal_scan_commodities"}],
+        [{"text": "◀️ Назад к сигналу", "callback_data": "menu_signal"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def _simple_sync_public_auto_settings(chat_id):
+    _base_simple_sync_public_auto_settings_v763_for_v764(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    sig["enabled"] = bool(sig.get("enabled", True))
+    sig["send_interval"] = "5m"
+    sig["tf"] = None
+
+
+if "signals" in AUTO_TASKS:
+    AUTO_TASKS["signals"]["default_interval"] = "5m"
+    AUTO_TASKS["signals"]["default_tf"] = None
+AUTO_DEFAULT_PLAN_V78["signals"] = {"enabled": True, "send_interval": "5m", "tf": None}
+
+
+def _task_status_line(chat_id, task_key):
+    if task_key == "signals":
+        st = _get_auto_task_settings(chat_id, "signals")
+        enabled = "ON" if st.get("enabled") else "OFF"
+        universe = _auto_signal_universe_label_v765()
+        return f"📡 Авто-сигналы: <b>{enabled}</b> | 5м | crypto all TF, Yahoo 30м+ | {universe}"
+    return _base_task_status_line_v763_for_v764(chat_id, task_key)
+
+
+def auto_settings_text(chat_id):
+    text = _base_auto_settings_text_v763_for_v764(chat_id)
+    universe = _auto_signal_universe_label_v765()
+    return text + (
+        f"\n\nNYSE: <b>{'open' if nyse_is_open_v764() else 'closed'}</b>"
+        f" | Сырьё 24/5: <b>{'open' if commodities_market_is_open_v765() else 'closed'}</b>"
+        f"\nАвто-сигналы: <b>{universe}</b>"
+    )
+
+
+def auto_task_keyboard(chat_id, task_key):
+    if task_key == "signals":
+        st = _get_auto_task_settings(chat_id, "signals")
+        rows = [[{"text": "⛔ Выключить" if st.get("enabled") else "✅ Включить", "callback_data": f"auto_tog_{task_key}"}]]
+        rows += [
+            [{"text": "⏰ Частота: 5м", "callback_data": f"auto_task_{task_key}"}],
+            [{"text": "📊 Crypto all TF | Yahoo 30м+", "callback_data": f"auto_task_{task_key}"}],
+            [{"text": "◀️ Уведомления", "callback_data": "auto_settings"}],
+            [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+        ]
+        return {"inline_keyboard": rows}
+    return _base_auto_task_keyboard_v763_for_v764(chat_id, task_key)
+
+
+def _auto_signal_scan_candidates_v752(chat_id):
+    tried = []
+    candidates = []
+    pairs = _auto_signal_scan_pairs_v765()
+    workers = min(PAPER_SCAN_WORKERS, len(pairs)) or 1
+    with _futures_v74.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="auto-signal-stock-scan") as pool:
+        fut_to_pair = {
+            pool.submit(_paper_scan_one_v74, chat_id, ticker, tf): (ticker, tf)
+            for ticker, tf in pairs
+        }
+        for fut in _futures_v74.as_completed(fut_to_pair):
+            ticker, tf = fut_to_pair[fut]
+            try:
+                row, found = fut.result()
+                tried.append(row)
+                for cand in list(found or []):
+                    if _auto_signal_candidate_passes_v752(cand):
+                        candidates.append(cand)
+            except Exception as e:
+                print(f"  [auto-signal-v764] scan error {ticker} {tf}: {e}")
+                tried.append({"ticker": ticker, "tf": tf, "error": str(e)})
+    candidates.sort(key=_auto_signal_candidate_score_v752, reverse=True)
+    return candidates, tried
+
+
+def _auto_signal_select_trade_candidate_v753(chat_id):
+    candidates, tried = _auto_signal_scan_candidates_v752(chat_id)
+    if not candidates:
+        return None, tried
+    active_positions, pos_err = _testnet_open_positions_v734()
+    today_count = _testnet_today_real_entry_count_v734(chat_id)
+    filtered = []
+    for cand in candidates:
+        if _is_crypto_ticker_v764(cand.get("ticker")):
+            reason = _testnet_candidate_block_reason_v735(
+                chat_id,
+                cand,
+                active_positions=active_positions,
+                pos_err=pos_err,
+                today_count=today_count,
+            )
+            if reason:
+                continue
+        filtered.append(cand)
+    filtered.sort(key=_auto_signal_candidate_score_v752, reverse=True)
+    return (filtered[0] if filtered else None), tried
+
+
+def build_auto_signals_message(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    selected, _ = _auto_signal_select_trade_candidate_v753(chat_id)
+    if not selected:
+        return None
+    ticker = selected.get("ticker")
+    interval = selected.get("interval")
+    direction = str(selected.get("direction") or "").upper()
+    strategy = str(selected.get("strategy") or "")
+    signature = f"{ticker}:{interval}:{direction}:{strategy}:stock_v764"
+    cooldown = AUTO_SIGNAL_DUPLICATE_COOLDOWN_MIN_V752 * 60
+    group_id = f"auto_signal_v764_{chat_id}"
+    if not should_send_signal(ticker, interval, signature, cooldown, group_id):
+        return None
+    data = selected.get("data") or {}
+    universe = _auto_signal_universe_label_v765()
+    pairs_count = len(_auto_signal_scan_pairs_v765())
+    header = [
+        "🔔 <b>Авто-сигнал</b>",
+        f"Scan: <b>{len(_auto_signal_scan_tickers_v764())} активов / {pairs_count} проверок</b> | каждые <b>5м</b>",
+        f"Universe: <b>{universe}</b>",
+        "",
+    ]
+    return "\n".join(header) + "\n" + format_signal_summary(data, ticker, interval)
+
+
+async def async_handle_update(session, update, sem):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            data = cb.get("data", "")
+            chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+            callback_id = cb.get("id")
+            if data in {"sig_change_ticker", "change_ticker"}:
+                await _answer_callback_once_v732(session, callback_id, "Актив")
+                await send_or_edit(session, update, "🧭 <b>Выбери группу активов:</b>", signal_ticker_keyboard())
+                return
+            if data == "sig_crypto_tickers":
+                await _answer_callback_once_v732(session, callback_id, "Крипто")
+                await send_or_edit(session, update, "🪙 <b>Крипто для сигнала:</b>", signal_crypto_ticker_keyboard_v764())
+                return
+            if data == "sig_stock_tickers":
+                await _answer_callback_once_v732(session, callback_id, "Акции")
+                await send_or_edit(session, update, "📈 <b>Акции для сигнала:</b>", signal_stock_ticker_keyboard_v764())
+                return
+            if data == "sig_commodity_tickers":
+                await _answer_callback_once_v732(session, callback_id, "Сырьё")
+                await send_or_edit(session, update, "⛏ <b>Сырьё для сигнала:</b>", signal_commodity_ticker_keyboard_v765())
+                return
+            if data == "sig_change_interval" and _is_delayed_yahoo_signal_ticker_v765(user_tickers.get(chat_id, "BTCUSDT")):
+                await _answer_callback_once_v732(session, callback_id, "TF")
+                await send_or_edit(session, update, "⏱ <b>TF для Yahoo-активов</b>\n\n5м/15м скрыты: задержка данных слишком сильно искажает вход.", delayed_signal_interval_keyboard_v765())
+                return
+            if data.startswith("sig_interval_") and _is_delayed_yahoo_signal_ticker_v765(user_tickers.get(chat_id, "BTCUSDT")):
+                interval = data.replace("sig_interval_", "", 1)
+                await _answer_callback_once_v732(session, callback_id, "TF")
+                if interval not in DELAYED_YAHOO_SIGNAL_TFS_V765:
+                    await send_or_edit(session, update, "⏱ <b>Для акций/сырья доступны TF 30м+</b>", delayed_signal_interval_keyboard_v765())
+                    return
+                user_intervals[chat_id] = interval
+                save_user_state()
+                await send_or_edit(session, update, format_signal_menu_text(chat_id), signal_menu_keyboard(chat_id))
+                return
+            if data.startswith("sig_ticker_"):
+                ticker = data.replace("sig_ticker_", "", 1).upper()
+                if _is_delayed_yahoo_signal_ticker_v765(ticker):
+                    await _answer_callback_once_v732(session, callback_id, ticker)
+                    user_tickers[chat_id] = ticker
+                    user_intervals[chat_id] = _safe_signal_interval_v765(ticker, user_intervals.get(chat_id, "15m"))
+                    save_user_state()
+                    await send_or_edit(session, update, format_signal_menu_text(chat_id), signal_menu_keyboard(chat_id))
+                    return
+            if data == "get_signal" and _is_delayed_yahoo_signal_ticker_v765(user_tickers.get(chat_id, "BTCUSDT")):
+                ticker = user_tickers.get(chat_id, "BTCUSDT")
+                user_intervals[chat_id] = _safe_signal_interval_v765(ticker, user_intervals.get(chat_id, "15m"))
+                save_user_state()
+            if data in {"signal_scan_crypto", "signal_scan_stocks", "signal_scan_commodities"}:
+                group = {"signal_scan_crypto": "crypto", "signal_scan_stocks": "stocks", "signal_scan_commodities": "commodities"}[data]
+                await _answer_callback_once_v732(session, callback_id, "Скан")
+                await send_or_edit(session, update, "🔎 <b>Скан активов</b>\n\nПроверяю данные...", signal_scan_group_keyboard_v764(group))
+                text = await asyncio.to_thread(format_signal_scan_group_v764, chat_id, group)
+                await send_or_edit(session, update, text, signal_scan_group_keyboard_v764(group))
+                return
+        await _base_async_handle_update_v763_for_v764(session, update, sem)
+    except Exception:
+        raise
+
+
+BOT_VERSION_LABEL = "v7.65 Delay-Aware Stocks and Commodities"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -23858,6 +24542,8 @@ RUNTIME_LAYERS = [
     ("v7.61", "bounded runtime caches and shared Fear & Greed HTTP session"),
     ("v7.62", "compatibility alias for Testnet journal event recording"),
     ("v7.63", "Testnet exploration gate for strong WAIT RETEST demo setups"),
+    ("v7.64", "stock signal universe and NYSE-aware 5-minute auto-signal scanning"),
+    ("v7.65", "delay-aware Yahoo timeframes plus commodity signal universe"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -23929,6 +24615,16 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "adaptive_quality_bucket_group": _adaptive_quality_bucket_group_v748,
     "adaptive_quality_adjusted_winrate": _adaptive_quality_adjusted_winrate_v749,
     "testnet_exploration_data_block": _testnet_exploration_data_block_v763,
+    "nyse_is_open": nyse_is_open_v764,
+    "commodities_market_is_open": commodities_market_is_open_v765,
+    "stock_ohlcv": _stock_ohlcv_v764,
+    "stock_price": _stock_price_v764,
+    "auto_signal_scan_tickers": _auto_signal_scan_tickers_v764,
+    "auto_signal_scan_pairs": _auto_signal_scan_pairs_v765,
+    "signal_commodity_ticker_keyboard": signal_commodity_ticker_keyboard_v765,
+    "format_signal_scan_group": format_signal_scan_group_v764,
+    "signal_crypto_ticker_keyboard": signal_crypto_ticker_keyboard_v764,
+    "signal_stock_ticker_keyboard": signal_stock_ticker_keyboard_v764,
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
@@ -24163,6 +24859,24 @@ def validate_runtime_architecture():
         errors.append("adaptive setup quality adjusted winrate helper is missing")
     if not callable(globals().get("_testnet_exploration_data_block_v763")):
         errors.append("Testnet exploration gate helper is missing")
+    if not callable(globals().get("nyse_is_open_v764")):
+        errors.append("NYSE session helper is missing")
+    if not callable(globals().get("commodities_market_is_open_v765")):
+        errors.append("commodities session helper is missing")
+    if not callable(globals().get("_stock_ohlcv_v764")):
+        errors.append("stock OHLCV helper is missing")
+    if not callable(globals().get("_auto_signal_scan_tickers_v764")):
+        errors.append("stock-aware auto signal universe helper is missing")
+    if not callable(globals().get("_auto_signal_scan_pairs_v765")):
+        errors.append("asset-aware auto signal scan pairs helper is missing")
+    if "signals" in AUTO_TASKS and AUTO_TASKS["signals"].get("default_interval") != "5m":
+        errors.append("auto signals default interval must be 5m")
+    if len(STOCK_SIGNAL_TICKERS_V764) != 7:
+        errors.append("stock signal universe must contain top 7 assets")
+    if len(COMMODITY_SIGNAL_TICKERS_V765) != 7:
+        errors.append("commodity signal universe must contain top 7 assets")
+    if any(tf in DELAYED_YAHOO_SIGNAL_TFS_V765 for tf in ("5m", "15m")):
+        errors.append("Yahoo delayed assets must not use 5m/15m signal TF")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):
