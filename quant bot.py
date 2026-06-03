@@ -23570,7 +23570,51 @@ def get_fear_greed():
         return None, None, []
 
 
-BOT_VERSION_LABEL = "v7.61 Runtime Cache Maintenance"
+# ============================================================
+# v7.62 - TESTNET JOURNAL COMPATIBILITY ALIAS
+# ============================================================
+# Later Testnet layers call the old public journal helper name. Keep it wired
+# and de-duplicate immediate entry/protection records already written by v7.21.
+
+
+def _testnet_journal_event_key_v762(kind, plan, result):
+    plan = plan or {}
+    result = result or {}
+    return (
+        str(kind or ""),
+        str(plan.get("plan_id") or result.get("plan_id") or ""),
+        str(result.get("ts") or ""),
+        str(result.get("submitted")),
+        str(result.get("ok")),
+        _testnet_result_reason_v721(result),
+    )
+
+
+def _testnet_journal_existing_key_v762(event):
+    event = event or {}
+    return (
+        str(event.get("kind") or ""),
+        str(event.get("plan_id") or ""),
+        str(event.get("ts") or ""),
+        str(event.get("submitted")),
+        str(event.get("ok")),
+        str(event.get("reason") or ""),
+    )
+
+
+def _record_testnet_journal_event_v721(kind, plan, result):
+    key = _testnet_journal_event_key_v762(kind, plan, result)
+    try:
+        state = _testnet_journal_load_v721()
+        for event in reversed(list(state.get("events") or [])[-20:]):
+            if _testnet_journal_existing_key_v762(event) == key:
+                return event
+    except Exception as e:
+        print(f"  [testnet_journal_v762] duplicate check skipped: {e}")
+    return _testnet_journal_record_v721(kind, plan, result)
+
+
+BOT_VERSION_LABEL = "v7.62 Testnet Journal Compatibility"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -23658,6 +23702,7 @@ RUNTIME_LAYERS = [
     ("v7.59", "compact all-asset manual signal scan and version-free Telegram diagnostics"),
     ("v7.60", "compact last Testnet attempt report for demo trading"),
     ("v7.61", "bounded runtime caches and shared Fear & Greed HTTP session"),
+    ("v7.62", "compatibility alias for Testnet journal event recording"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -23665,6 +23710,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "get_price": get_price,
     "get_fear_greed": get_fear_greed,
     "prune_runtime_caches": prune_runtime_caches_v761,
+    "record_testnet_journal_event": _record_testnet_journal_event_v721,
     "futures_api_symbol": futures_api_symbol,
     "_binance_ohlcv": _binance_ohlcv,
     "full_analyze": full_analyze,
@@ -23929,6 +23975,8 @@ def validate_runtime_architecture():
         errors.append("runtime cache pruning helper is missing")
     if not callable(globals().get("get_fear_greed")):
         errors.append("Fear & Greed getter is missing")
+    if not callable(globals().get("_record_testnet_journal_event_v721")):
+        errors.append("Testnet journal compatibility helper is missing")
     if not callable(globals().get("cancel_testnet_open_orders_v741")):
         errors.append("testnet cancel-open-orders helper is missing")
     if not callable(globals().get("cancel_testnet_algo_orders_v741")):

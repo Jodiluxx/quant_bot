@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from decimal import Decimal
 import unittest
 from unittest.mock import patch
@@ -252,6 +253,31 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
         self.assertEqual(result["stage"], "validation")
         self.assertIn("protection_test exception", result["reason"])
         self.assertEqual(len(calls), 1)
+
+    def test_testnet_journal_compatibility_helper_deduplicates_existing_event(self) -> None:
+        plan = self._plan()
+        result = {
+            "ts": "2026-06-03T10:00:00+00:00",
+            "submitted": True,
+            "ok": True,
+            "status_code": 200,
+            "request": {"symbol": "BTCUSDT"},
+            "response": {},
+        }
+        old_file = self.bot.TESTNET_JOURNAL_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            journal_path = os.path.join(tmp, "testnet_journal.json")
+            self.bot.TESTNET_JOURNAL_FILE = journal_path
+            try:
+                first = self.bot._testnet_journal_record_v721("entry", plan, result)
+                second = self.bot._record_testnet_journal_event_v721("entry", plan, result)
+                state = self.bot._testnet_journal_load_v721()
+            finally:
+                self.bot.TESTNET_JOURNAL_FILE = old_file
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(state.get("events") or []), 1)
+        self.assertTrue(callable(self.bot._record_testnet_journal_event_v721))
 
 
 if __name__ == "__main__":
