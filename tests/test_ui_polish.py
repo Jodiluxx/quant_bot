@@ -326,7 +326,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.70 OANDA Commodity Data Source")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.71 Alpaca Stock Data Source")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -351,6 +351,9 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("nyse_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("commodities_market_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("stock_ohlcv", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("alpaca_ohlcv", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("alpaca_price", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("alpaca_enabled_for_ticker", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("oanda_ohlcv", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("oanda_price", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("oanda_enabled_for_ticker", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -397,6 +400,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.68" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.69" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.70" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.71" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -724,6 +728,8 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_delayed_yahoo_assets_use_slow_timeframes_in_auto_scan(self) -> None:
         old_force = os.environ.get("STOCK_SIGNALS_FORCE_NYSE_OPEN")
         old_commodity_force = os.environ.get("COMMODITY_SIGNALS_FORCE_OPEN")
+        old_alpaca_key = os.environ.pop("ALPACA_API_KEY_ID", None)
+        old_alpaca_secret = os.environ.pop("ALPACA_API_SECRET_KEY", None)
         old_oanda = os.environ.pop("OANDA_API_TOKEN", None)
         old_oanda_alt = os.environ.pop("OANDA_TOKEN", None)
         try:
@@ -750,9 +756,15 @@ class TelegramUiPolishTests(unittest.TestCase):
                 os.environ["OANDA_API_TOKEN"] = old_oanda
             if old_oanda_alt is not None:
                 os.environ["OANDA_TOKEN"] = old_oanda_alt
+            if old_alpaca_key is not None:
+                os.environ["ALPACA_API_KEY_ID"] = old_alpaca_key
+            if old_alpaca_secret is not None:
+                os.environ["ALPACA_API_SECRET_KEY"] = old_alpaca_secret
 
     def test_stock_chart_parser_supports_manual_signals(self) -> None:
         old_fetch = self.bot._stock_fetch_yahoo_chart_v764
+        old_alpaca_key = os.environ.pop("ALPACA_API_KEY_ID", None)
+        old_alpaca_secret = os.environ.pop("ALPACA_API_SECRET_KEY", None)
         try:
             timestamps = list(range(1, 121))
             quote = {
@@ -772,6 +784,94 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.assertIn(("AAPL", "1h"), seen)
         finally:
             self.bot._stock_fetch_yahoo_chart_v764 = old_fetch
+            if old_alpaca_key is not None:
+                os.environ["ALPACA_API_KEY_ID"] = old_alpaca_key
+            if old_alpaca_secret is not None:
+                os.environ["ALPACA_API_SECRET_KEY"] = old_alpaca_secret
+
+    def test_alpaca_stock_source_enables_fast_timeframes_and_card_label(self) -> None:
+        old_key = os.environ.get("ALPACA_API_KEY_ID")
+        old_secret = os.environ.get("ALPACA_API_SECRET_KEY")
+        try:
+            os.environ["ALPACA_API_KEY_ID"] = "test-key"
+            os.environ["ALPACA_API_SECRET_KEY"] = "test-secret"
+            self.assertTrue(self.bot._alpaca_enabled_for_ticker_v771("AAPL"))
+            self.assertEqual(self.bot._signal_tfs_for_asset_v765("AAPL"), ["5m", "15m", "30m", "45m", "1h", "4h"])
+            self.assertEqual(self.bot._safe_signal_interval_v765("AAPL", "5m"), "5m")
+            data = {
+                "signal": "LONG",
+                "direction": "long",
+                "price": 100.0,
+                "confidence": 80,
+                "prob": 0.68,
+                "bull_args": ["test support"],
+                "bear_args": ["test risk"],
+                "risk_levels": {"entry": 100.0, "sl": 98.0, "tp1": 104.0, "tp2": 106.0, "rr_ratio": 1.67},
+                "entry_plan": {"status": "ENTER_NOW", "entry_now_score": 78, "setup_score": 80, "rr_now": 1.67},
+            }
+            text = self.bot.format_signal_summary(data, "AAPL", "5m")
+        finally:
+            if old_key is None:
+                os.environ.pop("ALPACA_API_KEY_ID", None)
+            else:
+                os.environ["ALPACA_API_KEY_ID"] = old_key
+            if old_secret is None:
+                os.environ.pop("ALPACA_API_SECRET_KEY", None)
+            else:
+                os.environ["ALPACA_API_SECRET_KEY"] = old_secret
+
+        self.assertIn("Alpaca Market Data", text)
+        self.assertIn("IEX", text)
+        self.assertNotIn("Yahoo delayed", text)
+
+    def test_alpaca_ohlcv_parses_bars_without_real_network(self) -> None:
+        old_key = os.environ.get("ALPACA_API_KEY_ID")
+        old_secret = os.environ.get("ALPACA_API_SECRET_KEY")
+        old_session = self.bot._session
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                bars = []
+                for idx in range(80):
+                    value = 100.0 + idx
+                    bars.append({"o": value, "h": value + 1, "l": value - 1, "c": value + 0.5, "v": 1000 + idx})
+                return {"bars": {"AAPL": bars}}
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, params=None, headers=None, timeout=None):
+                self.calls.append((url, dict(params or {}), dict(headers or {}), timeout))
+                return FakeResponse()
+
+        fake = FakeSession()
+        try:
+            os.environ["ALPACA_API_KEY_ID"] = "test-key"
+            os.environ["ALPACA_API_SECRET_KEY"] = "test-secret"
+            self.bot._session = fake
+            data = self.bot.get_ohlcv("AAPL", "15m")
+        finally:
+            self.bot._session = old_session
+            if old_key is None:
+                os.environ.pop("ALPACA_API_KEY_ID", None)
+            else:
+                os.environ["ALPACA_API_KEY_ID"] = old_key
+            if old_secret is None:
+                os.environ.pop("ALPACA_API_SECRET_KEY", None)
+            else:
+                os.environ["ALPACA_API_SECRET_KEY"] = old_secret
+
+        self.assertEqual(len(data[3]), 80)
+        self.assertEqual(data[3][-1], 179.5)
+        self.assertIn("/v2/stocks/bars", fake.calls[0][0])
+        self.assertEqual(fake.calls[0][1]["symbols"], "AAPL")
+        self.assertEqual(fake.calls[0][1]["timeframe"], "15Min")
+        self.assertEqual(fake.calls[0][1]["feed"], "iex")
+        self.assertEqual(fake.calls[0][2]["APCA-API-KEY-ID"], "test-key")
 
     def test_runtime_process_scan_matches_exact_project_bot_runtime(self) -> None:
         old_rows = self.bot._runtime_python_process_rows_v756

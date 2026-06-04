@@ -25282,7 +25282,211 @@ def format_signal_group_menu_text_v766(chat_id, group):
     ])
 
 
-BOT_VERSION_LABEL = "v7.70 OANDA Commodity Data Source"
+# ============================================================
+# v7.71 - ALPACA STOCK DATA SOURCE
+# ============================================================
+# If Alpaca market-data keys are configured, stock signals prefer Alpaca bars.
+# The default feed is IEX: faster than Yahoo, but not full SIP market coverage.
+
+_base_get_ohlcv_v770_for_v771 = get_ohlcv
+_base_get_price_v770_for_v771 = get_price
+_base_safe_signal_interval_v770_for_v771 = _safe_signal_interval_v765
+_base_signal_tfs_for_asset_v770_for_v771 = _signal_tfs_for_asset_v765
+_base_signal_group_tfs_v770_for_v771 = _signal_group_tfs_v766
+_base_format_signal_summary_v770_for_v771 = format_signal_summary
+_base_format_signal_group_menu_text_v770_for_v771 = format_signal_group_menu_text_v766
+
+ALPACA_STOCK_SIGNAL_TFS_V771 = ["5m", "15m", "30m", "45m", "1h", "4h"]
+ALPACA_TIMEFRAME_V771 = {
+    "5m": "5Min",
+    "15m": "15Min",
+    "30m": "30Min",
+    "1h": "1Hour",
+}
+ALPACA_AGG_INTERVALS_V771 = {
+    "45m": ("15m", 3),
+    "4h": ("1h", 4),
+}
+ALPACA_LOOKBACK_DAYS_V771 = {
+    "5m": 15,
+    "15m": 45,
+    "30m": 90,
+    "1h": 365,
+}
+
+
+def _alpaca_api_key_v771():
+    return (os.getenv("ALPACA_API_KEY_ID") or os.getenv("APCA_API_KEY_ID") or "").strip()
+
+
+def _alpaca_api_secret_v771():
+    return (os.getenv("ALPACA_API_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY") or "").strip()
+
+
+def _alpaca_data_base_v771():
+    return (os.getenv("ALPACA_DATA_BASE") or "https://data.alpaca.markets").strip().rstrip("/")
+
+
+def _alpaca_feed_v771():
+    return (os.getenv("ALPACA_STOCK_FEED") or "iex").strip().lower()
+
+
+def _alpaca_enabled_for_ticker_v771(ticker):
+    return _is_stock_ticker_v764(ticker) and bool(_alpaca_api_key_v771() and _alpaca_api_secret_v771())
+
+
+def _alpaca_headers_v771():
+    return {
+        "APCA-API-KEY-ID": _alpaca_api_key_v771(),
+        "APCA-API-SECRET-KEY": _alpaca_api_secret_v771(),
+        "Accept": "application/json",
+    }
+
+
+def _alpaca_start_time_v771(interval):
+    days = ALPACA_LOOKBACK_DAYS_V771.get(interval, 90)
+    dt = datetime.now(timezone.utc) - timedelta(days=days)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def _alpaca_fetch_bars_v771(ticker, interval, limit=10000):
+    ticker = str(ticker or "").upper()
+    if interval not in ALPACA_TIMEFRAME_V771:
+        raise ValueError(f"Alpaca interval is unsupported: {interval}")
+    response = _session.get(
+        f"{_alpaca_data_base_v771()}/v2/stocks/bars",
+        params={
+            "symbols": ticker,
+            "timeframe": ALPACA_TIMEFRAME_V771[interval],
+            "start": _alpaca_start_time_v771(interval),
+            "limit": int(limit),
+            "adjustment": "raw",
+            "feed": _alpaca_feed_v771(),
+            "sort": "asc",
+        },
+        headers=_alpaca_headers_v771(),
+        timeout=12,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    bars_block = payload.get("bars") if isinstance(payload, dict) else None
+    if isinstance(bars_block, dict):
+        bars = bars_block.get(ticker) or bars_block.get(ticker.upper()) or []
+    elif isinstance(bars_block, list):
+        bars = bars_block
+    else:
+        bars = []
+    rows = []
+    for bar in bars:
+        try:
+            row = (
+                float(bar.get("o")),
+                float(bar.get("h")),
+                float(bar.get("l")),
+                float(bar.get("c")),
+                float(bar.get("v") or 0),
+            )
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if all(math.isfinite(x) for x in row[:4]):
+            rows.append(row)
+    if len(rows) < 50:
+        raise ValueError(f"Not enough Alpaca stock candles for {ticker}: {len(rows)}")
+    rows = rows[-1000:]
+    return (
+        [x[0] for x in rows],
+        [x[1] for x in rows],
+        [x[2] for x in rows],
+        [x[3] for x in rows],
+        [x[4] for x in rows],
+    )
+
+
+def _alpaca_ohlcv_v771(ticker, interval):
+    interval = str(interval or "")
+    if interval in ALPACA_AGG_INTERVALS_V771:
+        base_interval, group_size = ALPACA_AGG_INTERVALS_V771[interval]
+        base = _alpaca_fetch_bars_v771(ticker, base_interval)
+        return _aggregate_stock_ohlcv_v764(base, group_size)
+    return tuple(part[-500:] for part in _alpaca_fetch_bars_v771(ticker, interval))
+
+
+def _alpaca_price_v771(ticker):
+    return _alpaca_ohlcv_v771(ticker, "5m")[3][-1]
+
+
+def _safe_signal_interval_v765(ticker, interval):
+    if _alpaca_enabled_for_ticker_v771(ticker):
+        return interval if interval in ALPACA_STOCK_SIGNAL_TFS_V771 else "15m"
+    return _base_safe_signal_interval_v770_for_v771(ticker, interval)
+
+
+def _signal_tfs_for_asset_v765(ticker):
+    if _alpaca_enabled_for_ticker_v771(ticker):
+        return list(ALPACA_STOCK_SIGNAL_TFS_V771)
+    return _base_signal_tfs_for_asset_v770_for_v771(ticker)
+
+
+def _signal_group_tfs_v766(group):
+    if group == "stocks" and _alpaca_api_key_v771() and _alpaca_api_secret_v771():
+        return list(ALPACA_STOCK_SIGNAL_TFS_V771)
+    return _base_signal_group_tfs_v770_for_v771(group)
+
+
+def get_ohlcv(ticker, interval):
+    if _alpaca_enabled_for_ticker_v771(ticker):
+        try:
+            return _alpaca_ohlcv_v771(ticker, _safe_signal_interval_v765(ticker, interval))
+        except Exception as e:
+            print(f"  [alpaca_v771] fallback to Yahoo for {ticker} {interval}: {e}")
+    return _base_get_ohlcv_v770_for_v771(ticker, interval)
+
+
+def get_price(ticker):
+    if _alpaca_enabled_for_ticker_v771(ticker):
+        try:
+            return _alpaca_price_v771(ticker)
+        except Exception as e:
+            print(f"  [alpaca_v771] price fallback for {ticker}: {e}")
+    return _base_get_price_v770_for_v771(ticker)
+
+
+def format_signal_summary(data, ticker, interval):
+    text = _base_format_signal_summary_v770_for_v771(data, ticker, interval)
+    ticker = str(ticker or "").upper()
+    if _alpaca_enabled_for_ticker_v771(ticker):
+        replacement = (
+            f"Данные: <b>Alpaca Market Data</b> | feed <b>{_ui_html(_alpaca_feed_v771().upper())}</b> | "
+            "US equities"
+        )
+        lines = text.splitlines()
+        for idx, line in enumerate(lines[:6]):
+            if "Данные:" in line:
+                lines[idx] = replacement
+                return "\n".join(lines)
+        insert_at = 2 if len(lines) > 2 else len(lines)
+        lines.insert(insert_at, replacement)
+        return "\n".join(lines)
+    return text
+
+
+def format_signal_group_menu_text_v766(chat_id, group):
+    group, ticker, interval = _signal_group_state_v766(chat_id, group)
+    if group != "stocks" or not (_alpaca_api_key_v771() and _alpaca_api_secret_v771()):
+        return _base_format_signal_group_menu_text_v770_for_v771(chat_id, group)
+    meta = SIGNAL_GROUPS_V766[group]
+    return "\n".join([
+        f"{meta['emoji']} <b>{meta['title']} сигналы</b>",
+        "",
+        f"Актив: <b>{_ui_signal_symbol_v764(ticker)}</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b>",
+        "",
+        f"Источник: <b>Alpaca Market Data</b>, feed <b>{_ui_html(_alpaca_feed_v771().upper())}</b>. TF: 5м, 15м, 30м, 45м, 1ч, 4ч.",
+        "IEX быстрее Yahoo, но это не полный SIP-весь рынок. Для полной ленты нужен SIP/feed-подписка.",
+    ])
+
+
+BOT_VERSION_LABEL = "v7.71 Alpaca Stock Data Source"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -25379,6 +25583,7 @@ RUNTIME_LAYERS = [
     ("v7.68", "responsive Testnet UI cards with cached account reads and background report rendering"),
     ("v7.69", "signal cards label Yahoo delayed and futures-proxy data sources for stocks and commodities"),
     ("v7.70", "optional OANDA v20 commodity candles replace Yahoo proxies when OANDA_API_TOKEN is configured"),
+    ("v7.71", "optional Alpaca IEX/SIP stock candles replace Yahoo when Alpaca market-data keys are configured"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -25459,6 +25664,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "commodities_market_is_open": commodities_market_is_open_v765,
     "stock_ohlcv": _stock_ohlcv_v764,
     "stock_price": _stock_price_v764,
+    "alpaca_ohlcv": _alpaca_ohlcv_v771,
+    "alpaca_price": _alpaca_price_v771,
+    "alpaca_enabled_for_ticker": _alpaca_enabled_for_ticker_v771,
     "oanda_ohlcv": _oanda_ohlcv_v770,
     "oanda_price": _oanda_price_v770,
     "oanda_enabled_for_ticker": _oanda_enabled_for_ticker_v770,
@@ -25712,6 +25920,10 @@ def validate_runtime_architecture():
         errors.append("commodities session helper is missing")
     if not callable(globals().get("_stock_ohlcv_v764")):
         errors.append("stock OHLCV helper is missing")
+    if not callable(globals().get("_alpaca_ohlcv_v771")):
+        errors.append("Alpaca stock OHLCV helper is missing")
+    if "5m" not in globals().get("ALPACA_STOCK_SIGNAL_TFS_V771", []):
+        errors.append("Alpaca stock fast signal TF list is missing")
     if not callable(globals().get("_oanda_ohlcv_v770")):
         errors.append("OANDA commodity OHLCV helper is missing")
     if "XAUUSD" not in globals().get("OANDA_SIGNAL_SYMBOLS_V770", {}):
