@@ -139,7 +139,10 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
         params, geometry = self.bot._real_protection_order_params_v729(self._plan())
         self.assertTrue(geometry["ok"])
         self.assertEqual([label for label, _ in params], ["SL", "TP1", "TP2"])
+        self.assertEqual(params[0][1]["algoType"], "CONDITIONAL")
+        self.assertEqual(params[0][1]["positionSide"], "BOTH")
         self.assertEqual(params[0][1]["reduceOnly"], "true")
+        self.assertEqual(params[0][1]["newOrderRespType"], "ACK")
         self.assertEqual(params[1][1]["type"], "TAKE_PROFIT_MARKET")
 
     def test_precision_normalizes_bnb_entry_and_unsplittable_tp(self) -> None:

@@ -19558,8 +19558,10 @@ def submit_testnet_protection_order_tests(plan):
             "ok": True,
             "status_code": "LOCAL_VALIDATION",
             "request": {
+                "algoType": params.get("algoType"),
                 "symbol": params.get("symbol"),
                 "side": params.get("side"),
+                "positionSide": params.get("positionSide"),
                 "type": params.get("type"),
                 "quantity": params.get("quantity"),
                 "triggerPrice": params.get("triggerPrice"),
@@ -19621,8 +19623,10 @@ def submit_testnet_real_protection_orders(plan, entry_result=None):
             "status_code": response.get("status_code"),
             "reason": response.get("reason") or response.get("error"),
             "request": {
+                "algoType": params.get("algoType"),
                 "symbol": params.get("symbol"),
                 "side": params.get("side"),
+                "positionSide": params.get("positionSide"),
                 "type": params.get("type"),
                 "quantity": params.get("quantity"),
                 "triggerPrice": params.get("triggerPrice"),
@@ -20635,14 +20639,17 @@ def build_testnet_protection_order_tests(plan):
         trigger_text = _testnet_price_text_v739(symbol, order.get("stop_price"))
         params.append({
             "label": label,
+            "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": order.get("side"),
+            "positionSide": "BOTH",
             "type": order.get("type"),
             "quantity": qty_text,
             "triggerPrice": trigger_text,
             "reduceOnly": "true",
             "workingType": "CONTRACT_PRICE",
             "priceProtect": "false",
+            "newOrderRespType": "ACK",
             "clientAlgoId": _protect_client_id_v720(plan.get("plan_id"), label),
         })
     geometry["quantity_plan"] = quantities
@@ -24774,7 +24781,7 @@ async def async_handle_update(session, update, sem):
     await _base_async_handle_update_v765_for_v766(session, update, sem)
 
 
-BOT_VERSION_LABEL = "v7.66 Signal Market Router UI"
+BOT_VERSION_LABEL = "v7.67 Testnet Algo Protection Params"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -24867,6 +24874,7 @@ RUNTIME_LAYERS = [
     ("v7.64", "stock signal universe and NYSE-aware 5-minute auto-signal scanning"),
     ("v7.65", "delay-aware Yahoo timeframes plus commodity signal universe"),
     ("v7.66", "signal UI routes through market groups with per-group asset and TF selection"),
+    ("v7.67", "Testnet algo protection orders include algoType, positionSide and ACK response mode"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
