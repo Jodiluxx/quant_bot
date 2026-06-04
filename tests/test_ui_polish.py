@@ -326,7 +326,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.69 Explicit Delayed Asset Data Source")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.70 OANDA Commodity Data Source")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -351,6 +351,9 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("nyse_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("commodities_market_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("stock_ohlcv", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("oanda_ohlcv", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("oanda_price", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("oanda_enabled_for_ticker", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("auto_signal_scan_tickers", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("auto_signal_scan_pairs", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("signal_group_keyboard", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -393,6 +396,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.67" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.68" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.69" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.70" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -602,6 +606,8 @@ class TelegramUiPolishTests(unittest.TestCase):
                 os.environ["COMMODITY_SIGNALS_FORCE_OPEN"] = old_commodity_force
 
     def test_delayed_commodity_signal_card_labels_yahoo_proxy_source(self) -> None:
+        old_oanda = os.environ.pop("OANDA_API_TOKEN", None)
+        old_oanda_alt = os.environ.pop("OANDA_TOKEN", None)
         data = {
             "signal": "LONG",
             "direction": "long",
@@ -624,15 +630,102 @@ class TelegramUiPolishTests(unittest.TestCase):
                 "rr_now": 1.67,
             },
         }
-        text = self.bot.format_signal_summary(data, "XAUUSD", "45m")
-        self.assertIn("XAUUSD", text)
-        self.assertIn("Yahoo futures proxy", text)
-        self.assertIn("GC=F", text)
-        self.assertIn("не OANDA spot", text)
+        try:
+            text = self.bot.format_signal_summary(data, "XAUUSD", "45m")
+            self.assertIn("XAUUSD", text)
+            self.assertIn("Yahoo futures proxy", text)
+            self.assertIn("GC=F", text)
+            self.assertIn("не OANDA spot", text)
+        finally:
+            if old_oanda is not None:
+                os.environ["OANDA_API_TOKEN"] = old_oanda
+            if old_oanda_alt is not None:
+                os.environ["OANDA_TOKEN"] = old_oanda_alt
+
+    def test_oanda_commodity_source_enables_fast_timeframes_and_card_label(self) -> None:
+        old_token = os.environ.get("OANDA_API_TOKEN")
+        try:
+            os.environ["OANDA_API_TOKEN"] = "test-token"
+            self.assertTrue(self.bot._oanda_enabled_for_ticker_v770("XAUUSD"))
+            self.assertEqual(self.bot._signal_tfs_for_asset_v765("XAUUSD"), ["5m", "15m", "30m", "45m", "1h", "4h"])
+            self.assertEqual(self.bot._safe_signal_interval_v765("XAUUSD", "5m"), "5m")
+            data = {
+                "signal": "LONG",
+                "direction": "long",
+                "price": 4496.10,
+                "confidence": 80,
+                "prob": 0.68,
+                "bull_args": ["test support"],
+                "bear_args": ["test risk"],
+                "risk_levels": {"entry": 4496.10, "sl": 4475.83, "tp1": 4530.42, "tp2": 4550.90, "rr_ratio": 1.67},
+                "entry_plan": {"status": "ENTER_NOW", "entry_now_score": 78, "setup_score": 80, "rr_now": 1.67},
+            }
+            text = self.bot.format_signal_summary(data, "XAUUSD", "15m")
+        finally:
+            if old_token is None:
+                os.environ.pop("OANDA_API_TOKEN", None)
+            else:
+                os.environ["OANDA_API_TOKEN"] = old_token
+
+        self.assertIn("OANDA v20", text)
+        self.assertIn("XAU_USD", text)
+        self.assertNotIn("Yahoo futures proxy", text)
+
+    def test_oanda_ohlcv_parses_candles_without_real_network(self) -> None:
+        old_token = os.environ.get("OANDA_API_TOKEN")
+        old_session = self.bot._session
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                candles = []
+                for idx in range(80):
+                    value = 4400.0 + idx
+                    candles.append({
+                        "complete": True,
+                        "volume": 10 + idx,
+                        "mid": {
+                            "o": str(value),
+                            "h": str(value + 2),
+                            "l": str(value - 2),
+                            "c": str(value + 1),
+                        },
+                    })
+                return {"candles": candles}
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, params=None, headers=None, timeout=None):
+                self.calls.append((url, dict(params or {}), dict(headers or {}), timeout))
+                return FakeResponse()
+
+        fake = FakeSession()
+        try:
+            os.environ["OANDA_API_TOKEN"] = "test-token"
+            self.bot._session = fake
+            data = self.bot.get_ohlcv("XAUUSD", "15m")
+        finally:
+            self.bot._session = old_session
+            if old_token is None:
+                os.environ.pop("OANDA_API_TOKEN", None)
+            else:
+                os.environ["OANDA_API_TOKEN"] = old_token
+
+        self.assertEqual(len(data[3]), 80)
+        self.assertEqual(data[3][-1], 4480.0)
+        self.assertIn("/v3/instruments/XAU_USD/candles", fake.calls[0][0])
+        self.assertEqual(fake.calls[0][1]["granularity"], "M15")
+        self.assertEqual(fake.calls[0][2]["Authorization"], "Bearer test-token")
 
     def test_delayed_yahoo_assets_use_slow_timeframes_in_auto_scan(self) -> None:
         old_force = os.environ.get("STOCK_SIGNALS_FORCE_NYSE_OPEN")
         old_commodity_force = os.environ.get("COMMODITY_SIGNALS_FORCE_OPEN")
+        old_oanda = os.environ.pop("OANDA_API_TOKEN", None)
+        old_oanda_alt = os.environ.pop("OANDA_TOKEN", None)
         try:
             os.environ["STOCK_SIGNALS_FORCE_NYSE_OPEN"] = "1"
             os.environ["COMMODITY_SIGNALS_FORCE_OPEN"] = "1"
@@ -653,6 +746,10 @@ class TelegramUiPolishTests(unittest.TestCase):
                 os.environ.pop("COMMODITY_SIGNALS_FORCE_OPEN", None)
             else:
                 os.environ["COMMODITY_SIGNALS_FORCE_OPEN"] = old_commodity_force
+            if old_oanda is not None:
+                os.environ["OANDA_API_TOKEN"] = old_oanda
+            if old_oanda_alt is not None:
+                os.environ["OANDA_TOKEN"] = old_oanda_alt
 
     def test_stock_chart_parser_supports_manual_signals(self) -> None:
         old_fetch = self.bot._stock_fetch_yahoo_chart_v764

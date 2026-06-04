@@ -25090,7 +25090,199 @@ async def async_handle_update(session, update, sem):
     await _base_async_handle_update_v766_for_v768(session, update, sem)
 
 
-BOT_VERSION_LABEL = "v7.69 Explicit Delayed Asset Data Source"
+# ============================================================
+# v7.70 - OANDA COMMODITY DATA SOURCE
+# ============================================================
+# If OANDA_API_TOKEN is configured, commodity signals prefer OANDA v20 candles
+# (e.g. XAUUSD -> XAU_USD) instead of delayed Yahoo futures proxies. If OANDA
+# rejects an instrument, the old Yahoo path remains a fallback.
+
+_base_get_ohlcv_v769_for_v770 = get_ohlcv
+_base_get_price_v769_for_v770 = get_price
+_base_safe_signal_interval_v769_for_v770 = _safe_signal_interval_v765
+_base_signal_tfs_for_asset_v769_for_v770 = _signal_tfs_for_asset_v765
+_base_signal_group_tfs_v769_for_v770 = _signal_group_tfs_v766
+_base_format_signal_summary_v769_for_v770 = format_signal_summary
+_base_format_signal_group_menu_text_v769_for_v770 = format_signal_group_menu_text_v766
+
+OANDA_SIGNAL_SYMBOLS_V770 = {
+    "XAUUSD": "XAU_USD",
+    "XAGUSD": "XAG_USD",
+    "XPTUSD": "XPT_USD",
+    "XPDUSD": "XPD_USD",
+    "USOIL": "WTICO_USD",
+    "UKOIL": "BCO_USD",
+    "COPPER": "XCU_USD",
+}
+OANDA_GRANULARITY_V770 = {
+    "5m": "M5",
+    "15m": "M15",
+    "30m": "M30",
+    "1h": "H1",
+    "4h": "H4",
+}
+OANDA_AGG_INTERVALS_V770 = {"45m": ("15m", 3)}
+OANDA_SIGNAL_TFS_V770 = ["5m", "15m", "30m", "45m", "1h", "4h"]
+
+
+def _oanda_api_token_v770():
+    return (os.getenv("OANDA_API_TOKEN") or os.getenv("OANDA_TOKEN") or "").strip()
+
+
+def _oanda_api_base_v770():
+    explicit = (os.getenv("OANDA_API_BASE") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    env = (os.getenv("OANDA_ENV") or "practice").strip().lower()
+    if env in {"live", "real"}:
+        return "https://api-fxtrade.oanda.com"
+    return "https://api-fxpractice.oanda.com"
+
+
+def _oanda_enabled_for_ticker_v770(ticker):
+    ticker = str(ticker or "").upper()
+    return bool(_oanda_api_token_v770()) and ticker in OANDA_SIGNAL_SYMBOLS_V770
+
+
+def _oanda_headers_v770():
+    return {
+        "Authorization": "Bearer " + _oanda_api_token_v770(),
+        "Accept": "application/json",
+    }
+
+
+def _oanda_fetch_candles_v770(ticker, interval, count=600):
+    ticker = str(ticker or "").upper()
+    instrument = OANDA_SIGNAL_SYMBOLS_V770.get(ticker)
+    if not instrument:
+        raise ValueError(f"OANDA instrument is not mapped for {ticker}")
+    if interval not in OANDA_GRANULARITY_V770:
+        raise ValueError(f"OANDA interval is unsupported: {interval}")
+    url = f"{_oanda_api_base_v770()}/v3/instruments/{instrument}/candles"
+    response = _session.get(
+        url,
+        params={
+            "price": "M",
+            "granularity": OANDA_GRANULARITY_V770[interval],
+            "count": int(count),
+        },
+        headers=_oanda_headers_v770(),
+        timeout=12,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    candles = payload.get("candles") if isinstance(payload, dict) else None
+    if not isinstance(candles, list):
+        raise ValueError(f"OANDA candles error: {payload}")
+    rows = []
+    for candle in candles:
+        mid = (candle or {}).get("mid") or {}
+        try:
+            if candle.get("complete") is False and len(candles) > 80:
+                continue
+            row = (
+                float(mid.get("o")),
+                float(mid.get("h")),
+                float(mid.get("l")),
+                float(mid.get("c")),
+                float((candle or {}).get("volume") or 0),
+            )
+        except (TypeError, ValueError):
+            continue
+        if all(math.isfinite(x) for x in row[:4]):
+            rows.append(row)
+    if len(rows) < 50:
+        raise ValueError(f"Not enough OANDA candles for {ticker}: {len(rows)}")
+    rows = rows[-600:]
+    return (
+        [x[0] for x in rows],
+        [x[1] for x in rows],
+        [x[2] for x in rows],
+        [x[3] for x in rows],
+        [x[4] for x in rows],
+    )
+
+
+def _oanda_ohlcv_v770(ticker, interval):
+    interval = str(interval or "")
+    if interval in OANDA_AGG_INTERVALS_V770:
+        base_interval, group_size = OANDA_AGG_INTERVALS_V770[interval]
+        base = _oanda_fetch_candles_v770(ticker, base_interval, count=1800)
+        return _aggregate_stock_ohlcv_v764(base, group_size)
+    return tuple(part[-500:] for part in _oanda_fetch_candles_v770(ticker, interval, count=650))
+
+
+def _oanda_price_v770(ticker):
+    return _oanda_ohlcv_v770(ticker, "5m")[3][-1]
+
+
+def _safe_signal_interval_v765(ticker, interval):
+    if _oanda_enabled_for_ticker_v770(ticker):
+        return interval if interval in OANDA_SIGNAL_TFS_V770 else "15m"
+    return _base_safe_signal_interval_v769_for_v770(ticker, interval)
+
+
+def _signal_tfs_for_asset_v765(ticker):
+    if _oanda_enabled_for_ticker_v770(ticker):
+        return list(OANDA_SIGNAL_TFS_V770)
+    return _base_signal_tfs_for_asset_v769_for_v770(ticker)
+
+
+def _signal_group_tfs_v766(group):
+    if group == "commodities" and _oanda_api_token_v770():
+        return list(OANDA_SIGNAL_TFS_V770)
+    return _base_signal_group_tfs_v769_for_v770(group)
+
+
+def get_ohlcv(ticker, interval):
+    if _oanda_enabled_for_ticker_v770(ticker):
+        try:
+            return _oanda_ohlcv_v770(ticker, _safe_signal_interval_v765(ticker, interval))
+        except Exception as e:
+            print(f"  [oanda_v770] fallback to Yahoo for {ticker} {interval}: {e}")
+    return _base_get_ohlcv_v769_for_v770(ticker, interval)
+
+
+def get_price(ticker):
+    if _oanda_enabled_for_ticker_v770(ticker):
+        try:
+            return _oanda_price_v770(ticker)
+        except Exception as e:
+            print(f"  [oanda_v770] price fallback for {ticker}: {e}")
+    return _base_get_price_v769_for_v770(ticker)
+
+
+def format_signal_summary(data, ticker, interval):
+    text = _base_format_signal_summary_v769_for_v770(data, ticker, interval)
+    ticker = str(ticker or "").upper()
+    if _oanda_enabled_for_ticker_v770(ticker):
+        oanda_symbol = OANDA_SIGNAL_SYMBOLS_V770.get(ticker, ticker)
+        replacement = f"Данные: <b>OANDA v20</b> | symbol <b>{_ui_html(oanda_symbol)}</b> | OANDA chart"
+        lines = text.splitlines()
+        for idx, line in enumerate(lines[:6]):
+            if "Данные:" in line:
+                lines[idx] = replacement
+                return "\n".join(lines)
+    return text
+
+
+def format_signal_group_menu_text_v766(chat_id, group):
+    group, ticker, interval = _signal_group_state_v766(chat_id, group)
+    if group != "commodities" or not _oanda_api_token_v770():
+        return _base_format_signal_group_menu_text_v769_for_v770(chat_id, group)
+    meta = SIGNAL_GROUPS_V766[group]
+    return "\n".join([
+        f"{meta['emoji']} <b>{meta['title']} сигналы</b>",
+        "",
+        f"Актив: <b>{_ui_signal_symbol_v764(ticker)}</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b>",
+        "",
+        "Источник: <b>OANDA v20</b>. TF: 5м, 15м, 30м, 45м, 1ч, 4ч.",
+        "Скан показывает LONG / SHORT / WAIT, но авто-уведомления отправляют только уверенные LONG/SHORT.",
+    ])
+
+
+BOT_VERSION_LABEL = "v7.70 OANDA Commodity Data Source"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -25186,6 +25378,7 @@ RUNTIME_LAYERS = [
     ("v7.67", "Testnet algo protection orders include algoType, positionSide and ACK response mode"),
     ("v7.68", "responsive Testnet UI cards with cached account reads and background report rendering"),
     ("v7.69", "signal cards label Yahoo delayed and futures-proxy data sources for stocks and commodities"),
+    ("v7.70", "optional OANDA v20 commodity candles replace Yahoo proxies when OANDA_API_TOKEN is configured"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -25266,6 +25459,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "commodities_market_is_open": commodities_market_is_open_v765,
     "stock_ohlcv": _stock_ohlcv_v764,
     "stock_price": _stock_price_v764,
+    "oanda_ohlcv": _oanda_ohlcv_v770,
+    "oanda_price": _oanda_price_v770,
+    "oanda_enabled_for_ticker": _oanda_enabled_for_ticker_v770,
     "auto_signal_scan_tickers": _auto_signal_scan_tickers_v764,
     "auto_signal_scan_pairs": _auto_signal_scan_pairs_v765,
     "signal_commodity_ticker_keyboard": signal_commodity_ticker_keyboard_v765,
@@ -25516,6 +25712,10 @@ def validate_runtime_architecture():
         errors.append("commodities session helper is missing")
     if not callable(globals().get("_stock_ohlcv_v764")):
         errors.append("stock OHLCV helper is missing")
+    if not callable(globals().get("_oanda_ohlcv_v770")):
+        errors.append("OANDA commodity OHLCV helper is missing")
+    if "XAUUSD" not in globals().get("OANDA_SIGNAL_SYMBOLS_V770", {}):
+        errors.append("OANDA XAUUSD mapping is missing")
     if not callable(globals().get("_auto_signal_scan_tickers_v764")):
         errors.append("stock-aware auto signal universe helper is missing")
     if not callable(globals().get("_auto_signal_scan_pairs_v765")):
