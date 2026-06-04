@@ -326,7 +326,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.71 Alpaca Stock Data Source")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.72 Testnet Daily Trade Cap Removed")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -1040,6 +1040,34 @@ class TelegramUiPolishTests(unittest.TestCase):
         try:
             self.bot._testnet_open_positions_v734 = lambda: ([], None)
             self.bot._testnet_today_real_entry_count_v734 = lambda chat_id=None: 0
+            self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: {"blockers": []}
+            candidate = {
+                "ticker": "BTCUSDT",
+                "interval": "15m",
+                "direction": "long",
+                "data": {"risk_levels": {"rr_ratio": 1.67}, "risk_blockers": []},
+                "entry_plan": {
+                    "status": "ENTER_NOW",
+                    "entry_now_score": 88,
+                    "setup_score": 88,
+                    "rr_now": 1.67,
+                },
+            }
+            self.assertIsNone(self.bot._testnet_candidate_block_reason_v735(987654321, candidate))
+        finally:
+            self.bot._testnet_open_positions_v734 = old_open
+            self.bot._testnet_today_real_entry_count_v734 = old_count
+            self.bot._build_testnet_trade_plan_v734 = old_plan
+
+    def test_testnet_daily_count_is_not_a_hard_trade_blocker(self) -> None:
+        old_open = self.bot._testnet_open_positions_v734
+        old_count = self.bot._testnet_today_real_entry_count_v734
+        old_plan = self.bot._build_testnet_trade_plan_v734
+        try:
+            self.bot._testnet_open_positions_v734 = lambda: ([], None)
+            self.bot._testnet_today_real_entry_count_v734 = (
+                lambda chat_id=None: self.bot.PAPER_TRADER_MAX_TRADES_PER_DAY
+            )
             self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: {"blockers": []}
             candidate = {
                 "ticker": "BTCUSDT",

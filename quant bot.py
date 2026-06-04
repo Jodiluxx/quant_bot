@@ -25486,7 +25486,141 @@ def format_signal_group_menu_text_v766(chat_id, group):
     ])
 
 
-BOT_VERSION_LABEL = "v7.71 Alpaca Stock Data Source"
+# ============================================================
+# v7.72 - TESTNET DAILY TRADE CAP REMOVED
+# ============================================================
+# Keep the day counter for diagnostics, but do not let it block Binance
+# Futures Testnet entries. Open-position, same-direction, correlation,
+# precision, SL/TP and exchange-safety checks still remain active.
+
+_base_build_testnet_trade_plan_v771_for_v772 = _build_testnet_trade_plan_v734
+_base_testnet_candidate_block_reason_v771_for_v772 = _testnet_candidate_block_reason_v735
+
+
+def _is_testnet_daily_cap_reason_v772(value):
+    text = str(value or "").lower()
+    return (
+        ("daily" in text and "limit" in text)
+        or ("днев" in text and "лимит" in text)
+        or ("сделок" in text and f"/{PAPER_TRADER_MAX_TRADES_PER_DAY}" in text)
+    )
+
+
+def _strip_testnet_daily_cap_from_plan_v772(plan):
+    plan = dict(plan or {})
+    blockers = list(plan.get("blockers") or [])
+    filtered = [x for x in blockers if not _is_testnet_daily_cap_reason_v772(x)]
+    if len(filtered) != len(blockers):
+        plan["blockers"] = filtered
+        warnings = list(plan.get("warnings") or [])
+        warnings.append("daily Testnet trade counter is observed, not blocking")
+        plan["warnings"] = warnings
+    return plan
+
+
+def _build_testnet_trade_plan_v734(chat_id, candidate):
+    return _strip_testnet_daily_cap_from_plan_v772(
+        _base_build_testnet_trade_plan_v771_for_v772(chat_id, candidate)
+    )
+
+
+def _testnet_candidate_block_reason_v735(chat_id, candidate, active_positions=None, pos_err=None, today_count=None):
+    reason = _base_testnet_candidate_block_reason_v771_for_v772(
+        chat_id,
+        candidate,
+        active_positions=active_positions,
+        pos_err=pos_err,
+        today_count=0,
+    )
+    if _is_testnet_daily_cap_reason_v772(reason):
+        return None
+    return reason
+
+
+def _testnet_today_attempts_label_v772(chat_id):
+    count = _testnet_today_real_entry_count_v734(chat_id)
+    return f"{count} попыток"
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _simple_sync_public_auto_settings(chat_id)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d • %H:%M UTC")
+    st = _testnet_stats_line_v734()
+    lines = [
+        "🤖 <b>Демо-бот Binance Testnet: цикл 15м</b>",
+        now,
+        "",
+        f"Testnet позиции: <b>{st['open']}/{PAPER_TRADER_MAX_POSITIONS}</b> | Сегодня: <b>{_testnet_today_attempts_label_v772(chat_id)}</b>",
+        "Режим: <b>только Binance Futures Testnet</b>",
+    ]
+    candidate, tried = testnet_select_trade_candidate(chat_id)
+    if not candidate:
+        reason = _testnet_best_gate_message_v735(tried)
+        decision = {"opened": False, "status": "NO_TRADE", "reason": reason}
+        _demo_analysis_record_cycle_v736(chat_id, tried, decision=decision)
+        lines += ["", "<b>Решение:</b>", "Сделка на Binance Testnet не открыта.", reason]
+        best = _format_scan_rows(tried)
+        if best:
+            lines += ["", "<b>Лучшие проверки:</b>"] + best[:3]
+        return "\n".join(lines)
+
+    result = _submit_testnet_trade_v734(chat_id, candidate)
+    plan = result.get("plan") or {}
+    ticker = plan.get("ticker") or candidate.get("ticker")
+    direction = str(plan.get("direction") or candidate.get("direction") or "").upper()
+    interval = plan.get("interval") or candidate.get("interval")
+    if not result.get("ok"):
+        decision = {
+            "opened": False,
+            "status": "BLOCKED",
+            "stage": result.get("stage"),
+            "reason": str(result.get("reason") or "")[:500],
+            "ticker": ticker,
+            "interval": interval,
+            "direction": direction,
+        }
+        _demo_analysis_record_cycle_v736(chat_id, tried, candidate=candidate, result=result, decision=decision)
+        lines += [
+            "",
+            "<b>Решение:</b>",
+            "Сделка на Binance Testnet не открыта.",
+            f"Этап: <b>{_ui_html(result.get('stage'))}</b>",
+            "Причина: " + _ui_short_text(result.get("reason"), 180),
+        ]
+        if ticker and direction:
+            lines.append(f"План: <b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}")
+        return "\n".join(lines)
+
+    entry_order = plan.get("entry_order") or {}
+    protection = result.get("protection") or {}
+    monitor = _testnet_monitor_for_plan_v737(plan)
+    result["monitor"] = monitor
+    decision = {
+        "opened": True,
+        "status": "OPENED",
+        "ticker": ticker,
+        "interval": interval,
+        "direction": direction,
+        "reason": str(candidate.get("reason") or "")[:500],
+        "monitor_status": monitor.get("status"),
+    }
+    _demo_analysis_record_cycle_v736(chat_id, tried, candidate=candidate, result=result, decision=decision)
+    lines += [
+        "",
+        "<b>Решение:</b>",
+        "✅ Открыта сделка на <b>Binance Futures Testnet</b>.",
+        "",
+        f"<b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}",
+        f"Qty: <b>{entry_order.get('quantity')}</b> | Leverage: <b>x{entry_order.get('leverage')}</b>",
+        f"Entry ref: <b>{fmt_price(entry_order.get('entry_reference'), ticker)}</b>",
+        f"Protection: <b>{len(protection.get('orders') or [])} reduce-only algo orders</b>",
+        _testnet_monitor_short_line_v737(monitor),
+        f"Причина: {_ui_short_text(candidate.get('reason'), 140)}",
+    ]
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.72 Testnet Daily Trade Cap Removed"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -25584,6 +25718,7 @@ RUNTIME_LAYERS = [
     ("v7.69", "signal cards label Yahoo delayed and futures-proxy data sources for stocks and commodities"),
     ("v7.70", "optional OANDA v20 commodity candles replace Yahoo proxies when OANDA_API_TOKEN is configured"),
     ("v7.71", "optional Alpaca IEX/SIP stock candles replace Yahoo when Alpaca market-data keys are configured"),
+    ("v7.72", "remove hard daily Testnet trade cap while keeping position and exchange-safety gates"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
