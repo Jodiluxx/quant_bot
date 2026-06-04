@@ -326,7 +326,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.67 Testnet Algo Protection Params")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.68 Responsive Testnet UI Cache")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -391,10 +391,16 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.65" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.66" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.67" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.68" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_public_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_ui_cached_call", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_open_positions_ui", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_income_stats_ui", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_lifecycle_recent_ui", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_closed_trade_rows_ui", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("normalize_testnet_plan", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_connection_status", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("rebuild_testnet_lifecycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -735,6 +741,70 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertNotIn("Paper-", text)
         self.assertNotIn("paper-", text)
         self.assertNotIn("Paper Trader", text)
+
+    def test_main_status_does_not_refresh_testnet_network_stats(self) -> None:
+        old_open = self.bot._testnet_open_positions_v734
+        old_income = self.bot._base_testnet_income_stats_v734_for_v768
+        old_cache = dict(self.bot._testnet_ui_cache_v768)
+        calls = {"open": 0, "income": 0}
+
+        def fail_open():
+            calls["open"] += 1
+            raise AssertionError("main menu should not refresh positions")
+
+        def fail_income(limit=1000):
+            calls["income"] += 1
+            raise AssertionError("main menu should not refresh income")
+
+        try:
+            self.bot._testnet_ui_cache_v768.clear()
+            self.bot._testnet_open_positions_v734 = fail_open
+            self.bot._base_testnet_income_stats_v734_for_v768 = fail_income
+            text = self.bot.format_main_status(987654321)
+        finally:
+            self.bot._testnet_open_positions_v734 = old_open
+            self.bot._base_testnet_income_stats_v734_for_v768 = old_income
+            self.bot._testnet_ui_cache_v768.clear()
+            self.bot._testnet_ui_cache_v768.update(old_cache)
+
+        self.assertIn("Testnet", text)
+        self.assertEqual(calls, {"open": 0, "income": 0})
+
+    def test_closed_trade_button_uses_local_lifecycle_without_rebuild(self) -> None:
+        old_load = self.bot._testnet_lifecycle_load_v740
+        old_plans = self.bot._execution_last_plans_v715
+        old_rebuild = self.bot.rebuild_testnet_lifecycle_v740
+        calls = {"rebuild": 0}
+
+        def fail_rebuild(chat_id=None, limit=20):
+            calls["rebuild"] += 1
+            raise AssertionError("closed report button should not rebuild lifecycle")
+
+        try:
+            self.bot._testnet_lifecycle_load_v740 = lambda: {
+                "trades": [
+                    {
+                        "plan_id": "p1",
+                        "ticker": "BTCUSDT",
+                        "direction": "long",
+                        "interval": "15m",
+                        "created_at": "2026-06-04T00:00:00+00:00",
+                        "status": "PLANNED",
+                        "pnl": {"status": "UNATTRIBUTED"},
+                    }
+                ]
+            }
+            self.bot._execution_last_plans_v715 = lambda chat_id, limit=500: [{"plan_id": "p1"}]
+            self.bot.rebuild_testnet_lifecycle_v740 = fail_rebuild
+            text = self.bot._simple_format_closed_positions(987654321)
+        finally:
+            self.bot._testnet_lifecycle_load_v740 = old_load
+            self.bot._execution_last_plans_v715 = old_plans
+            self.bot.rebuild_testnet_lifecycle_v740 = old_rebuild
+
+        self.assertIn("Demo Trade Report", text)
+        self.assertIn("BTC", text)
+        self.assertEqual(calls["rebuild"], 0)
 
     def test_testnet_gate_does_not_use_stale_paper_positions(self) -> None:
         old_open = self.bot._testnet_open_positions_v734

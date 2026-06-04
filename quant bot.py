@@ -24781,7 +24781,303 @@ async def async_handle_update(session, update, sem):
     await _base_async_handle_update_v765_for_v766(session, update, sem)
 
 
-BOT_VERSION_LABEL = "v7.67 Testnet Algo Protection Params"
+# ============================================================
+# v7.68 - RESPONSIVE TESTNET UI CACHE
+# ============================================================
+# Navigation should feel like an app: ordinary menu/report buttons must not
+# block the Telegram loop while Binance is slow. Trading gates still use their
+# own fresh checks; this cache is only for user-facing cards and reports.
+
+_base_async_handle_update_v766_for_v768 = async_handle_update
+_base_format_main_status_v766_for_v768 = format_main_status
+_base_testnet_income_stats_v734_for_v768 = _testnet_income_stats_v734
+_base_testnet_public_stats_v738_for_v768 = _testnet_public_stats_v738
+_base_testnet_stats_line_v734_for_v768 = _testnet_stats_line_v734
+_base_simple_format_open_positions_v766_for_v768 = _simple_format_open_positions
+
+TESTNET_UI_POSITION_CACHE_TTL_V768 = 12.0
+TESTNET_UI_INCOME_CACHE_TTL_V768 = 60.0
+_testnet_ui_cache_v768 = {}
+
+
+def _testnet_ui_cache_get_v768(key, max_age):
+    item = _testnet_ui_cache_v768.get(key)
+    if not item:
+        return None
+    age = time.monotonic() - float(item.get("ts", 0.0) or 0.0)
+    if age <= float(max_age):
+        return item.get("value")
+    return None
+
+
+def _testnet_ui_cache_stale_v768(key):
+    item = _testnet_ui_cache_v768.get(key)
+    if not item:
+        return None
+    return item.get("value")
+
+
+def _testnet_ui_cache_set_v768(key, value):
+    _testnet_ui_cache_v768[key] = {"ts": time.monotonic(), "value": value}
+    return value
+
+
+def _testnet_ui_cached_call_v768(key, loader, max_age, fallback=None, allow_refresh=True):
+    cached = _testnet_ui_cache_get_v768(key, max_age)
+    if cached is not None:
+        return cached
+    stale = _testnet_ui_cache_stale_v768(key)
+    if not allow_refresh:
+        return stale if stale is not None else fallback
+    try:
+        value = loader()
+        return _testnet_ui_cache_set_v768(key, value)
+    except Exception as e:
+        if stale is not None:
+            return stale
+        return fallback if fallback is not None else {"ok": False, "reason": str(e)[:180]}
+
+
+def _testnet_open_positions_ui_v768(allow_refresh=True):
+    return _testnet_ui_cached_call_v768(
+        "positions",
+        _testnet_open_positions_v734,
+        TESTNET_UI_POSITION_CACHE_TTL_V768,
+        fallback=([], None),
+        allow_refresh=allow_refresh,
+    )
+
+
+def _testnet_income_stats_ui_v768(limit=1000, allow_refresh=True):
+    key = f"income:{int(limit)}"
+    return _testnet_ui_cached_call_v768(
+        key,
+        lambda: _base_testnet_income_stats_v734_for_v768(limit),
+        TESTNET_UI_INCOME_CACHE_TTL_V768,
+        fallback={"ok": False, "reason": "income cache is empty"},
+        allow_refresh=allow_refresh,
+    )
+
+
+def _testnet_income_stats_v734(limit=1000):
+    return _testnet_income_stats_ui_v768(limit, allow_refresh=True)
+
+
+def _testnet_stats_line_v734(allow_refresh=True):
+    active, err = _testnet_open_positions_ui_v768(allow_refresh=allow_refresh)
+    stats = _testnet_income_stats_ui_v768(allow_refresh=allow_refresh)
+    if stats.get("ok"):
+        wr = f"{stats.get('winrate', 0):.1f}%"
+        return {
+            "open": len(active),
+            "closed": stats.get("closed", 0),
+            "wins": stats.get("wins", 0),
+            "losses": stats.get("losses", 0),
+            "winrate": wr,
+            "net": stats.get("net", 0.0),
+            "err": err,
+        }
+    return {
+        "open": len(active),
+        "closed": 0,
+        "wins": 0,
+        "losses": 0,
+        "winrate": "0.0%",
+        "net": 0.0,
+        "err": err or stats.get("reason"),
+    }
+
+
+def _testnet_public_stats_v738(chat_id):
+    active, pos_err = _testnet_open_positions_ui_v768(allow_refresh=True)
+    income = _testnet_income_stats_v734()
+    closed_rows = _testnet_closed_trade_rows_v742(chat_id, 200)
+    attributed = [row for row in closed_rows if (row.get("pnl") or {}).get("status") == "ATTRIBUTED"]
+    wins = [row for row in attributed if _safe_float((row.get("pnl") or {}).get("realized_usdt"), 0) > 0]
+    losses = [row for row in attributed if _safe_float((row.get("pnl") or {}).get("realized_usdt"), 0) < 0]
+    net = sum(_safe_float((row.get("pnl") or {}).get("realized_usdt"), 0) or 0 for row in attributed)
+    income_ok = bool(income.get("ok"))
+    return {
+        "open": len(active),
+        "position_error": pos_err,
+        "bot_closed": len(closed_rows),
+        "attributed_closed": len(attributed),
+        "bot_wins": len(wins),
+        "bot_losses": len(losses),
+        "bot_winrate": (len(wins) / len(attributed) * 100.0) if attributed else None,
+        "bot_net": net,
+        "income_events": int(income.get("closed", 0) or 0) if income_ok else 0,
+        "income_winrate": f"{income.get('winrate', 0):.1f}%" if income_ok else "n/a",
+        "income_net": _safe_float(income.get("net"), 0) if income_ok else 0.0,
+        "income_error": None if income_ok else income.get("reason"),
+    }
+
+
+def format_main_status(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
+    sig = _get_auto_task_settings(chat_id, "signals")
+    paper = _get_auto_task_settings(chat_id, "paper_trader")
+    stats = _testnet_stats_line_v734(allow_refresh=False)
+    return "\n".join([
+        "🏠 <b>Главное меню</b>",
+        "",
+        f"Сигнал: <b>{_ui_ticker_short(ticker)}USDT</b> | TF <b>{_ui_tf_short(interval)}</b>",
+        f"Авто: <b>{auto_state}</b> | Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
+        f"Testnet позиции: <b>{stats['open']}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        "",
+        "<b>Уведомления:</b>",
+        f"• Сигналы: <b>{'ON' if sig.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | { _ui_tf_short(sig.get('send_interval')) } | TF { _ui_tf_short(sig.get('tf') or '30m') }",
+        f"• Демо-бот: <b>{'ON' if paper.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | каждые 15м",
+    ])
+
+
+def _simple_format_open_positions(chat_id):
+    positions, err = _testnet_open_positions_ui_v768(allow_refresh=True)
+    lines = ["🟢 <b>Открытые Binance Testnet позиции</b>", ""]
+    if err:
+        lines.append("Не удалось прочитать Testnet позиции: " + _ui_short_text(err, 160))
+        return "\n".join(lines)
+    if not positions:
+        lines.append("Открытых Testnet позиций нет.")
+        return "\n".join(lines)
+    for pos in positions[-5:]:
+        amt = _safe_float(pos.get("positionAmt"), 0) or 0
+        direction = "LONG" if amt > 0 else "SHORT"
+        lines += [
+            f"<b>{_ui_ticker_short(pos.get('symbol'))} {direction}</b>",
+            f"Size: <b>{amt:g}</b> | Entry: <b>{fmt_price(pos.get('entryPrice'), pos.get('symbol'))}</b>",
+            f"Mark: <b>{fmt_price(pos.get('markPrice'), pos.get('symbol'))}</b> | uPnL: <b>{_safe_float(pos.get('unRealizedProfit'), 0):+.3f} USDT</b>",
+            "",
+        ]
+    return "\n".join(lines).rstrip()
+
+
+def _testnet_lifecycle_recent_ui_v768(chat_id=None, limit=20):
+    rows = list((_testnet_lifecycle_load_v740().get("trades") or []))
+    if chat_id is not None:
+        plan_ids = {p.get("plan_id") for p in _execution_last_plans_v715(chat_id, 500)}
+        rows = [x for x in rows if x.get("plan_id") in plan_ids]
+    rows.sort(key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+    return rows[: int(limit)]
+
+
+def _testnet_closed_trade_rows_ui_v768(chat_id=None, limit=50):
+    rows = _testnet_lifecycle_recent_ui_v768(chat_id, limit)
+    closed = []
+    for row in rows:
+        monitor = row.get("monitor") or {}
+        if monitor.get("status") in {"NO_POSITION", "ORPHAN_ORDERS"} or str(row.get("status") or "").startswith("CLOSED_"):
+            closed.append(row)
+    closed.sort(key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+    return closed[: int(limit)]
+
+
+def _simple_format_closed_positions(chat_id):
+    rows = _testnet_lifecycle_recent_ui_v768(chat_id, 50)
+    closed = _testnet_closed_trade_rows_ui_v768(chat_id, 50)
+    attributed = [row for row in closed if (row.get("pnl") or {}).get("status") == "ATTRIBUTED"]
+    linked = len(attributed)
+    pending = max(0, len(closed) - linked)
+    issues = _testnet_lifecycle_issue_count_v744(rows)
+    wins = [
+        row for row in attributed
+        if _safe_float((row.get("pnl") or {}).get("realized_usdt"), 0) > 0
+    ]
+    losses = [
+        row for row in attributed
+        if _safe_float((row.get("pnl") or {}).get("realized_usdt"), 0) < 0
+    ]
+    net = sum(_safe_float((row.get("pnl") or {}).get("realized_usdt"), 0) or 0 for row in attributed)
+    open_cached, _ = _testnet_open_positions_ui_v768(allow_refresh=False)
+    lines = [
+        "📒 <b>Demo Trade Report</b>",
+        "",
+        f"Открытые: <b>{len(open_cached)}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"Закрытые: <b>{len(closed)}</b> | PnL linked: <b>{linked}</b>",
+    ]
+    if linked:
+        wr = len(wins) / linked * 100.0
+        lines.append(f"Winrate: <b>{wr:.1f}%</b> | PnL: <b>{net:+.3f} USDT</b> | W/L {len(wins)}/{len(losses)}")
+    else:
+        lines.append("Winrate / PnL: <b>н/д</b> — закрытых сделок с привязанным PnL ещё нет")
+    lines += [
+        f"Сверяется: <b>{pending}</b> | Проблемы: <b>{issues}</b>",
+        "",
+        "<b>Последние сделки:</b>",
+    ]
+    if not rows:
+        lines.append("Пока нет Testnet-сделок бота.")
+        return "\n".join(lines)
+    for row in rows[:8]:
+        ticker = _ui_ticker_short(row.get("ticker"))
+        direction = str(row.get("direction") or "").upper()
+        interval = _ui_tf_short(row.get("interval"))
+        status = _testnet_lifecycle_user_status_v744(row)
+        result = _testnet_lifecycle_result_text_v744(row)
+        lines.append(f"• {ticker} {direction} {interval} | <b>{_ui_html(status)}</b> | {result}")
+    if pending:
+        lines += ["", "PnL может появиться позже: Binance income иногда приходит не сразу."]
+    if issues:
+        lines += ["", "Проблемные статусы записаны локально для разбора."]
+    return "\n".join(lines)
+
+
+async def _send_responsive_card_v768(session, update, loading_text, builder, keyboard):
+    await send_or_edit(session, update, loading_text, keyboard)
+    try:
+        text = await asyncio.to_thread(builder)
+    except Exception as e:
+        text = "⚠️ <b>Не удалось собрать экран.</b>\n\nПричина: " + _ui_short_text(str(e), 180)
+    await send_or_edit(session, update, text, keyboard)
+
+
+async def async_handle_update(session, update, sem):
+    if "callback_query" in update:
+        cb = update["callback_query"]
+        data = cb.get("data", "")
+        chat_id = _signal_chat_key_v766(cb["message"]["chat"]["id"])
+        callback_id = cb.get("id")
+
+        if data in {"menu_autobot", "paper_trader"}:
+            await _answer_callback_once_v732(session, callback_id, "Демо-бот")
+            await _send_responsive_card_v768(
+                session,
+                update,
+                "🤖 <b>Демо-бот Binance Testnet</b>\n\nЗагружаю краткую статистику...",
+                lambda: format_autobot_menu(chat_id),
+                autobot_keyboard(chat_id),
+            )
+            return
+
+        if data == "paper_open_positions":
+            await _answer_callback_once_v732(session, callback_id, "Открытые")
+            await _send_responsive_card_v768(
+                session,
+                update,
+                "🟢 <b>Открытые позиции</b>\n\nСверяю Binance Testnet...",
+                lambda: _simple_format_open_positions(chat_id),
+                autobot_keyboard(chat_id),
+            )
+            return
+
+        if data in {"paper_closed_menu", "paper_closed_win", "paper_closed_loss"}:
+            await _answer_callback_once_v732(session, callback_id, "Отчёт")
+            await _send_responsive_card_v768(
+                session,
+                update,
+                "📒 <b>Отчёт по сделкам</b>\n\nЧитаю локальный журнал и PnL-кэш...",
+                lambda: _simple_format_closed_positions(chat_id),
+                autobot_keyboard(chat_id),
+            )
+            return
+
+    await _base_async_handle_update_v766_for_v768(session, update, sem)
+
+
+BOT_VERSION_LABEL = "v7.68 Responsive Testnet UI Cache"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -24875,6 +25171,7 @@ RUNTIME_LAYERS = [
     ("v7.65", "delay-aware Yahoo timeframes plus commodity signal universe"),
     ("v7.66", "signal UI routes through market groups with per-group asset and TF selection"),
     ("v7.67", "Testnet algo protection orders include algoType, positionSide and ACK response mode"),
+    ("v7.68", "responsive Testnet UI cards with cached account reads and background report rendering"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -24921,6 +25218,11 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "testnet_position_status_line": _testnet_position_status_line_v733,
     "testnet_open_positions": _testnet_open_positions_v734,
     "testnet_income_stats": _testnet_income_stats_v734,
+    "testnet_ui_cached_call": _testnet_ui_cached_call_v768,
+    "testnet_open_positions_ui": _testnet_open_positions_ui_v768,
+    "testnet_income_stats_ui": _testnet_income_stats_ui_v768,
+    "testnet_lifecycle_recent_ui": _testnet_lifecycle_recent_ui_v768,
+    "testnet_closed_trade_rows_ui": _testnet_closed_trade_rows_ui_v768,
     "testnet_select_trade_candidate": testnet_select_trade_candidate,
     "demo_analysis_record_cycle": _demo_analysis_record_cycle_v736,
     "demo_analysis_recent_cycles": _demo_analysis_recent_cycles_v736,
