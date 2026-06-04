@@ -24211,6 +24211,19 @@ def format_signal_summary(data, ticker, interval):
     if _is_delayed_yahoo_signal_ticker_v765(ticker):
         text = text.replace(f"{_ui_ticker_short(ticker)}USDT", _ui_signal_symbol_v764(ticker))
         text = text.replace("Futures Context", "Market Context")
+        yahoo_symbol = YAHOO_SIGNAL_SYMBOLS_V765.get(str(ticker or "").upper(), ticker)
+        asset_note = "Yahoo delayed"
+        if _is_commodity_ticker_v765(ticker):
+            asset_note = "Yahoo futures proxy"
+        source_line = (
+            f"Данные: <b>{_ui_html(asset_note)}</b> | symbol <b>{_ui_html(yahoo_symbol)}</b> | "
+            "не OANDA spot"
+        )
+        lines = text.splitlines()
+        insert_at = 2 if len(lines) > 2 else len(lines)
+        if not any("Данные:" in line for line in lines[:5]):
+            lines.insert(insert_at, source_line)
+            text = "\n".join(lines)
     return text
 
 
@@ -25077,7 +25090,7 @@ async def async_handle_update(session, update, sem):
     await _base_async_handle_update_v766_for_v768(session, update, sem)
 
 
-BOT_VERSION_LABEL = "v7.68 Responsive Testnet UI Cache"
+BOT_VERSION_LABEL = "v7.69 Explicit Delayed Asset Data Source"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -25172,6 +25185,7 @@ RUNTIME_LAYERS = [
     ("v7.66", "signal UI routes through market groups with per-group asset and TF selection"),
     ("v7.67", "Testnet algo protection orders include algoType, positionSide and ACK response mode"),
     ("v7.68", "responsive Testnet UI cards with cached account reads and background report rendering"),
+    ("v7.69", "signal cards label Yahoo delayed and futures-proxy data sources for stocks and commodities"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

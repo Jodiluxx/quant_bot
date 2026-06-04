@@ -326,7 +326,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.68 Responsive Testnet UI Cache")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.69 Explicit Delayed Asset Data Source")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -392,6 +392,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.66" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.67" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.68" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.69" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -599,6 +600,35 @@ class TelegramUiPolishTests(unittest.TestCase):
                 os.environ["STOCK_SIGNALS_FORCE_NYSE_OPEN"] = old_force
             if old_commodity_force is not None:
                 os.environ["COMMODITY_SIGNALS_FORCE_OPEN"] = old_commodity_force
+
+    def test_delayed_commodity_signal_card_labels_yahoo_proxy_source(self) -> None:
+        data = {
+            "signal": "LONG",
+            "direction": "long",
+            "price": 4496.10,
+            "confidence": 80,
+            "prob": 0.68,
+            "bull_args": ["test support"],
+            "bear_args": ["test risk"],
+            "risk_levels": {
+                "entry": 4496.10,
+                "sl": 4475.83,
+                "tp1": 4530.42,
+                "tp2": 4550.90,
+                "rr_ratio": 1.67,
+            },
+            "entry_plan": {
+                "status": "ENTER_NOW",
+                "entry_now_score": 78,
+                "setup_score": 80,
+                "rr_now": 1.67,
+            },
+        }
+        text = self.bot.format_signal_summary(data, "XAUUSD", "45m")
+        self.assertIn("XAUUSD", text)
+        self.assertIn("Yahoo futures proxy", text)
+        self.assertIn("GC=F", text)
+        self.assertIn("не OANDA spot", text)
 
     def test_delayed_yahoo_assets_use_slow_timeframes_in_auto_scan(self) -> None:
         old_force = os.environ.get("STOCK_SIGNALS_FORCE_NYSE_OPEN")
