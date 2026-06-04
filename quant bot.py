@@ -24452,7 +24452,329 @@ async def async_handle_update(session, update, sem):
         raise
 
 
-BOT_VERSION_LABEL = "v7.65 Delay-Aware Stocks and Commodities"
+# ============================================================
+# v7.66 - SIGNAL MARKET ROUTER UI
+# ============================================================
+
+_base_signal_menu_keyboard_v765_for_v766 = signal_menu_keyboard
+_base_format_signal_menu_text_v765_for_v766 = format_signal_menu_text
+_base_compact_signal_keyboard_v765_for_v766 = compact_signal_keyboard
+_base_async_handle_update_v765_for_v766 = async_handle_update
+
+SIGNAL_GROUPS_V766 = {
+    "crypto": {
+        "title": "Крипто",
+        "emoji": "🪙",
+        "callback": "sig_crypto_tickers",
+        "scan_callback": "signal_scan_crypto",
+        "asset_callback": "sig_group_asset_crypto",
+        "tf_callback": "sig_group_tf_crypto",
+        "default_ticker": "BTCUSDT",
+        "default_tf": "15m",
+    },
+    "stocks": {
+        "title": "Акции",
+        "emoji": "📈",
+        "callback": "sig_stock_tickers",
+        "scan_callback": "signal_scan_stocks",
+        "asset_callback": "sig_group_asset_stocks",
+        "tf_callback": "sig_group_tf_stocks",
+        "default_ticker": "AAPL",
+        "default_tf": DELAYED_YAHOO_DEFAULT_TF_V765,
+    },
+    "commodities": {
+        "title": "Сырьё",
+        "emoji": "⛏",
+        "callback": "sig_commodity_tickers",
+        "scan_callback": "signal_scan_commodities",
+        "asset_callback": "sig_group_asset_commodities",
+        "tf_callback": "sig_group_tf_commodities",
+        "default_ticker": "XAUUSD",
+        "default_tf": DELAYED_YAHOO_DEFAULT_TF_V765,
+    },
+}
+SIGNAL_GROUP_CALLBACKS_V766 = {meta["callback"]: group for group, meta in SIGNAL_GROUPS_V766.items()}
+SIGNAL_ASSET_CALLBACKS_V766 = {meta["asset_callback"]: group for group, meta in SIGNAL_GROUPS_V766.items()}
+SIGNAL_TF_CALLBACKS_V766 = {meta["tf_callback"]: group for group, meta in SIGNAL_GROUPS_V766.items()}
+SIGNAL_SCAN_CALLBACKS_V766 = {meta["scan_callback"]: group for group, meta in SIGNAL_GROUPS_V766.items()}
+
+_user_signal_active_group_v766 = {}
+_user_signal_group_tickers_v766 = {}
+_user_signal_group_intervals_v766 = {}
+
+
+def _signal_chat_key_v766(chat_id):
+    return _normalize_chat_id_v78(chat_id)
+
+
+def _signal_group_for_ticker_v766(ticker):
+    if _is_stock_ticker_v764(ticker):
+        return "stocks"
+    if _is_commodity_ticker_v765(ticker):
+        return "commodities"
+    return "crypto"
+
+
+def _signal_group_tickers_v766(group):
+    if group == "stocks":
+        return list(STOCK_SIGNAL_TICKERS_V764)
+    if group == "commodities":
+        return list(COMMODITY_SIGNAL_TICKERS_V765)
+    return list(SIGNAL_CRYPTO_TICKERS_V764)
+
+
+def _signal_group_tfs_v766(group):
+    if group in {"stocks", "commodities"}:
+        return list(DELAYED_YAHOO_SIGNAL_TFS_V765)
+    return list(AUTO_SIGNAL_SCAN_TFS_V752)
+
+
+def _signal_group_default_ticker_v766(group):
+    return SIGNAL_GROUPS_V766.get(group, SIGNAL_GROUPS_V766["crypto"])["default_ticker"]
+
+
+def _signal_group_default_tf_v766(group):
+    return SIGNAL_GROUPS_V766.get(group, SIGNAL_GROUPS_V766["crypto"])["default_tf"]
+
+
+def _signal_group_state_v766(chat_id, group=None):
+    chat_id = _signal_chat_key_v766(chat_id)
+    if group is None:
+        group = _user_signal_active_group_v766.get(chat_id)
+    if group not in SIGNAL_GROUPS_V766:
+        group = _signal_group_for_ticker_v766(user_tickers.get(chat_id, "BTCUSDT"))
+    _user_signal_active_group_v766[chat_id] = group
+
+    group_tickers = _user_signal_group_tickers_v766.setdefault(chat_id, {})
+    group_intervals = _user_signal_group_intervals_v766.setdefault(chat_id, {})
+    current_ticker = str(user_tickers.get(chat_id, "") or "").upper()
+    if current_ticker in _signal_group_tickers_v766(group):
+        group_tickers[group] = current_ticker
+    ticker = group_tickers.get(group) or _signal_group_default_ticker_v766(group)
+    if ticker not in _signal_group_tickers_v766(group):
+        ticker = _signal_group_default_ticker_v766(group)
+    group_tickers[group] = ticker
+
+    current_interval = user_intervals.get(chat_id)
+    allowed_tfs = _signal_group_tfs_v766(group)
+    if current_interval in allowed_tfs and _signal_group_for_ticker_v766(current_ticker) == group:
+        group_intervals[group] = current_interval
+    interval = group_intervals.get(group) or _signal_group_default_tf_v766(group)
+    if interval not in allowed_tfs:
+        interval = _signal_group_default_tf_v766(group)
+    group_intervals[group] = interval
+    return group, ticker, interval
+
+
+def _sync_signal_group_to_user_v766(chat_id, group):
+    chat_id = _signal_chat_key_v766(chat_id)
+    group, ticker, interval = _signal_group_state_v766(chat_id, group)
+    user_tickers[chat_id] = ticker
+    user_intervals[chat_id] = interval
+    return group, ticker, interval
+
+
+def _set_signal_group_ticker_v766(chat_id, ticker):
+    chat_id = _signal_chat_key_v766(chat_id)
+    ticker = str(ticker or "").upper()
+    group = _signal_group_for_ticker_v766(ticker)
+    _user_signal_active_group_v766[chat_id] = group
+    _user_signal_group_tickers_v766.setdefault(chat_id, {})[group] = ticker
+    interval = _signal_group_state_v766(chat_id, group)[2]
+    user_tickers[chat_id] = ticker
+    user_intervals[chat_id] = interval
+    _clear_signal_cache(chat_id)
+    save_user_state()
+    return group
+
+
+def _set_signal_group_interval_v766(chat_id, interval):
+    chat_id = _signal_chat_key_v766(chat_id)
+    group, ticker, _ = _signal_group_state_v766(chat_id)
+    allowed = _signal_group_tfs_v766(group)
+    if interval not in allowed:
+        return group, False
+    _user_signal_group_intervals_v766.setdefault(chat_id, {})[group] = interval
+    user_tickers[chat_id] = ticker
+    user_intervals[chat_id] = interval
+    _clear_signal_cache(chat_id)
+    save_user_state()
+    return group, True
+
+
+def format_signal_menu_text(chat_id):
+    group, ticker, interval = _signal_group_state_v766(chat_id)
+    return "\n".join([
+        "📡 <b>Сигналы</b>",
+        "",
+        "Выбери рынок для анализа:",
+        "• Крипто — все TF, данные Binance",
+        "• Акции — TF 30м+, только во время NYSE",
+        "• Сырьё — TF 30м+, режим 24/5",
+        "",
+        f"Текущий выбор: <b>{_ui_signal_symbol_v764(ticker)}</b> / <b>{_ui_tf_short(interval)}</b>",
+        "Авто-сигналы: каждые <b>5м</b>, только уверенные LONG/SHORT.",
+    ])
+
+
+def signal_menu_keyboard(chat_id):
+    return {"inline_keyboard": [
+        [
+            {"text": "🪙 Крипто", "callback_data": "sig_crypto_tickers"},
+            {"text": "📈 Акции", "callback_data": "sig_stock_tickers"},
+        ],
+        [{"text": "⛏ Сырьё", "callback_data": "sig_commodity_tickers"}],
+        [{"text": "⚙️ Уведомления", "callback_data": "auto_settings"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def format_signal_group_menu_text_v766(chat_id, group):
+    group, ticker, interval = _signal_group_state_v766(chat_id, group)
+    meta = SIGNAL_GROUPS_V766[group]
+    if group == "crypto":
+        note = "TF: 5м, 15м, 30м, 45м, 1ч, 4ч."
+    elif group == "stocks":
+        note = "Yahoo-данные могут запаздывать, поэтому TF только 30м+."
+    else:
+        note = "Сырьё через Yahoo-прокси; TF только 30м+, рынок почти 24/5."
+    return "\n".join([
+        f"{meta['emoji']} <b>{meta['title']} сигналы</b>",
+        "",
+        f"Актив: <b>{_ui_signal_symbol_v764(ticker)}</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b>",
+        "",
+        note,
+        "Скан показывает LONG / SHORT / WAIT, но авто-уведомления отправляют только уверенные LONG/SHORT.",
+    ])
+
+
+def signal_group_keyboard_v766(chat_id, group):
+    group, ticker, interval = _signal_group_state_v766(chat_id, group)
+    meta = SIGNAL_GROUPS_V766[group]
+    return {"inline_keyboard": [
+        [{"text": f"📡 Сигнал: {_ui_signal_symbol_v764(ticker)} / {_ui_tf_short(interval)}", "callback_data": "get_signal"}],
+        [{"text": f"🔎 Скан всех: {meta['title']}", "callback_data": meta["scan_callback"]}],
+        [
+            {"text": f"🧭 Актив: {_ui_signal_symbol_v764(ticker)}", "callback_data": meta["asset_callback"]},
+            {"text": f"⏱ TF: {_ui_tf_short(interval)}", "callback_data": meta["tf_callback"]},
+        ],
+        [{"text": "◀️ Группы активов", "callback_data": "menu_signal"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def signal_group_asset_keyboard_v766(chat_id, group):
+    tickers = _signal_group_tickers_v766(group)
+    rows = []
+    for idx in range(0, len(tickers), 2):
+        rows.append([
+            {"text": TICKERS[k]["label"], "callback_data": f"sig_ticker_{k}"}
+            for k in tickers[idx:idx + 2]
+        ])
+    rows.append([{"text": f"◀️ Назад: {SIGNAL_GROUPS_V766[group]['title']}", "callback_data": SIGNAL_GROUPS_V766[group]["callback"]}])
+    rows.append([{"text": "🏠 Главное меню", "callback_data": "back_main"}])
+    return {"inline_keyboard": rows}
+
+
+def signal_group_tf_keyboard_v766(chat_id, group):
+    tfs = _signal_group_tfs_v766(group)
+    rows = []
+    for idx in range(0, len(tfs), 3):
+        rows.append([
+            {"text": INTERVALS[iv]["label"], "callback_data": f"sig_interval_{iv}"}
+            for iv in tfs[idx:idx + 3]
+        ])
+    rows.append([{"text": f"◀️ Назад: {SIGNAL_GROUPS_V766[group]['title']}", "callback_data": SIGNAL_GROUPS_V766[group]["callback"]}])
+    rows.append([{"text": "🏠 Главное меню", "callback_data": "back_main"}])
+    return {"inline_keyboard": rows}
+
+
+def compact_signal_keyboard(open_callback=None):
+    return {"inline_keyboard": [
+        [{"text": "🔄 Обновить сигнал", "callback_data": "get_signal"}],
+        [{"text": "◀️ К рынку", "callback_data": "sig_active_group"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+async def async_handle_update(session, update, sem):
+    if "callback_query" in update:
+        cb = update["callback_query"]
+        data = cb.get("data", "")
+        chat_id = _signal_chat_key_v766(cb["message"]["chat"]["id"])
+        callback_id = cb.get("id")
+
+        if data in {"sig_change_ticker", "change_ticker"}:
+            await _answer_callback_once_v732(session, callback_id, "Рынки")
+            await send_or_edit(session, update, format_signal_menu_text(chat_id), signal_menu_keyboard(chat_id))
+            return
+
+        if data in {"sig_change_interval", "change_interval"}:
+            group = _signal_group_state_v766(chat_id)[0]
+            _sync_signal_group_to_user_v766(chat_id, group)
+            await _answer_callback_once_v732(session, callback_id, "TF")
+            await send_or_edit(session, update, f"⏱ <b>Выбери TF: {SIGNAL_GROUPS_V766[group]['title']}</b>", signal_group_tf_keyboard_v766(chat_id, group))
+            return
+
+        if data in SIGNAL_GROUP_CALLBACKS_V766:
+            group = SIGNAL_GROUP_CALLBACKS_V766[data]
+            _sync_signal_group_to_user_v766(chat_id, group)
+            await _answer_callback_once_v732(session, callback_id, SIGNAL_GROUPS_V766[group]["title"])
+            await send_or_edit(session, update, format_signal_group_menu_text_v766(chat_id, group), signal_group_keyboard_v766(chat_id, group))
+            return
+
+        if data == "sig_active_group":
+            group = _signal_group_state_v766(chat_id)[0]
+            _sync_signal_group_to_user_v766(chat_id, group)
+            await _answer_callback_once_v732(session, callback_id, SIGNAL_GROUPS_V766[group]["title"])
+            await send_or_edit(session, update, format_signal_group_menu_text_v766(chat_id, group), signal_group_keyboard_v766(chat_id, group))
+            return
+
+        if data in SIGNAL_ASSET_CALLBACKS_V766:
+            group = SIGNAL_ASSET_CALLBACKS_V766[data]
+            _sync_signal_group_to_user_v766(chat_id, group)
+            await _answer_callback_once_v732(session, callback_id, "Актив")
+            await send_or_edit(session, update, f"🧭 <b>Выбери актив: {SIGNAL_GROUPS_V766[group]['title']}</b>", signal_group_asset_keyboard_v766(chat_id, group))
+            return
+
+        if data in SIGNAL_TF_CALLBACKS_V766:
+            group = SIGNAL_TF_CALLBACKS_V766[data]
+            _sync_signal_group_to_user_v766(chat_id, group)
+            await _answer_callback_once_v732(session, callback_id, "TF")
+            await send_or_edit(session, update, f"⏱ <b>Выбери TF: {SIGNAL_GROUPS_V766[group]['title']}</b>", signal_group_tf_keyboard_v766(chat_id, group))
+            return
+
+        if data.startswith("sig_ticker_"):
+            ticker = data.replace("sig_ticker_", "", 1).upper()
+            if ticker in TICKERS:
+                group = _set_signal_group_ticker_v766(chat_id, ticker)
+                await _answer_callback_once_v732(session, callback_id, TICKERS[ticker]["label"])
+                await send_or_edit(session, update, format_signal_group_menu_text_v766(chat_id, group), signal_group_keyboard_v766(chat_id, group))
+                return
+
+        if data.startswith("sig_interval_"):
+            interval = data.replace("sig_interval_", "", 1)
+            group, ok = _set_signal_group_interval_v766(chat_id, interval)
+            await _answer_callback_once_v732(session, callback_id, INTERVALS.get(interval, {}).get("label", "TF"))
+            if not ok:
+                await send_or_edit(session, update, f"⏱ <b>Для {SIGNAL_GROUPS_V766[group]['title']} доступны свои TF.</b>", signal_group_tf_keyboard_v766(chat_id, group))
+                return
+            await send_or_edit(session, update, format_signal_group_menu_text_v766(chat_id, group), signal_group_keyboard_v766(chat_id, group))
+            return
+
+        if data == "get_signal":
+            group = _signal_group_state_v766(chat_id)[0]
+            _sync_signal_group_to_user_v766(chat_id, group)
+
+        if data in SIGNAL_SCAN_CALLBACKS_V766:
+            group = SIGNAL_SCAN_CALLBACKS_V766[data]
+            _sync_signal_group_to_user_v766(chat_id, group)
+
+    await _base_async_handle_update_v765_for_v766(session, update, sem)
+
+
+BOT_VERSION_LABEL = "v7.66 Signal Market Router UI"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -24544,6 +24866,7 @@ RUNTIME_LAYERS = [
     ("v7.63", "Testnet exploration gate for strong WAIT RETEST demo setups"),
     ("v7.64", "stock signal universe and NYSE-aware 5-minute auto-signal scanning"),
     ("v7.65", "delay-aware Yahoo timeframes plus commodity signal universe"),
+    ("v7.66", "signal UI routes through market groups with per-group asset and TF selection"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -24622,6 +24945,10 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "auto_signal_scan_tickers": _auto_signal_scan_tickers_v764,
     "auto_signal_scan_pairs": _auto_signal_scan_pairs_v765,
     "signal_commodity_ticker_keyboard": signal_commodity_ticker_keyboard_v765,
+    "format_signal_group_menu": format_signal_group_menu_text_v766,
+    "signal_group_keyboard": signal_group_keyboard_v766,
+    "signal_group_asset_keyboard": signal_group_asset_keyboard_v766,
+    "signal_group_tf_keyboard": signal_group_tf_keyboard_v766,
     "format_signal_scan_group": format_signal_scan_group_v764,
     "signal_crypto_ticker_keyboard": signal_crypto_ticker_keyboard_v764,
     "signal_stock_ticker_keyboard": signal_stock_ticker_keyboard_v764,
@@ -24877,6 +25204,12 @@ def validate_runtime_architecture():
         errors.append("commodity signal universe must contain top 7 assets")
     if any(tf in DELAYED_YAHOO_SIGNAL_TFS_V765 for tf in ("5m", "15m")):
         errors.append("Yahoo delayed assets must not use 5m/15m signal TF")
+    if not callable(globals().get("format_signal_group_menu_text_v766")):
+        errors.append("signal group menu formatter is missing")
+    if not callable(globals().get("signal_group_keyboard_v766")):
+        errors.append("signal group keyboard is missing")
+    if not callable(globals().get("signal_group_tf_keyboard_v766")):
+        errors.append("signal group TF keyboard is missing")
     if not callable(globals().get("reset_demo_journals")):
         errors.append("demo journal reset helper is missing")
     if not callable(globals().get("format_testnet_journal_report")):

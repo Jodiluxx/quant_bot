@@ -34,13 +34,39 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_signal_menu_exposes_all_asset_scan(self) -> None:
         rows = self.bot.signal_menu_keyboard(987654321)["inline_keyboard"]
         callbacks = {button["callback_data"] for row in rows for button in row}
-        self.assertIn("get_signal", callbacks)
-        self.assertIn("signal_scan_crypto", callbacks)
-        self.assertIn("signal_scan_stocks", callbacks)
-        self.assertIn("signal_scan_commodities", callbacks)
         self.assertIn("sig_crypto_tickers", callbacks)
         self.assertIn("sig_stock_tickers", callbacks)
         self.assertIn("sig_commodity_tickers", callbacks)
+        self.assertNotIn("get_signal", callbacks)
+        self.assertNotIn("signal_scan_crypto", callbacks)
+
+    def test_signal_group_screen_has_scan_asset_and_tf_controls(self) -> None:
+        rows = self.bot.signal_group_keyboard_v766(987654321, "stocks")["inline_keyboard"]
+        callbacks = {button["callback_data"] for row in rows for button in row}
+        self.assertIn("get_signal", callbacks)
+        self.assertIn("signal_scan_stocks", callbacks)
+        self.assertIn("sig_group_asset_stocks", callbacks)
+        self.assertIn("sig_group_tf_stocks", callbacks)
+        text = self.bot.format_signal_group_menu_text_v766(987654321, "stocks")
+        self.assertIn("Акции", text)
+        self.assertIn("TF", text)
+
+    def test_signal_group_tf_lists_are_separate(self) -> None:
+        crypto_callbacks = [
+            button["callback_data"]
+            for row in self.bot.signal_group_tf_keyboard_v766(987654321, "crypto")["inline_keyboard"]
+            for button in row
+        ]
+        stock_callbacks = [
+            button["callback_data"]
+            for row in self.bot.signal_group_tf_keyboard_v766(987654321, "stocks")["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn("sig_interval_5m", crypto_callbacks)
+        self.assertIn("sig_interval_15m", crypto_callbacks)
+        self.assertNotIn("sig_interval_5m", stock_callbacks)
+        self.assertNotIn("sig_interval_15m", stock_callbacks)
+        self.assertIn("sig_interval_1h", stock_callbacks)
 
     def test_signal_card_is_compact_and_html_escapes_dynamic_text(self) -> None:
         text = self.bot.format_signal_summary(
@@ -300,7 +326,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.65 Delay-Aware Stocks and Commodities")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.66 Signal Market Router UI")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -327,6 +353,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("stock_ohlcv", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("auto_signal_scan_tickers", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("auto_signal_scan_pairs", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("signal_group_keyboard", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("signal_group_tf_keyboard", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertTrue(any(layer[0] == "v7.32" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.33" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.34" for layer in self.bot.RUNTIME_LAYERS))
@@ -361,6 +389,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.63" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.64" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.65" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.66" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
