@@ -25620,7 +25620,294 @@ def paper_trader_cycle(chat_id, manual=False):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.72 Testnet Daily Trade Cap Removed"
+# ============================================================
+# v7.73 - RISKIER TESTNET LEARNING MODE
+# ============================================================
+# Testnet is allowed to explore more. The bot still refuses entries that cannot
+# have protection attached. Strategy learning counts only real PnL-attributed
+# losses, not execution bugs such as rejected protection orders.
+
+_base_paper_strategy_candidates_v772_for_v773 = _paper_strategy_candidates
+_base_testnet_exploration_data_block_v772_for_v773 = _testnet_exploration_data_block_v763
+_base_testnet_candidate_block_reason_v772_for_v773 = _testnet_candidate_block_reason_v735
+_base_submit_testnet_trade_v772_for_v773 = _submit_testnet_trade_v734
+
+TESTNET_LEARNING_LOSS_STREAK_LIMIT_V773 = int(os.getenv("TESTNET_STRATEGY_LOSS_STREAK_LIMIT", "5"))
+TESTNET_PROBE_MIN_ENTRY_NOW_V773 = int(os.getenv("TESTNET_PROBE_MIN_ENTRY_NOW", "56"))
+TESTNET_PROBE_MIN_SETUP_V773 = int(os.getenv("TESTNET_PROBE_MIN_SETUP", "56"))
+TESTNET_PROBE_MIN_RR_V773 = float(os.getenv("TESTNET_PROBE_MIN_RR", "1.30"))
+TESTNET_PROBE_MIN_CONFIDENCE_V773 = int(os.getenv("TESTNET_PROBE_MIN_CONFIDENCE", "45"))
+TESTNET_PROBE_MAX_WARNINGS_V773 = int(os.getenv("TESTNET_PROBE_MAX_WARNINGS", "3"))
+TESTNET_RETEST_MIN_ENTRY_NOW_V773 = int(os.getenv("TESTNET_RETEST_MIN_ENTRY_NOW", "45"))
+TESTNET_RETEST_MIN_SETUP_V773 = int(os.getenv("TESTNET_RETEST_MIN_SETUP", "55"))
+TESTNET_RETEST_MIN_RR_V773 = float(os.getenv("TESTNET_RETEST_MIN_RR", "1.30"))
+TESTNET_RETEST_MIN_CONFIDENCE_V773 = int(os.getenv("TESTNET_RETEST_MIN_CONFIDENCE", "45"))
+
+
+def _real_protection_client_id_v729(plan_id, label):
+    seed = f"{plan_id}:{label}:{time.time_ns()}"
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:10]
+    clean_label = str(label or "P").upper()[:3]
+    return f"rp_{clean_label}_{digest}"[:36]
+
+
+def _testnet_plan_direction_v773(plan):
+    direction = str((plan or {}).get("direction") or "").lower()
+    if direction in {"long", "short"}:
+        return direction
+    side = str(((plan or {}).get("entry_order") or {}).get("side") or "").upper()
+    if side == "BUY":
+        return "long"
+    if side == "SELL":
+        return "short"
+    return ""
+
+
+def _testnet_protection_immediate_trigger_reason_v773(plan, ref_price=None):
+    plan = plan or {}
+    symbol = plan.get("api_symbol") or plan.get("ticker")
+    direction = _testnet_plan_direction_v773(plan)
+    if not direction:
+        return "cannot validate protection trigger side without direction"
+    price = _safe_float(ref_price, None)
+    if price is None:
+        try:
+            price = _safe_float(get_price(plan.get("ticker") or symbol), None)
+        except Exception:
+            price = None
+    if price is None:
+        price = _safe_float(((plan.get("entry_order") or {}).get("entry_reference")), None)
+    if price is None:
+        return None
+    tick = _safe_float((_testnet_rules_summary_v739(symbol) or {}).get("tick"), 0) or 0
+    buffer = max(tick, abs(float(price)) * 0.00005)
+    bad = []
+    for order in plan.get("protection_orders") or []:
+        label = str(order.get("label") or order.get("type") or "protection")
+        trigger = _safe_float(order.get("stop_price"), None)
+        if trigger is None:
+            continue
+        order_type = str(order.get("type") or "").upper()
+        if direction == "long":
+            if order_type == "STOP_MARKET" and price <= trigger + buffer:
+                bad.append(f"{label} trigger {trigger:g} too close/above current {price:g}")
+            if order_type == "TAKE_PROFIT_MARKET" and price >= trigger - buffer:
+                bad.append(f"{label} trigger {trigger:g} too close/below current {price:g}")
+        else:
+            if order_type == "STOP_MARKET" and price >= trigger - buffer:
+                bad.append(f"{label} trigger {trigger:g} too close/below current {price:g}")
+            if order_type == "TAKE_PROFIT_MARKET" and price <= trigger + buffer:
+                bad.append(f"{label} trigger {trigger:g} too close/above current {price:g}")
+    if bad:
+        return "protection would immediately trigger: " + "; ".join(bad[:3])
+    return None
+
+
+def _testnet_strategy_loss_streak_v773(chat_id, strategy, limit=80):
+    strategy = str(strategy or "").strip()
+    if not strategy:
+        return 0
+    streak = 0
+    for row in _testnet_closed_trade_rows_v742(chat_id, limit):
+        if str(row.get("strategy") or "").strip() != strategy:
+            continue
+        pnl = row.get("pnl") or {}
+        if pnl.get("status") != "ATTRIBUTED":
+            continue
+        realized = _safe_float(pnl.get("realized_usdt"), 0) or 0
+        if realized < 0:
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _testnet_strategy_learning_block_v773(chat_id, candidate):
+    strategy = str((candidate or {}).get("strategy") or "").strip()
+    if not strategy:
+        return None
+    streak = _testnet_strategy_loss_streak_v773(chat_id, strategy)
+    if streak >= TESTNET_LEARNING_LOSS_STREAK_LIMIT_V773:
+        return (
+            f"strategy learning pause: {strategy} has {streak} real PnL losses in a row; "
+            "collect wins from other setups first"
+        )
+    return None
+
+
+def _testnet_exploration_data_block_v763(data):
+    if not TESTNET_EXPLORE_WAIT_RETEST_ENABLED_V763:
+        return "WAIT RETEST exploration выключен"
+    m = _testnet_exploration_metrics_v763(data)
+    if not _testnet_exploration_status_ok_v763(m["status"]):
+        return "entry status пока не READY/WAIT RETEST"
+    if m["rr"] < TESTNET_RETEST_MIN_RR_V773:
+        return f"RR {m['rr']:.2f}x ниже Testnet probe минимума {TESTNET_RETEST_MIN_RR_V773:.2f}x"
+    if m["entry_now"] < TESTNET_RETEST_MIN_ENTRY_NOW_V773:
+        return f"EntryNow {m['entry_now']}/100 ниже Testnet probe минимума {TESTNET_RETEST_MIN_ENTRY_NOW_V773}/100"
+    if m["setup"] < TESTNET_RETEST_MIN_SETUP_V773:
+        return f"Setup {m['setup']}/100 ниже Testnet probe минимума {TESTNET_RETEST_MIN_SETUP_V773}/100"
+    if m["confidence"] < TESTNET_RETEST_MIN_CONFIDENCE_V773:
+        return f"Confidence {m['confidence']}/100 ниже Testnet probe минимума {TESTNET_RETEST_MIN_CONFIDENCE_V773}/100"
+    if len(m["warnings"]) > TESTNET_PROBE_MAX_WARNINGS_V773:
+        return f"слишком много warnings для Testnet probe: {len(m['warnings'])}/{TESTNET_PROBE_MAX_WARNINGS_V773}"
+    return None
+
+
+def _paper_strategy_candidates(chat_id, ticker, interval, data):
+    rows = list(_base_paper_strategy_candidates_v772_for_v773(chat_id, ticker, interval, data) or [])
+    ep = (data or {}).get("entry_plan") or {}
+    risk = (data or {}).get("risk_levels") or {}
+    status = ep.get("status")
+    direction = (data or {}).get("direction")
+    rr = _safe_float(ep.get("rr_now"), 0) or _safe_float(risk.get("rr_ratio"), 0) or 0
+    entry_now = int(ep.get("entry_now_score", ep.get("score", 0)) or 0)
+    setup = int(ep.get("setup_score", ep.get("score", 0)) or 0)
+    confidence = int((data or {}).get("confidence", 0) or 0)
+    warnings = list((data or {}).get("risk_warnings") or [])
+    blockers = list((data or {}).get("risk_blockers") or [])
+    if (
+        status == "ENTER_NOW"
+        and direction
+        and risk
+        and not blockers
+        and rr >= TESTNET_PROBE_MIN_RR_V773
+        and entry_now >= TESTNET_PROBE_MIN_ENTRY_NOW_V773
+        and setup >= TESTNET_PROBE_MIN_SETUP_V773
+        and confidence >= TESTNET_PROBE_MIN_CONFIDENCE_V773
+        and len(warnings) <= TESTNET_PROBE_MAX_WARNINGS_V773
+    ):
+        already = {str(x.get("strategy") or "") for x in rows}
+        if "testnet_probe_v1" not in already:
+            rows.append({
+                "strategy": "testnet_probe_v1",
+                "score": entry_now + min(12, max(0, setup - 50) // 4) + min(8, max(0, confidence - 45) // 5),
+                "ticker": ticker,
+                "interval": interval,
+                "direction": direction,
+                "data": data,
+                "entry_plan": ep,
+                "testnet_probe": True,
+                "reason": (
+                    f"Testnet probe: EntryNow {entry_now}/100, Setup {setup}/100, "
+                    f"RR {rr:.2f}x, warnings {len(warnings)}"
+                ),
+                "metrics": {
+                    "entry_now": entry_now,
+                    "setup": setup,
+                    "confidence": confidence,
+                    "rr": rr,
+                    "mode": "riskier_testnet_probe",
+                },
+            })
+    return rows
+
+
+def _testnet_candidate_block_reason_v735(chat_id, candidate, active_positions=None, pos_err=None, today_count=None):
+    reason = _base_testnet_candidate_block_reason_v772_for_v773(
+        chat_id,
+        candidate,
+        active_positions=active_positions,
+        pos_err=pos_err,
+        today_count=today_count,
+    )
+    if reason:
+        return reason
+    return _testnet_strategy_learning_block_v773(chat_id, candidate)
+
+
+def _submit_testnet_trade_v734(chat_id, candidate):
+    try:
+        plan = _build_testnet_trade_plan_v734(chat_id, candidate)
+    except Exception as e:
+        return {"ok": False, "stage": "plan", "plan": {}, "reason": f"plan exception: {type(e).__name__}: {str(e)[:220]}"}
+
+    if plan.get("blockers"):
+        _execution_record_plan_v715(plan)
+        return {"ok": False, "stage": "plan", "plan": plan, "reason": "; ".join(plan.get("blockers") or [])}
+
+    try:
+        entry_test = submit_testnet_order_test(plan)
+    except Exception as e:
+        entry_test = _testnet_stage_error_v754(plan, "entry_test", e)
+
+    try:
+        protection_test = submit_testnet_protection_order_tests(plan)
+    except Exception as e:
+        protection_test = _testnet_stage_error_v754(plan, "protection_test", e)
+
+    preflight_reason = None
+    if entry_test.get("ok") and protection_test.get("ok"):
+        preflight_reason = _testnet_protection_immediate_trigger_reason_v773(plan)
+        if preflight_reason:
+            protection_test = dict(protection_test)
+            protection_test["ok"] = False
+            protection_test["reason"] = preflight_reason
+            protection_test["stage"] = "protection_preflight"
+
+    if not entry_test.get("ok") or not protection_test.get("ok"):
+        _record_testnet_trade_attempt_v734(plan, entry_test, protection_test)
+        return {
+            "ok": False,
+            "stage": "validation",
+            "plan": plan,
+            "entry_test": entry_test,
+            "protection_test": protection_test,
+            "reason": _testnet_result_reason_v754(entry_test)
+            if not entry_test.get("ok")
+            else _testnet_result_reason_v754(protection_test),
+        }
+
+    try:
+        leverage = submit_testnet_set_leverage(plan)
+    except Exception as e:
+        leverage = _testnet_stage_error_v754(plan, "leverage", e)
+
+    try:
+        entry = submit_testnet_real_entry_order(plan, {"entry_test_ok": True, "protection_test_ok": True})
+    except Exception as e:
+        entry = _testnet_stage_error_v754(plan, "real_entry", e)
+
+    protection = None
+    emergency = None
+    if entry.get("ok"):
+        try:
+            protection = submit_testnet_real_protection_orders(plan, entry)
+        except Exception as e:
+            protection = _testnet_stage_error_v754(plan, "real_protection", e)
+        if not protection.get("ok"):
+            try:
+                emergency = submit_testnet_emergency_close_order(plan, "protection_failed_after_entry")
+            except Exception as e:
+                emergency = _testnet_stage_error_v754(plan, "emergency_close", e)
+
+    _record_testnet_trade_attempt_v734(plan, entry_test, protection_test, leverage, entry, protection, emergency)
+
+    if not entry.get("ok"):
+        return {"ok": False, "stage": "entry", "plan": plan, "entry": entry, "reason": _testnet_result_reason_v754(entry)}
+    if not protection or not protection.get("ok"):
+        return {
+            "ok": False,
+            "stage": "protection",
+            "plan": plan,
+            "entry": entry,
+            "protection": protection,
+            "emergency": emergency,
+            "reason": _testnet_result_reason_v754(protection or {"reason": "protection order rejected"}),
+        }
+
+    monitor = _testnet_monitor_for_plan_v737(plan, delay_sec=0.2)
+    return {
+        "ok": True,
+        "stage": "done",
+        "plan": plan,
+        "entry": entry,
+        "protection": protection,
+        "monitor": monitor,
+    }
+
+
+BOT_VERSION_LABEL = "v7.73 Riskier Testnet Learning"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -25719,6 +26006,7 @@ RUNTIME_LAYERS = [
     ("v7.70", "optional OANDA v20 commodity candles replace Yahoo proxies when OANDA_API_TOKEN is configured"),
     ("v7.71", "optional Alpaca IEX/SIP stock candles replace Yahoo when Alpaca market-data keys are configured"),
     ("v7.72", "remove hard daily Testnet trade cap while keeping position and exchange-safety gates"),
+    ("v7.73", "riskier Testnet probe entries, strategy loss-streak learning and safer protection preflight"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

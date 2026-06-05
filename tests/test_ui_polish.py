@@ -326,7 +326,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.72 Testnet Daily Trade Cap Removed")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.73 Riskier Testnet Learning")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -1086,6 +1086,63 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_open_positions_v734 = old_open
             self.bot._testnet_today_real_entry_count_v734 = old_count
             self.bot._build_testnet_trade_plan_v734 = old_plan
+
+    def test_riskier_testnet_probe_candidate_is_added(self) -> None:
+        data = {
+            "direction": "long",
+            "confidence": 48,
+            "risk_levels": {"rr_ratio": 1.35},
+            "risk_warnings": ["weak volume"],
+            "risk_blockers": [],
+            "entry_plan": {
+                "status": "ENTER_NOW",
+                "entry_now_score": 58,
+                "setup_score": 58,
+                "rr_now": 1.35,
+            },
+        }
+
+        rows = self.bot._paper_strategy_candidates("probe-chat", "BTCUSDT", "15m", data)
+
+        self.assertIn("testnet_probe_v1", {row.get("strategy") for row in rows})
+
+    def test_strategy_learning_blocks_after_five_real_losses(self) -> None:
+        old_base = self.bot._base_testnet_candidate_block_reason_v772_for_v773
+        old_closed = self.bot._testnet_closed_trade_rows_v742
+        try:
+            self.bot._base_testnet_candidate_block_reason_v772_for_v773 = lambda *args, **kwargs: None
+            self.bot._testnet_closed_trade_rows_v742 = lambda chat_id=None, limit=200: [
+                {"strategy": "testnet_probe_v1", "pnl": {"status": "ATTRIBUTED", "realized_usdt": -0.01}}
+                for _ in range(5)
+            ]
+            reason = self.bot._testnet_candidate_block_reason_v735(
+                987654321,
+                {"strategy": "testnet_probe_v1"},
+            )
+        finally:
+            self.bot._base_testnet_candidate_block_reason_v772_for_v773 = old_base
+            self.bot._testnet_closed_trade_rows_v742 = old_closed
+
+        self.assertIn("strategy learning pause", reason)
+
+    def test_strategy_learning_ignores_execution_emergency_rows(self) -> None:
+        old_base = self.bot._base_testnet_candidate_block_reason_v772_for_v773
+        old_closed = self.bot._testnet_closed_trade_rows_v742
+        try:
+            self.bot._base_testnet_candidate_block_reason_v772_for_v773 = lambda *args, **kwargs: None
+            self.bot._testnet_closed_trade_rows_v742 = lambda chat_id=None, limit=200: [
+                {"strategy": "testnet_probe_v1", "status": "EMERGENCY_CLOSED", "pnl": {"status": "PENDING"}}
+                for _ in range(8)
+            ]
+            reason = self.bot._testnet_candidate_block_reason_v735(
+                987654321,
+                {"strategy": "testnet_probe_v1"},
+            )
+        finally:
+            self.bot._base_testnet_candidate_block_reason_v772_for_v773 = old_base
+            self.bot._testnet_closed_trade_rows_v742 = old_closed
+
+        self.assertIsNone(reason)
 
     def test_demo_analytics_store_details_not_user_card(self) -> None:
         row = {

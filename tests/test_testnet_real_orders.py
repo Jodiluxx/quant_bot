@@ -139,11 +139,32 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
         params, geometry = self.bot._real_protection_order_params_v729(self._plan())
         self.assertTrue(geometry["ok"])
         self.assertEqual([label for label, _ in params], ["SL", "TP1", "TP2"])
+        client_ids = [row["clientAlgoId"] for _, row in params]
+        self.assertEqual(len(client_ids), len(set(client_ids)))
+        self.assertTrue(all(len(x) <= 36 for x in client_ids))
+        self.assertTrue(client_ids[0].startswith("rp_SL_"))
+        self.assertTrue(client_ids[1].startswith("rp_TP1_"))
+        self.assertTrue(client_ids[2].startswith("rp_TP2_"))
         self.assertEqual(params[0][1]["algoType"], "CONDITIONAL")
         self.assertEqual(params[0][1]["positionSide"], "BOTH")
         self.assertEqual(params[0][1]["reduceOnly"], "true")
         self.assertEqual(params[0][1]["newOrderRespType"], "ACK")
         self.assertEqual(params[1][1]["type"], "TAKE_PROFIT_MARKET")
+
+    def test_protection_preflight_detects_immediate_trigger_before_real_entry(self) -> None:
+        plan = self._plan()
+        old_price = self.bot.get_price
+        old_rules = self.bot._testnet_rules_summary_v739
+        try:
+            self.bot.get_price = lambda ticker: 94.0
+            self.bot._testnet_rules_summary_v739 = lambda symbol: {"tick": "0.1"}
+            reason = self.bot._testnet_protection_immediate_trigger_reason_v773(plan)
+        finally:
+            self.bot.get_price = old_price
+            self.bot._testnet_rules_summary_v739 = old_rules
+
+        self.assertIn("immediately trigger", reason)
+        self.assertIn("SL", reason)
 
     def test_precision_normalizes_bnb_entry_and_unsplittable_tp(self) -> None:
         plan = self._plan()
@@ -197,6 +218,7 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
         old_real_protection = self.bot.submit_testnet_real_protection_orders
         old_monitor = self.bot._testnet_monitor_for_plan_v737
         old_record = self.bot._record_testnet_trade_attempt_v734
+        old_price = self.bot.get_price
 
         try:
             self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: plan
@@ -207,6 +229,7 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
             self.bot.submit_testnet_real_protection_orders = lambda p, entry: calls.append("real_protection") or {"ok": True, "orders": [{"ok": True}]}
             self.bot._testnet_monitor_for_plan_v737 = lambda p, delay_sec=0.2: {"status": "PROTECTED"}
             self.bot._record_testnet_trade_attempt_v734 = lambda *args, **kwargs: calls.append("record")
+            self.bot.get_price = lambda ticker: 100.0
 
             result = self.bot._submit_testnet_trade_v734("1", {"ticker": "BTCUSDT"})
         finally:
@@ -218,6 +241,7 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
             self.bot.submit_testnet_real_protection_orders = old_real_protection
             self.bot._testnet_monitor_for_plan_v737 = old_monitor
             self.bot._record_testnet_trade_attempt_v734 = old_record
+            self.bot.get_price = old_price
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stage"], "done")
@@ -315,7 +339,7 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
             "risk_levels": {"rr_ratio": 1.67},
             "entry_plan": {
                 "status": "WAIT_RETEST",
-                "entry_now_score": 55,
+                "entry_now_score": 40,
                 "setup_score": 80,
                 "rr_now": 1.67,
             },
