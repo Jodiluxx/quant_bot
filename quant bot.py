@@ -25907,7 +25907,276 @@ def _submit_testnet_trade_v734(chat_id, candidate):
     }
 
 
-BOT_VERSION_LABEL = "v7.73 Riskier Testnet Learning"
+# ============================================================
+# v7.74 - AUTO-SIGNAL AND TESTNET EXECUTION SYNC
+# ============================================================
+# Public auto-signals and the Binance Futures Testnet demo bot now share one
+# candidate source. If an auto-signal is sent, the bot immediately tries the
+# same candidate on Testnet. User-facing messages hide internal API jargon and
+# explain blocking reasons in plain trading language.
+
+_base_auto_signal_select_trade_candidate_v773_for_v774 = _auto_signal_select_trade_candidate_v753
+_base_build_auto_signals_message_v773_for_v774 = build_auto_signals_message
+_base_paper_trader_cycle_v773_for_v774 = paper_trader_cycle
+_base_testnet_monitor_short_line_v773_for_v774 = _testnet_monitor_short_line_v737
+
+
+def _humanize_testnet_reason_v774(reason, stage=None):
+    raw = str(reason or "").strip()
+    text = raw.lower()
+    stage_text = str(stage or "").lower()
+    if not raw:
+        return "Причина не пришла от биржи. Подробности сохранены локально для диагностики."
+    if "order would immediately trigger" in text or "immediately trigger" in text:
+        return (
+            "Стоп или тейк слишком близко к текущей цене. Binance считает, что защитный ордер "
+            "может сработать сразу, поэтому бот не оставляет позицию без нормальной защиты."
+        )
+    if "mandatory parameter" in text or "algotype" in text:
+        return (
+            "Binance не принял защитный SL/TP из-за параметров ордера. Вход не оставлен открытым, "
+            "пока защита не проходит проверку."
+        )
+    if "reduceonly" in text or "reduce-only" in text:
+        return (
+            "Защитный ордер не подтверждён как ордер на закрытие позиции. Бот не открывает сделку, "
+            "если SL/TP могут увеличить риск вместо его ограничения."
+        )
+    if "clientorderid is duplicated" in text or "duplicate" in text:
+        return "Binance отклонил повторный ID ордера. Бот не стал создавать дубль сделки."
+    if "timestamp" in text or "-1021" in text:
+        return (
+            "Время компьютера и сервера Binance расходится. Бот остановил отправку ордера, "
+            "чтобы не получить некорректное исполнение."
+        )
+    if "position limit" in text or "max positions" in text or "позици" in text and "лимит" in text:
+        return "Лимит открытых позиций уже достигнут. Новая сделка не открыта, чтобы не раздувать риск."
+    if "same direction" in text or "same-direction" in text:
+        return "Похожая позиция в эту же сторону уже есть. Бот не дублирует одинаковый риск."
+    if "adaptive quality gate" in text:
+        return "Похожие сетапы недавно показывали слабую статистику. Бот ждёт более чистый вход."
+    if "strategy learning pause" in text:
+        return "Эта стратегия получила серию реальных Testnet-убытков. Бот временно её не берёт."
+    if "wait retest" in text or "retest" in text:
+        return "Идея есть, но цена не в лучшей зоне. Бот ждёт ретест, а не догоняет движение."
+    if "entry_test" in stage_text or "entry" == stage_text:
+        return "Binance не принял входной ордер. Сделка не открыта."
+    if "protection" in stage_text or "validation" in stage_text:
+        return "Binance не подтвердил защитные SL/TP. Бот не открывает позицию без защиты."
+    return _ui_short_text(raw, 220)
+
+
+def _humanize_candidate_reason_v774(candidate):
+    candidate = candidate or {}
+    strategy = str(candidate.get("strategy") or "")
+    ep = candidate.get("entry_plan") or {}
+    rr = _safe_float(ep.get("rr_now"), 0) or _safe_float(((candidate.get("data") or {}).get("risk_levels") or {}).get("rr_ratio"), 0)
+    entry_now = int(ep.get("entry_now_score", ep.get("score", 0)) or 0)
+    setup = int(ep.get("setup_score", ep.get("score", 0)) or 0)
+    if strategy == "strict_quality_v1":
+        return f"Строгий фильтр разрешил вход: момент {entry_now}/100, сетап {setup}/100, риск/прибыль {rr:.2f}x."
+    if strategy == "trend_follow_v1":
+        return f"Трендовая идея совпала с направлением рынка: момент {entry_now}/100, сетап {setup}/100, риск/прибыль {rr:.2f}x."
+    if strategy == "testnet_probe_v1":
+        return f"Пробная Testnet-сделка: сетап не идеальный, но метрики достаточные для обучения бота."
+    if strategy == "wait_retest_probe_v1":
+        return "Пробная Testnet-сделка от ретеста: идея есть, размер риска должен быть маленьким."
+    return _ui_short_text(candidate.get("reason") or "Сигнал и риск-фильтры разрешили вход.", 180)
+
+
+def _testnet_result_user_reason_v774(result):
+    result = result or {}
+    reason = result.get("reason")
+    if not reason:
+        if result.get("protection"):
+            reason = _testnet_result_reason_v754(result.get("protection"))
+        elif result.get("entry"):
+            reason = _testnet_result_reason_v754(result.get("entry"))
+    return _humanize_testnet_reason_v774(reason, result.get("stage"))
+
+
+def _simple_latest_analysis(chat_id):
+    cycle = None
+    try:
+        cycle = _last_demo_cycle_v760(chat_id)
+    except Exception:
+        cycle = None
+    if cycle:
+        decision = cycle.get("user_visible") or {}
+        selected = cycle.get("selected") or {}
+        status = str(decision.get("status") or "").upper()
+        ticker = selected.get("ticker") or decision.get("ticker")
+        direction = str(selected.get("direction") or decision.get("direction") or "").upper()
+        interval = selected.get("interval") or decision.get("interval")
+        prefix = ""
+        if ticker and direction:
+            prefix = f"{_ui_ticker_short(ticker)} {direction} | TF {_ui_tf_short(interval)}. "
+        if status == "OPENED":
+            return prefix + "Последняя попытка: сделка открыта, SL/TP проверяются монитором."
+        if status in {"BLOCKED", "NO_TRADE"}:
+            reason = _humanize_testnet_reason_v774(decision.get("reason"), decision.get("stage"))
+            return prefix + "Последняя попытка: сделка не открыта. " + reason
+    events = _recent_testnet_real_events_v729(chat_id, 1)
+    if events:
+        e = events[0]
+        if e.get("ok"):
+            return "Последняя попытка: Binance Testnet принял действие. Подробности сохранены локально."
+        return "Последняя попытка: сделка не открыта. " + _humanize_testnet_reason_v774(e.get("reason"), e.get("kind"))
+    return "Пока сделок нет. Бот ждёт уверенный LONG/SHORT и проверяет, примет ли Binance защитные SL/TP."
+
+
+def _testnet_execution_result_line_v774(result):
+    result = result or {}
+    if result.get("ok"):
+        return "✅ Сделка открыта на Binance Futures Testnet, защитные SL/TP подтверждены."
+    stage = str(result.get("stage") or "").lower()
+    if stage == "protection":
+        return "⚠️ Вход прошёл, но защита не подтвердилась. Бот запустил аварийное закрытие."
+    if stage in {"validation", "plan"}:
+        return "⛔ Сделка не открыта: защита или риск-проверка не прошли."
+    if stage == "entry":
+        return "⛔ Сделка не открыта: Binance не принял входной ордер."
+    return "⛔ Сделка не открыта."
+
+
+def _synced_testnet_signal_candidate_v774(chat_id):
+    candidate, tried = testnet_select_trade_candidate(chat_id)
+    if not candidate:
+        return None, tried
+    if not _is_crypto_ticker_v764(candidate.get("ticker")):
+        return None, tried
+    if not _auto_signal_candidate_passes_v752(candidate):
+        return None, tried
+    return candidate, tried
+
+
+def _auto_signal_select_trade_candidate_v753(chat_id):
+    return _synced_testnet_signal_candidate_v774(chat_id)
+
+
+def _record_synced_demo_cycle_v774(chat_id, tried, candidate, result):
+    plan = (result or {}).get("plan") or {}
+    ticker = plan.get("ticker") or (candidate or {}).get("ticker")
+    direction = str(plan.get("direction") or (candidate or {}).get("direction") or "").upper()
+    interval = plan.get("interval") or (candidate or {}).get("interval")
+    decision = {
+        "opened": bool((result or {}).get("ok")),
+        "status": "OPENED" if (result or {}).get("ok") else "BLOCKED",
+        "stage": (result or {}).get("stage"),
+        "reason": _testnet_result_user_reason_v774(result),
+        "ticker": ticker,
+        "interval": interval,
+        "direction": direction,
+    }
+    try:
+        _demo_analysis_record_cycle_v736(chat_id, tried, candidate=candidate, result=result, decision=decision)
+    except Exception:
+        pass
+
+
+def build_auto_signals_message(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    selected, tried = _auto_signal_select_trade_candidate_v753(chat_id)
+    if not selected:
+        return None
+    ticker = selected.get("ticker")
+    interval = selected.get("interval")
+    direction = str(selected.get("direction") or "").upper()
+    strategy = str(selected.get("strategy") or "")
+    signature = f"{ticker}:{interval}:{direction}:{strategy}:testnet_sync_v774"
+    cooldown = AUTO_SIGNAL_DUPLICATE_COOLDOWN_MIN_V752 * 60
+    group_id = f"auto_signal_v774_{chat_id}"
+    if not should_send_signal(ticker, interval, signature, cooldown, group_id):
+        return None
+
+    result = _submit_testnet_trade_v734(chat_id, selected)
+    _record_synced_demo_cycle_v774(chat_id, tried, selected, result)
+    data = selected.get("data") or {}
+    lines = [
+        "🔔 <b>Авто-сигнал + Demo Testnet</b>",
+        "Сигнал и демо-бот используют один и тот же сетап.",
+        "",
+        format_signal_summary(data, ticker, interval),
+        "",
+        "<b>Исполнение:</b>",
+        _testnet_execution_result_line_v774(result),
+        "Причина: " + _ui_html(_testnet_result_user_reason_v774(result)),
+    ]
+    return "\n".join(lines)
+
+
+def _testnet_monitor_short_line_v737(monitor):
+    monitor = monitor or {}
+    status = str(monitor.get("status") or "UNKNOWN").upper()
+    if status == "PROTECTED":
+        return "Защита: <b>SL/TP стоят</b>."
+    if status == "NO_POSITION":
+        return "Позиция: не найдена или уже закрыта."
+    if status in {"UNPROTECTED", "MISMATCH", "FETCH_FAILED"}:
+        reason = _humanize_testnet_reason_v774(monitor.get("reason"), "monitor")
+        return "Защита: <b>не подтверждена</b>. " + _ui_html(reason)
+    return "Статус позиции: <b>{}</b>.".format(_ui_html(status))
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _simple_sync_public_auto_settings(chat_id)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d • %H:%M UTC")
+    st = _testnet_stats_line_v734()
+    lines = [
+        "🤖 <b>Демо-бот Binance Testnet</b>",
+        now,
+        "",
+        f"Позиции: <b>{st['open']}/{PAPER_TRADER_MAX_POSITIONS}</b> | Сегодня: <b>{_testnet_today_attempts_label_v772(chat_id)}</b>",
+        "Связь с сигналами: <b>ON</b>",
+    ]
+    candidate, tried = _synced_testnet_signal_candidate_v774(chat_id)
+    if not candidate:
+        reason = _testnet_best_gate_message_v735(tried)
+        decision = {"opened": False, "status": "NO_TRADE", "reason": reason}
+        _demo_analysis_record_cycle_v736(chat_id, tried, decision=decision)
+        lines += [
+            "",
+            "<b>Решение:</b>",
+            "Сделка не открыта.",
+            _ui_html(_humanize_testnet_reason_v774(reason)),
+        ]
+        best = _format_scan_rows(tried)
+        if best:
+            lines += ["", "<b>Лучшие проверки:</b>"] + best[:3]
+        return "\n".join(lines)
+
+    result = _submit_testnet_trade_v734(chat_id, candidate)
+    _record_synced_demo_cycle_v774(chat_id, tried, candidate, result)
+    plan = result.get("plan") or {}
+    ticker = plan.get("ticker") or candidate.get("ticker")
+    direction = str(plan.get("direction") or candidate.get("direction") or "").upper()
+    interval = plan.get("interval") or candidate.get("interval")
+    if not result.get("ok"):
+        lines += [
+            "",
+            "<b>Решение:</b>",
+            _testnet_execution_result_line_v774(result),
+            f"Сетап: <b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}",
+            "Причина: " + _ui_html(_testnet_result_user_reason_v774(result)),
+        ]
+        return "\n".join(lines)
+
+    entry_order = plan.get("entry_order") or {}
+    monitor = result.get("monitor") or _testnet_monitor_for_plan_v737(plan)
+    lines += [
+        "",
+        "<b>Решение:</b>",
+        "✅ Сделка открыта на <b>Binance Futures Testnet</b>.",
+        "",
+        f"<b>{_ui_ticker_short(ticker)} {direction}</b> | TF {_ui_tf_short(interval)}",
+        f"Вход: <b>{fmt_price(entry_order.get('entry_reference'), ticker)}</b> | Плечо: <b>x{entry_order.get('leverage')}</b>",
+        _testnet_monitor_short_line_v737(monitor),
+        "Почему: " + _ui_html(_humanize_candidate_reason_v774(candidate)),
+    ]
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.74 Signal-Testnet Sync"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -26007,6 +26276,7 @@ RUNTIME_LAYERS = [
     ("v7.71", "optional Alpaca IEX/SIP stock candles replace Yahoo when Alpaca market-data keys are configured"),
     ("v7.72", "remove hard daily Testnet trade cap while keeping position and exchange-safety gates"),
     ("v7.73", "riskier Testnet probe entries, strategy loss-streak learning and safer protection preflight"),
+    ("v7.74", "auto-signals execute the same Binance Testnet candidate and explain outcomes in plain language"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -26104,6 +26374,8 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "signal_crypto_ticker_keyboard": signal_crypto_ticker_keyboard_v764,
     "signal_stock_ticker_keyboard": signal_stock_ticker_keyboard_v764,
     "submit_testnet_trade": _submit_testnet_trade_v734,
+    "humanize_testnet_reason": _humanize_testnet_reason_v774,
+    "synced_testnet_signal_candidate": _synced_testnet_signal_candidate_v774,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,

@@ -185,7 +185,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         old_today = self.bot._testnet_today_real_entry_count_v734
         old_plan = self.bot._build_testnet_trade_plan_v734
         old_auto_tickers = self.bot._auto_signal_scan_tickers_v764
-        old_auto_tickers = self.bot._auto_signal_scan_tickers_v764
+        old_submit = self.bot._submit_testnet_trade_v734
+        submit_calls = []
 
         def fake_scan(chat_id, ticker, tf):
             row = {
@@ -238,6 +239,18 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.bot._testnet_today_real_entry_count_v734 = lambda chat_id=None: 0
         self.bot._build_testnet_trade_plan_v734 = lambda chat_id, candidate: {"blockers": []}
         self.bot._auto_signal_scan_tickers_v764 = lambda now_utc=None: ["BTCUSDT"]
+        self.bot._submit_testnet_trade_v734 = lambda chat_id, candidate: submit_calls.append((chat_id, candidate)) or {
+            "ok": True,
+            "stage": "done",
+            "plan": {
+                "ticker": candidate["ticker"],
+                "interval": candidate["interval"],
+                "direction": candidate["direction"],
+                "entry_order": {"entry_reference": 100.0, "leverage": 10},
+            },
+            "protection": {"orders": [{"label": "SL"}, {"label": "TP1"}, {"label": "TP2"}]},
+            "monitor": {"status": "PROTECTED", "sl_count": 1, "tp_count": 2},
+        }
         try:
             msg = self.bot.build_auto_signals_message("auto-ready-v752")
         finally:
@@ -249,12 +262,14 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_today_real_entry_count_v734 = old_today
             self.bot._build_testnet_trade_plan_v734 = old_plan
             self.bot._auto_signal_scan_tickers_v764 = old_auto_tickers
+            self.bot._submit_testnet_trade_v734 = old_submit
 
         self.assertIsNotNone(msg)
         self.assertIn("Авто-сигнал", msg)
         self.assertIn("BTCUSDT", msg)
         self.assertIn("LONG", msg)
         self.assertNotIn("WAIT", msg.splitlines()[0])
+        self.assertEqual(len(submit_calls), 1)
 
     def test_auto_signal_is_silent_when_demo_trade_gate_blocks_candidate(self) -> None:
         old_tickers = self.bot.PAPER_TRADER_SCAN_TICKERS
@@ -326,7 +341,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.73 Riskier Testnet Learning")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.74 Signal-Testnet Sync")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -347,6 +362,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("get_fear_greed", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("prune_runtime_caches", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("record_testnet_journal_event", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("humanize_testnet_reason", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("synced_testnet_signal_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_exploration_data_block", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("nyse_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("commodities_market_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -401,6 +418,9 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.69" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.70" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.71" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.72" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.73" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.74" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -429,6 +449,48 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("adaptive_quality_bucket_group", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("adaptive_quality_adjusted_winrate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+
+    def test_demo_cycle_uses_plain_human_execution_language(self) -> None:
+        old_selector = self.bot._synced_testnet_signal_candidate_v774
+        old_submit = self.bot._submit_testnet_trade_v734
+        old_stats = self.bot._testnet_stats_line_v734
+        old_attempts = self.bot._testnet_today_attempts_label_v772
+        try:
+            candidate = {
+                "ticker": "BTCUSDT",
+                "interval": "15m",
+                "direction": "long",
+                "strategy": "strict_quality_v1",
+                "reason": "strict quality test",
+                "data": {},
+                "entry_plan": {"entry_now_score": 88, "setup_score": 90, "rr_now": 1.67},
+            }
+            self.bot._synced_testnet_signal_candidate_v774 = lambda chat_id: (candidate, [])
+            self.bot._submit_testnet_trade_v734 = lambda chat_id, cand: {
+                "ok": True,
+                "stage": "done",
+                "plan": {
+                    "ticker": "BTCUSDT",
+                    "interval": "15m",
+                    "direction": "long",
+                    "entry_order": {"entry_reference": 100.0, "leverage": 10},
+                },
+                "monitor": {"status": "PROTECTED", "sl_count": 1, "tp_count": 2},
+                "protection": {"orders": [{"label": "SL"}, {"label": "TP1"}, {"label": "TP2"}]},
+            }
+            self.bot._testnet_stats_line_v734 = lambda allow_refresh=True: {"open": 0}
+            self.bot._testnet_today_attempts_label_v772 = lambda chat_id: "0 attempts"
+            text = self.bot.paper_trader_cycle("human-demo", manual=True)
+        finally:
+            self.bot._synced_testnet_signal_candidate_v774 = old_selector
+            self.bot._submit_testnet_trade_v734 = old_submit
+            self.bot._testnet_stats_line_v734 = old_stats
+            self.bot._testnet_today_attempts_label_v772 = old_attempts
+
+        self.assertIn("SL/TP", text)
+        self.assertNotIn("reduce-only", text)
+        self.assertNotIn("Protection:", text)
+        self.assertNotIn("Monitor:", text)
 
     def test_last_trade_attempt_report_explains_risk_gate_and_chain(self) -> None:
         old_cycles = self.bot._demo_analysis_recent_cycles_v736
