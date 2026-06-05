@@ -248,8 +248,8 @@ class TelegramUiPolishTests(unittest.TestCase):
                 "direction": candidate["direction"],
                 "entry_order": {"entry_reference": 100.0, "leverage": 10},
             },
-            "protection": {"orders": [{"label": "SL"}, {"label": "TP1"}, {"label": "TP2"}]},
-            "monitor": {"status": "PROTECTED", "sl_count": 1, "tp_count": 2},
+            "protection": {"orders": [{"label": "SL"}, {"label": "TP1"}]},
+            "monitor": {"status": "PROTECTED", "sl_count": 1, "tp_count": 1},
         }
         try:
             msg = self.bot.build_auto_signals_message("auto-ready-v752")
@@ -341,7 +341,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.74 Signal-Testnet Sync")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.75 Single TP Testnet Protection")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -364,6 +364,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("record_testnet_journal_event", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("humanize_testnet_reason", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("synced_testnet_signal_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_protection_labels", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_exploration_data_block", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("nyse_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("commodities_market_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -421,6 +422,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.72" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.73" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.74" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.75" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -475,8 +477,8 @@ class TelegramUiPolishTests(unittest.TestCase):
                     "direction": "long",
                     "entry_order": {"entry_reference": 100.0, "leverage": 10},
                 },
-                "monitor": {"status": "PROTECTED", "sl_count": 1, "tp_count": 2},
-                "protection": {"orders": [{"label": "SL"}, {"label": "TP1"}, {"label": "TP2"}]},
+                "monitor": {"status": "PROTECTED", "sl_count": 1, "tp_count": 1},
+                "protection": {"orders": [{"label": "SL"}, {"label": "TP1"}]},
             }
             self.bot._testnet_stats_line_v734 = lambda allow_refresh=True: {"open": 0}
             self.bot._testnet_today_attempts_label_v772 = lambda chat_id: "0 attempts"
@@ -487,7 +489,8 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_stats_line_v734 = old_stats
             self.bot._testnet_today_attempts_label_v772 = old_attempts
 
-        self.assertIn("SL/TP", text)
+        self.assertIn("SL", text)
+        self.assertIn("TP", text)
         self.assertNotIn("reduce-only", text)
         self.assertNotIn("Protection:", text)
         self.assertNotIn("Monitor:", text)

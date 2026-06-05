@@ -138,18 +138,31 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
     def test_real_protection_order_builder_uses_real_endpoint_shape(self) -> None:
         params, geometry = self.bot._real_protection_order_params_v729(self._plan())
         self.assertTrue(geometry["ok"])
-        self.assertEqual([label for label, _ in params], ["SL", "TP1", "TP2"])
+        self.assertEqual([label for label, _ in params], ["SL", "TP1"])
+        self.assertTrue(geometry["single_tp_mode"])
         client_ids = [row["clientAlgoId"] for _, row in params]
         self.assertEqual(len(client_ids), len(set(client_ids)))
         self.assertTrue(all(len(x) <= 36 for x in client_ids))
         self.assertTrue(client_ids[0].startswith("rp_SL_"))
         self.assertTrue(client_ids[1].startswith("rp_TP1_"))
-        self.assertTrue(client_ids[2].startswith("rp_TP2_"))
         self.assertEqual(params[0][1]["algoType"], "CONDITIONAL")
         self.assertEqual(params[0][1]["positionSide"], "BOTH")
         self.assertEqual(params[0][1]["reduceOnly"], "true")
         self.assertEqual(params[0][1]["newOrderRespType"], "ACK")
         self.assertEqual(params[1][1]["type"], "TAKE_PROFIT_MARKET")
+        self.assertEqual(params[0][1]["quantity"], params[1][1]["quantity"])
+
+    def test_testnet_plan_normalization_strips_second_take_profit(self) -> None:
+        plan = self.bot._normalize_testnet_plan_v734(self._plan())
+        self.assertEqual(
+            [row["label"] for row in plan["protection_orders"]],
+            ["SL", "TP1"],
+        )
+        protection, geometry = self.bot.build_testnet_protection_order_tests(plan)
+        self.assertTrue(geometry["ok"])
+        self.assertEqual([row["label"] for row in protection], ["SL", "TP1"])
+        self.assertEqual(protection[0]["quantity"], protection[1]["quantity"])
+        self.assertNotIn("TP2", geometry["quantity_plan"])
 
     def test_protection_preflight_detects_immediate_trigger_before_real_entry(self) -> None:
         plan = self._plan()
@@ -205,6 +218,7 @@ class RealTestnetOrderGuardTests(unittest.TestCase):
             self.assertEqual(Decimal(row["triggerPrice"]) % Decimal("0.01"), Decimal("0.00"))
         self.assertEqual(protection[0]["triggerPrice"], "653.35")
         self.assertEqual(protection[1]["quantity"], "0.01")
+        self.assertNotIn("TP2", geometry["quantity_plan"])
 
     def test_submit_testnet_trade_runs_real_entry_after_validation(self) -> None:
         plan = self._plan()

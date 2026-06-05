@@ -26240,7 +26240,145 @@ def paper_trader_cycle(chat_id, manual=False):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.74 Signal-Testnet Sync"
+# ============================================================
+# v7.75 - SINGLE TP TESTNET PROTECTION
+# ============================================================
+# The Testnet execution layer now places exactly two protection orders:
+# one STOP_MARKET stop loss and one TAKE_PROFIT_MARKET take profit. TP2 can
+# still exist as an analytical level in signal text, but it is not sent to
+# Binance Futures Testnet.
+
+_base_build_testnet_trade_plan_v774_for_v775 = _build_testnet_trade_plan_v734
+_base_validate_protection_order_geometry_v774_for_v775 = validate_protection_order_geometry
+_base_normalize_testnet_plan_v774_for_v775 = _normalize_testnet_plan_v734
+
+TESTNET_PROTECTION_LABELS_V775 = ("SL", "TP1")
+
+
+def testnet_protection_labels_v775():
+    return TESTNET_PROTECTION_LABELS_V775
+
+
+def _single_tp_protection_orders_v775(orders):
+    clean = []
+    seen = set()
+    for order in list(orders or []):
+        label = str(order.get("label") or "").upper()
+        if label not in TESTNET_PROTECTION_LABELS_V775:
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        clean.append(order)
+    return clean
+
+
+def _build_testnet_trade_plan_v734(chat_id, candidate):
+    plan = _base_build_testnet_trade_plan_v774_for_v775(chat_id, candidate)
+    plan = dict(plan or {})
+    plan["protection_orders"] = _single_tp_protection_orders_v775(plan.get("protection_orders"))
+    return plan
+
+
+def _normalize_testnet_plan_v734(plan):
+    plan = _base_normalize_testnet_plan_v774_for_v775(plan)
+    plan["protection_orders"] = _single_tp_protection_orders_v775(plan.get("protection_orders"))
+    return plan
+
+
+def _testnet_tp_quantity_texts_v739(symbol, total_qty_text):
+    total = _d_v734(total_qty_text)
+    if total <= 0:
+        return {}
+    rules = _testnet_qty_rules_v734(symbol)
+    step = _d_v734(rules.get("step"))
+    if step > 0:
+        total = _floor_step_v734(total, step)
+        if total <= 0:
+            return {}
+        return {"TP1": _fmt_decimal_fixed_v734(total, step)}
+    return {"TP1": _fmt_decimal_fixed_v734(total, "0.00000001")}
+
+
+def validate_protection_order_geometry(plan):
+    plan = dict(plan or {})
+    plan["protection_orders"] = _single_tp_protection_orders_v775(plan.get("protection_orders"))
+    geometry = _base_validate_protection_order_geometry_v774_for_v775(plan)
+    geometry["tp2"] = None
+    geometry["single_tp_mode"] = True
+    geometry["required_protection"] = list(TESTNET_PROTECTION_LABELS_V775)
+    return geometry
+
+
+def build_testnet_protection_order_tests(plan):
+    plan = _normalize_testnet_plan_v734(plan)
+    geometry = validate_protection_order_geometry(plan)
+    if not geometry.get("ok"):
+        return [], geometry
+    params = []
+    prot = _plan_protection_map_v720(plan)
+    symbol = plan.get("api_symbol") or plan.get("ticker")
+    entry_order = plan.get("entry_order") or {}
+    total_qty_text = entry_order.get("quantity") or _testnet_format_quantity_v734(
+        symbol,
+        entry_order.get("quantity_est"),
+        entry_order.get("entry_reference"),
+    )
+    quantities = {"SL": total_qty_text, **_testnet_tp_quantity_texts_v739(symbol, total_qty_text)}
+    for label in TESTNET_PROTECTION_LABELS_V775:
+        order = prot.get(label)
+        qty_text = quantities.get(label)
+        if not order or not qty_text or _d_v734(qty_text) <= 0:
+            continue
+        trigger_text = _testnet_price_text_v739(symbol, order.get("stop_price"))
+        params.append({
+            "label": label,
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": order.get("side"),
+            "positionSide": "BOTH",
+            "type": order.get("type"),
+            "quantity": qty_text,
+            "triggerPrice": trigger_text,
+            "reduceOnly": "true",
+            "workingType": "CONTRACT_PRICE",
+            "priceProtect": "false",
+            "newOrderRespType": "ACK",
+            "clientAlgoId": _protect_client_id_v720(plan.get("plan_id"), label),
+        })
+    geometry["quantity_plan"] = quantities
+    geometry["exchange_rules"] = _testnet_rules_summary_v739(symbol)
+    return params, geometry
+
+
+def _testnet_execution_result_line_v774(result):
+    result = result or {}
+    if result.get("ok"):
+        return "✅ Сделка открыта на Binance Futures Testnet, стоп-лосс и один тейк-профит подтверждены."
+    stage = str(result.get("stage") or "").lower()
+    if stage == "protection":
+        return "⚠️ Вход прошёл, но SL/TP не подтвердились. Бот запустил аварийное закрытие."
+    if stage in {"validation", "plan"}:
+        return "⛔ Сделка не открыта: стоп-лосс или тейк-профит не прошли проверку."
+    if stage == "entry":
+        return "⛔ Сделка не открыта: Binance не принял входной ордер."
+    return "⛔ Сделка не открыта."
+
+
+def _testnet_monitor_short_line_v737(monitor):
+    monitor = monitor or {}
+    status = str(monitor.get("status") or "UNKNOWN").upper()
+    if status == "PROTECTED":
+        return "Защита: <b>SL и TP стоят</b>."
+    if status == "NO_POSITION":
+        return "Позиция: не найдена или уже закрыта."
+    if status in {"UNPROTECTED", "MISMATCH", "FETCH_FAILED"}:
+        reason = _humanize_testnet_reason_v774(monitor.get("reason"), "monitor")
+        return "Защита: <b>не подтверждена</b>. " + _ui_html(reason)
+    return "Статус позиции: <b>{}</b>.".format(_ui_html(status))
+
+
+BOT_VERSION_LABEL = "v7.75 Single TP Testnet Protection"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -26341,6 +26479,7 @@ RUNTIME_LAYERS = [
     ("v7.72", "remove hard daily Testnet trade cap while keeping position and exchange-safety gates"),
     ("v7.73", "riskier Testnet probe entries, strategy loss-streak learning and safer protection preflight"),
     ("v7.74", "auto-signals execute the same Binance Testnet candidate and explain outcomes in plain language"),
+    ("v7.75", "Binance Testnet protection sends one SL and one TP only"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -26440,6 +26579,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "submit_testnet_trade": _submit_testnet_trade_v734,
     "humanize_testnet_reason": _humanize_testnet_reason_v774,
     "synced_testnet_signal_candidate": _synced_testnet_signal_candidate_v774,
+    "testnet_protection_labels": testnet_protection_labels_v775,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,
