@@ -25919,6 +25919,10 @@ _base_auto_signal_select_trade_candidate_v773_for_v774 = _auto_signal_select_tra
 _base_build_auto_signals_message_v773_for_v774 = build_auto_signals_message
 _base_paper_trader_cycle_v773_for_v774 = paper_trader_cycle
 _base_testnet_monitor_short_line_v773_for_v774 = _testnet_monitor_short_line_v737
+_base_task_status_line_v773_for_v774 = _task_status_line
+_base_auto_settings_text_v773_for_v774 = auto_settings_text
+_base_auto_task_keyboard_v773_for_v774 = auto_task_keyboard
+_base_format_main_status_v773_for_v774 = format_main_status
 
 
 def _humanize_testnet_reason_v774(reason, stage=None):
@@ -26023,6 +26027,66 @@ def _simple_latest_analysis(chat_id):
             return "Последняя попытка: Binance Testnet принял действие. Подробности сохранены локально."
         return "Последняя попытка: сделка не открыта. " + _humanize_testnet_reason_v774(e.get("reason"), e.get("kind"))
     return "Пока сделок нет. Бот ждёт уверенный LONG/SHORT и проверяет, примет ли Binance защитные SL/TP."
+
+
+def _task_status_line(chat_id, task_key):
+    if task_key == "signals":
+        st = _get_auto_task_settings(chat_id, "signals")
+        enabled = "ON" if st.get("enabled") else "OFF"
+        return f"📡 Авто-сигналы: <b>{enabled}</b> | 5м | Binance futures | Demo sync"
+    if task_key == "paper_trader":
+        st = _get_auto_task_settings(chat_id, "paper_trader")
+        enabled = "ON" if st.get("enabled") else "OFF"
+        return f"🤖 Демо-бот: <b>{enabled}</b> | 15м | тот же gate, что у авто-сигнала"
+    return _base_task_status_line_v773_for_v774(chat_id, task_key)
+
+
+def auto_settings_text(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    return "\n".join([
+        "⚙️ <b>Уведомления</b>",
+        "",
+        f"Общий статус: <b>{'ON' if chat_id in auto_chat_ids else 'OFF'}</b>",
+        f"• Авто-сигналы: <b>{'ON' if _get_auto_task_settings(chat_id, 'signals').get('enabled') else 'OFF'}</b> | каждые 5м",
+        f"• Демо-бот: <b>{'ON' if _get_auto_task_settings(chat_id, 'paper_trader').get('enabled') else 'OFF'}</b> | каждые 15м",
+        "",
+        "Авто-сигнал берёт только Binance futures crypto, потому что именно эти сделки можно исполнить на Demo Testnet.",
+        "Акции и сырьё остаются в ручном разделе «Сигнал» как аналитика, без Testnet-исполнения.",
+    ])
+
+
+def auto_task_keyboard(chat_id, task_key):
+    if task_key == "signals":
+        st = _get_auto_task_settings(chat_id, "signals")
+        return {"inline_keyboard": [
+            [{"text": "⛔ Выключить" if st.get("enabled") else "✅ Включить", "callback_data": f"auto_tog_{task_key}"}],
+            [{"text": "⏰ Частота: 5м", "callback_data": f"auto_task_{task_key}"}],
+            [{"text": "📊 Binance futures crypto", "callback_data": f"auto_task_{task_key}"}],
+            [{"text": "◀️ Уведомления", "callback_data": "auto_settings"}],
+            [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+        ]}
+    return _base_auto_task_keyboard_v773_for_v774(chat_id, task_key)
+
+
+def format_main_status(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
+    stats = _testnet_stats_line_v734(allow_refresh=False)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    paper = _get_auto_task_settings(chat_id, "paper_trader")
+    return "\n".join([
+        "🏠 <b>Главное меню</b>",
+        "",
+        f"Сигнал: <b>{_ui_signal_symbol_v764(ticker)}</b> | TF <b>{_ui_tf_short(interval)}</b>",
+        f"Авто: <b>{auto_state}</b> | Binance Testnet: <b>{_testnet_short_status_v733()}</b>",
+        f"Testnet позиции: <b>{stats['open']}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        "",
+        "<b>Уведомления:</b>",
+        f"• Авто-сигналы: <b>{'ON' if sig.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | 5м | Binance futures",
+        f"• Демо-бот: <b>{'ON' if paper.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | 15м | синхронно с сигналом",
+    ])
 
 
 def _testnet_execution_result_line_v774(result):
