@@ -341,7 +341,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.75 Single TP Testnet Protection")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.76 Human Demo Trade Report")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -365,6 +365,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("humanize_testnet_reason", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("synced_testnet_signal_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_protection_labels", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("testnet_lifecycle_public_status", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_exploration_data_block", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("nyse_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("commodities_market_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -423,6 +424,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.73" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.74" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.75" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.76" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -1348,9 +1350,11 @@ class TelegramUiPolishTests(unittest.TestCase):
 
         self.assertIn("Demo Trade Report", text)
         self.assertIn("Открытые: <b>1/3</b>", text)
-        self.assertIn("CLOSED_WIN", text)
+        self.assertIn("Закрыта в плюс", text)
         self.assertIn("+1.250 USDT", text)
-        self.assertIn("PNL_PENDING", text)
+        self.assertIn("PnL", text)
+        self.assertNotIn("CLOSED_WIN", text)
+        self.assertNotIn("PNL_PENDING", text)
         self.assertNotIn("plan_id", text)
         self.assertNotIn("orderId", text)
 
@@ -1388,16 +1392,34 @@ class TelegramUiPolishTests(unittest.TestCase):
             ]
             self.bot._testnet_plan_failure_hint_v751 = lambda plan_id: "Precision is over the maximum defined for this asset."
             text = self.bot.format_testnet_lifecycle_report_v744(987654321)
+            self.bot._testnet_lifecycle_recent_v740 = lambda chat_id=None, limit=50: [
+                {
+                    "plan_id": "plan-only",
+                    "ticker": "ETHUSDT",
+                    "direction": "long",
+                    "interval": "5m",
+                    "created_at": "2026-05-26T02:15:00+00:00",
+                    "status": "PLANNED",
+                    "pnl": {"status": "UNATTRIBUTED"},
+                },
+            ]
+            plan_only_text = self.bot.format_testnet_lifecycle_report_v744(987654321)
         finally:
             self.bot._testnet_public_stats_v738 = old_stats
             self.bot._testnet_lifecycle_recent_v740 = old_rows
             self.bot._testnet_plan_failure_hint_v751 = old_hint
 
-        self.assertIn("PLAN_ONLY", text)
-        self.assertIn("plan only, order not sent", text)
-        self.assertIn("ENTRY_REJECTED", text)
-        self.assertIn("Precision is over", text)
-        self.assertLess(text.find("ETH"), text.find("BNB"))
+        self.assertIn("BNB", text)
+        self.assertIn("Вход отклонён", text)
+        self.assertIn("точности", text)
+        self.assertNotIn("ENTRY_REJECTED", text)
+        self.assertNotIn("Precision is over", text)
+        self.assertNotIn("plan only, order not sent", text)
+        self.assertNotIn("ETH", text)
+        self.assertIn("План сохранён", plan_only_text)
+        self.assertIn("ордер на биржу не отправлялся", plan_only_text)
+        self.assertNotIn("PLAN_ONLY", plan_only_text)
+        self.assertNotIn("plan only, order not sent", plan_only_text)
 
     def test_autobot_keyboard_uses_report_button_without_new_callback(self) -> None:
         keyboard = self.bot.autobot_keyboard(987654321)

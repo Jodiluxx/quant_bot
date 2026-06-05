@@ -25953,6 +25953,11 @@ def _humanize_testnet_reason_v774(reason, stage=None):
             "Время компьютера и сервера Binance расходится. Бот остановил отправку ордера, "
             "чтобы не получить некорректное исполнение."
         )
+    if "precision is over" in text or "-1111" in text:
+        return (
+            "Binance отклонил ордер из-за точности цены или количества. Для новых сделок бот "
+            "округляет значения по правилам биржи; эта строка может быть старой записью журнала."
+        )
     if "position limit" in text or "max positions" in text or "позици" in text and "лимит" in text:
         return "Лимит открытых позиций уже достигнут. Новая сделка не открыта, чтобы не раздувать риск."
     if "same direction" in text or "same-direction" in text:
@@ -26378,7 +26383,115 @@ def _testnet_monitor_short_line_v737(monitor):
     return "Статус позиции: <b>{}</b>.".format(_ui_html(status))
 
 
-BOT_VERSION_LABEL = "v7.75 Single TP Testnet Protection"
+# ============================================================
+# v7.76 - HUMAN DEMO TRADE REPORT
+# ============================================================
+# The public Demo Trade Report should read like a trading journal, not a raw
+# execution log. Technical statuses remain stored locally, while Telegram shows
+# concise Russian status labels and plain reasons.
+
+_base_testnet_lifecycle_display_status_v775_for_v776 = _testnet_lifecycle_display_status_v751
+_base_testnet_lifecycle_result_text_v775_for_v776 = _testnet_lifecycle_result_text_v744
+_base_format_testnet_lifecycle_report_v775_for_v776 = format_testnet_lifecycle_report_v744
+
+
+def _testnet_lifecycle_public_status_v776(row):
+    status = _testnet_lifecycle_user_status_v744(row)
+    return {
+        "PLANNED": "План сохранён",
+        "ENTRY_ACCEPTED": "Вход принят",
+        "ENTRY_REJECTED": "Вход отклонён",
+        "OPEN_PROTECTED": "Открыта",
+        "PNL_PENDING": "Закрыта, PnL сверяется",
+        "ORPHAN_CLEANED": "Лишние ордера убраны",
+        "NEEDS_ATTENTION": "Нужна проверка",
+        "EMERGENCY_CLOSED": "Аварийно закрыта",
+        "CLOSED_WIN": "Закрыта в плюс",
+        "CLOSED_LOSS": "Закрыта в минус",
+        "CLOSED_FLAT": "Закрыта в ноль",
+    }.get(status, status or "План сохранён")
+
+
+def _testnet_lifecycle_display_status_v751(row):
+    return _testnet_lifecycle_public_status_v776(row)
+
+
+def _testnet_lifecycle_result_text_v744(row):
+    row = row or {}
+    pnl = row.get("pnl") or {}
+    if pnl.get("status") == "ATTRIBUTED":
+        return f"{pnl.get('realized_usdt', 0):+.3f} USDT"
+    status = _testnet_lifecycle_user_status_v744(row)
+    if status == "PLANNED":
+        return "ордер на биржу не отправлялся"
+    if status == "ENTRY_REJECTED":
+        hint = _testnet_plan_failure_hint_v751(row.get("plan_id"))
+        return _humanize_testnet_reason_v774(hint or "entry rejected", "entry")
+    if status == "EMERGENCY_CLOSED":
+        return "бот закрыл позицию, потому что защита не подтвердилась"
+    if status == "NEEDS_ATTENTION":
+        return "нужно проверить позицию или защитные ордера"
+    if status == "OPEN_PROTECTED":
+        return "позиция открыта, SL и TP стоят"
+    if status == "PNL_PENDING":
+        return "позиция закрыта, PnL ещё сверяется с Binance"
+    if status == "ORPHAN_CLEANED":
+        return "позиция закрыта, лишние ордера очищены"
+    return _base_testnet_lifecycle_result_text_v775_for_v776(row)
+
+
+def _testnet_lifecycle_public_issue_count_v776(rows):
+    bad = {"NEEDS_ATTENTION", "EMERGENCY_CLOSED", "ENTRY_REJECTED"}
+    return sum(1 for row in rows if _testnet_lifecycle_user_status_v744(row) in bad)
+
+
+def format_testnet_lifecycle_report_v744(chat_id, limit=8):
+    stats = _testnet_public_stats_v738(chat_id)
+    rows = list(_testnet_lifecycle_recent_v740(chat_id, 80) or [])
+    rows.sort(key=_testnet_lifecycle_created_dt_v751, reverse=True)
+    visible_rows = [row for row in rows if _testnet_lifecycle_user_status_v744(row) != "PLANNED"]
+    if not visible_rows:
+        visible_rows = rows
+    linked = int(stats.get("attributed_closed") or 0)
+    pending = max(0, int(stats.get("bot_closed") or 0) - linked)
+    issues = _testnet_lifecycle_public_issue_count_v776(rows)
+    lines = [
+        "📒 <b>Demo Trade Report</b>",
+        "",
+        f"Открытые: <b>{stats.get('open', 0)}/{PAPER_TRADER_MAX_POSITIONS}</b>",
+        f"Закрытые: <b>{stats.get('bot_closed', 0)}</b> | PnL привязан: <b>{linked}</b>",
+        _testnet_public_pnl_line_v738(stats),
+        f"Сверяется: <b>{pending}</b> | Тех. ошибок в журнале: <b>{issues}</b>",
+        "",
+        "<b>Последние события:</b>",
+    ]
+    if not rows:
+        lines.append("Пока нет Testnet-сделок бота.")
+        return "\n".join(lines)
+    shown = 0
+    for row in visible_rows:
+        if shown >= int(limit):
+            break
+        ticker = _ui_ticker_short(row.get("ticker"))
+        direction = str(row.get("direction") or "").upper()
+        interval = _ui_tf_short(row.get("interval"))
+        status = _testnet_lifecycle_public_status_v776(row)
+        result = _testnet_lifecycle_result_text_v744(row)
+        lines.append(f"• {ticker} {direction} {interval} | <b>{_ui_html(status)}</b>")
+        if result:
+            lines.append(f"  {_ui_html(_ui_short_text(result, 140))}")
+        shown += 1
+    if pending:
+        lines += ["", "PnL может появиться позже: Binance income иногда приходит не сразу."]
+    if issues:
+        lines += [
+            "",
+            "Технические ошибки сохранены локально. Это не всегда текущая проблема: часть строк может быть старой историей до последних исправлений.",
+        ]
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.76 Human Demo Trade Report"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -26480,6 +26593,7 @@ RUNTIME_LAYERS = [
     ("v7.73", "riskier Testnet probe entries, strategy loss-streak learning and safer protection preflight"),
     ("v7.74", "auto-signals execute the same Binance Testnet candidate and explain outcomes in plain language"),
     ("v7.75", "Binance Testnet protection sends one SL and one TP only"),
+    ("v7.76", "human-readable Demo Trade Report with local technical details hidden"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -26549,6 +26663,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "testnet_position_quality": _testnet_position_quality_v743,
     "format_testnet_lifecycle_report": format_testnet_lifecycle_report_v744,
     "testnet_lifecycle_display_status": _testnet_lifecycle_display_status_v751,
+    "testnet_lifecycle_public_status": _testnet_lifecycle_public_status_v776,
     "adaptive_quality_stats": _adaptive_quality_stats_v745,
     "adaptive_quality_penalty": _adaptive_quality_penalty_v745,
     "adaptive_quality_penalty_from_stats": _adaptive_quality_penalty_from_stats_v746,
