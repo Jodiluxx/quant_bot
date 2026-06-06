@@ -27295,7 +27295,558 @@ async def async_handle_update(session, update, sem):
     await _base_async_handle_update_v776_for_v777(session, update, sem)
 
 
-BOT_VERSION_LABEL = "v7.78 Signal Win Rate Breakdown"
+# ============================================================
+# v7.79 - TELEGRAM UI SPECIFICATION POLISH
+# ============================================================
+# Presentation-only layer based on quant_signal_bot_ui_specification_v2.pdf.
+# It keeps existing callback_data and trading logic intact, but makes Telegram
+# cards shorter, easier to scan, and less noisy on mobile.
+
+_base_format_signal_summary_v778_for_v779 = format_signal_summary
+_base_format_signal_scan_group_v778_for_v779 = format_signal_scan_group_v764
+_base_signal_scan_group_keyboard_v778_for_v779 = signal_scan_group_keyboard_v764
+_base_format_signal_scan_all_v778_for_v779 = format_signal_scan_all_v759
+_base_signal_scan_all_keyboard_v778_for_v779 = signal_scan_all_keyboard_v759
+_base_format_signal_winrate_report_v778_for_v779 = format_signal_winrate_report_v777
+_base_signal_menu_keyboard_v778_for_v779 = signal_menu_keyboard
+_base_format_signal_menu_text_v778_for_v779 = format_signal_menu_text
+_base_signal_group_keyboard_v778_for_v779 = signal_group_keyboard_v766
+_base_signal_group_asset_keyboard_v778_for_v779 = signal_group_asset_keyboard_v766
+_base_signal_group_tf_keyboard_v778_for_v779 = signal_group_tf_keyboard_v766
+_base_format_signal_group_menu_text_v778_for_v779 = format_signal_group_menu_text_v766
+_base_compact_signal_keyboard_v778_for_v779 = compact_signal_keyboard
+_base_main_keyboard_v778_for_v779 = main_keyboard
+_base_format_main_status_v778_for_v779 = format_main_status
+_base_autobot_keyboard_v778_for_v779 = autobot_keyboard
+_base_auto_settings_keyboard_v778_for_v779 = auto_settings_keyboard
+_base_auto_settings_text_v778_for_v779 = auto_settings_text
+
+
+def _ui_rule_v779():
+    return "───────────────────"
+
+
+def _ui_code_v779(value):
+    return f"<code>{_ui_html(value)}</code>"
+
+
+def _ui_money_code_v779(value, ticker):
+    return _ui_code_v779(fmt_price(value, ticker))
+
+
+def _ui_source_line_v779(ticker):
+    ticker = str(ticker or "").upper()
+    if _alpaca_enabled_for_ticker_v771(ticker):
+        return f"Данные: <b>Alpaca Market Data</b> | feed <b>{_ui_html(_alpaca_feed_v771().upper())}</b> | US equities"
+    if _oanda_enabled_for_ticker_v770(ticker):
+        oanda_symbol = OANDA_SIGNAL_SYMBOLS_V770.get(ticker, ticker)
+        return f"Данные: <b>OANDA v20</b> | symbol <b>{_ui_html(oanda_symbol)}</b> | OANDA chart"
+    if _is_delayed_yahoo_signal_ticker_v765(ticker):
+        yahoo_symbol = YAHOO_SIGNAL_SYMBOLS_V765.get(ticker, ticker)
+        source = "Yahoo futures proxy" if _is_commodity_ticker_v765(ticker) else "Yahoo delayed"
+        return f"Данные: <b>{_ui_html(source)}</b> | symbol <b>{_ui_html(yahoo_symbol)}</b> | не OANDA spot"
+    return "Данные: <b>Binance Futures</b>"
+
+
+def _ui_decision_sentence_v779(status, direction, entry_now):
+    plain = _ui_status_plain(status)
+    if plain == "READY" and direction in {"LONG", "SHORT"}:
+        return f"вход возможен малым риском (EntryNow: {entry_now}/100)"
+    if plain == "WAIT RETEST":
+        return f"запрещен сейчас: ждать ретест (EntryNow: {entry_now}/100)"
+    if plain == "WAIT CONFIRM":
+        return f"запрещен сейчас: ждать подтверждение (EntryNow: {entry_now}/100)"
+    if plain == "BLOCKED":
+        return f"запрещен защитным фильтром (EntryNow: {entry_now}/100)"
+    return f"не входить сейчас (EntryNow: {entry_now}/100)"
+
+
+def _ui_probability_text_v779(data, decision):
+    prob = _prob_value_v712(data.get("prob")) if "_prob_value_v712" in globals() else data.get("prob")
+    if decision not in {"LONG", "SHORT"}:
+        return "не считается без сделки"
+    if isinstance(prob, (int, float)) and prob > 0:
+        return f"{prob * 100:.1f}% направления"
+    return "нет оценки"
+
+
+def _ui_signal_status_label_v779(data):
+    direction = _ui_signal_direction(data)
+    plan = data.get("entry_plan") or {}
+    status = plan.get("status") or ("ENTER_NOW" if direction in {"LONG", "SHORT"} else "NO_SETUP")
+    decision = _simple_signal_decision(data)
+    if decision in {"LONG", "SHORT"}:
+        return decision, status, "🟢"
+    if _ui_status_plain(status) == "WAIT RETEST":
+        return "WAIT", status, "🟡"
+    if _ui_status_plain(status) == "BLOCKED":
+        return "WAIT", status, "🔴"
+    return "WAIT", status, "🟡"
+
+
+def _ui_status_human_v779(status):
+    plain = _ui_status_plain(status)
+    return {
+        "READY": "READY",
+        "WAIT RETEST": "WAIT: ожидание ретеста",
+        "WAIT CONFIRM": "WAIT: нужно подтверждение",
+        "BLOCKED": "BLOCKED",
+        "WAIT": "WAIT",
+    }.get(plain, plain)
+
+
+def format_signal_summary(data, ticker, interval):
+    data = data or {}
+    plan = data.get("entry_plan") or {}
+    risk = data.get("risk_levels") or {}
+    decision, status, emoji = _ui_signal_status_label_v779(data)
+    idea_direction = _ui_signal_direction(data)
+    tf = _ui_tf_short(interval)
+    price = data.get("price")
+    confidence = int(data.get("confidence") or 0)
+    entry_now = int(plan.get("entry_now_score", plan.get("score", 0)) or 0)
+    setup_score = int(plan.get("setup_score", plan.get("score", 0)) or 0)
+    rr = _safe_float(plan.get("rr_now"), None)
+    if rr is None or rr <= 0:
+        rr = _safe_float(risk.get("rr_ratio"), 0) or 0
+    support, risks = _ui_directional_lists(data, idea_direction.lower(), 3)
+    source_line = _ui_source_line_v779(ticker)
+
+    lines = [
+        f"📊 <b>АНАЛИЗ АКТИВА: #{_ui_signal_symbol_v764(ticker)} [{tf}]</b>",
+        _ui_rule_v779(),
+        f"{emoji} <b>ВЕРДИКТ: {_ui_html(decision)}</b>",
+        f"Идея: <b>{_ui_html(idea_direction)}</b> | Статус: <b>{_ui_html(_ui_status_human_v779(status))}</b>",
+        f"Сила паттерна: <b>{setup_score}/100</b>",
+        f"Текущий вход: <b>{_ui_html(_ui_decision_sentence_v779(status, decision, entry_now))}</b>",
+        f"Confidence: <b>{confidence}/100</b> | Вероятность: <b>{_ui_probability_text_v779(data, decision)}</b>",
+        _ui_rule_v779(),
+        source_line,
+        f"Цена: {_ui_money_code_v779(price, ticker)}",
+    ]
+
+    if risk:
+        lines += [
+            "",
+            "🎯 <b>Уровни</b>",
+            f"SL: {_ui_money_code_v779(risk.get('sl'), ticker)}",
+            f"TP1: {_ui_money_code_v779(risk.get('tp1'), ticker)}",
+            f"TP2: {_ui_money_code_v779(risk.get('tp2'), ticker)}",
+            f"RR: <b>{rr:.2f}x</b>",
+        ]
+
+    if data.get("anomaly_reason"):
+        lines += [
+            "",
+            "⚠️ <b>Риск данных</b>",
+            _ui_short_text(data.get("anomaly_reason"), 120),
+            "Не входить, пока данные выглядят аномально.",
+        ]
+        return "\n".join(lines)
+
+    if support:
+        lines += ["", "📈 <b>За идею</b>"]
+        lines += [f"• {_ui_short_text(item, 92)}" for item in support[:3]]
+    if risks:
+        lines += ["", "📉 <b>Риски</b>"]
+        lines += [f"• {_ui_short_text(item, 92)}" for item in risks[:3]]
+
+    if decision in {"LONG", "SHORT"}:
+        summary = "идея есть, но риск держать маленьким. Это статистика, не гарантия."
+    else:
+        summary = "не догонять цену. Лучше пропустить вход, чем открыть плохую сделку."
+    lines += ["", f"💡 <b>Резюме:</b> {_ui_html(summary)}"]
+    return "\n".join(lines)
+
+
+def format_msg(data, ticker, interval):
+    return format_signal_summary(data, ticker, interval)
+
+
+def _ui_market_group_button_v779(chat_id, group):
+    active = _signal_group_state_v766(chat_id)[0]
+    meta = SIGNAL_GROUPS_V766[group]
+    mark = "✅" if active == group else meta["emoji"]
+    return {"text": f"{mark} {meta['title']}", "callback_data": meta["callback"]}
+
+
+def format_signal_menu_text(chat_id):
+    group, ticker, interval = _signal_group_state_v766(chat_id)
+    meta = SIGNAL_GROUPS_V766[group]
+    return "\n".join([
+        "🔍 <b>Сканирование рынков</b>",
+        _ui_rule_v779(),
+        f"Выбран: {_ui_code_v779(_ui_signal_symbol_v764(ticker))} | TF {_ui_code_v779(_ui_tf_short(interval))}",
+        f"Рынок: <b>{_ui_html(meta['title'])}</b>",
+        "",
+        "Авто-сигналы проверяют рынки каждые <b>5м</b> и присылают только уверенные LONG/SHORT.",
+        "Выбери рынок ниже.",
+    ])
+
+
+def signal_menu_keyboard(chat_id):
+    return {"inline_keyboard": [
+        [
+            _ui_market_group_button_v779(chat_id, "crypto"),
+            _ui_market_group_button_v779(chat_id, "stocks"),
+        ],
+        [_ui_market_group_button_v779(chat_id, "commodities")],
+        [{"text": "🔎 Скан всех активов", "callback_data": "signal_scan_all"}],
+        [
+            {"text": "⚙️ Настройки", "callback_data": "auto_settings"},
+            {"text": "🏠 Меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def format_signal_group_menu_text_v766(chat_id, group):
+    group, ticker, interval = _signal_group_state_v766(chat_id, group)
+    meta = SIGNAL_GROUPS_V766[group]
+    if group == "crypto":
+        source = "Binance Futures, TF 5м-4ч."
+    elif group == "stocks" and _alpaca_enabled_for_ticker_v771(ticker):
+        source = f"Alpaca Market Data ({_ui_html(_alpaca_feed_v771().upper())}), TF 5м-4ч."
+    elif group == "stocks":
+        source = "Yahoo delayed, TF 30м+ во время NYSE."
+    elif _oanda_enabled_for_ticker_v770(ticker):
+        source = "OANDA v20, TF 5м-4ч."
+    else:
+        source = "Yahoo futures proxy, TF 30м+, рынок 24/5."
+    return "\n".join([
+        f"{meta['emoji']} <b>{meta['title']}</b>",
+        _ui_rule_v779(),
+        f"Актив: {_ui_code_v779(_ui_signal_symbol_v764(ticker))}",
+        f"TF: {_ui_code_v779(_ui_tf_short(interval))}",
+        f"Источник: <b>{source}</b>",
+        "",
+        "Сигнал покажет LONG / SHORT / WAIT. Подробные расчёты остаются внутри бота.",
+    ])
+
+
+def signal_group_keyboard_v766(chat_id, group):
+    group, ticker, interval = _signal_group_state_v766(chat_id, group)
+    meta = SIGNAL_GROUPS_V766[group]
+    return {"inline_keyboard": [
+        [{"text": f"📡 Сигнал: {_ui_signal_symbol_v764(ticker)} / {_ui_tf_short(interval)}", "callback_data": "get_signal"}],
+        [{"text": f"🔎 Сканировать все: {meta['title']}", "callback_data": meta["scan_callback"]}],
+        [
+            {"text": f"🎛 Актив: {_ui_signal_symbol_v764(ticker)}", "callback_data": meta["asset_callback"]},
+            {"text": f"⏱ TF: {_ui_tf_short(interval)}", "callback_data": meta["tf_callback"]},
+        ],
+        [
+            {"text": "◀️ Назад", "callback_data": "menu_signal"},
+            {"text": "🏠 Меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def signal_group_asset_keyboard_v766(chat_id, group):
+    group, ticker, _ = _signal_group_state_v766(chat_id, group)
+    tickers = _signal_group_tickers_v766(group)
+    rows = []
+    for idx in range(0, len(tickers), 2):
+        row = []
+        for item in tickers[idx:idx + 2]:
+            label = TICKERS[item]["label"]
+            if item == ticker:
+                label = "✅ " + label
+            row.append({"text": label, "callback_data": f"sig_ticker_{item}"})
+        rows.append(row)
+    rows.append([
+        {"text": "◀️ Назад", "callback_data": SIGNAL_GROUPS_V766[group]["callback"]},
+        {"text": "🏠 Меню", "callback_data": "back_main"},
+    ])
+    return {"inline_keyboard": rows}
+
+
+def signal_group_tf_keyboard_v766(chat_id, group):
+    group, _, interval = _signal_group_state_v766(chat_id, group)
+    tfs = _signal_group_tfs_v766(group)
+    rows = []
+    for idx in range(0, len(tfs), 3):
+        row = []
+        for iv in tfs[idx:idx + 3]:
+            label = _ui_tf_short(iv)
+            if iv == interval:
+                label = f"• {label} •"
+            row.append({"text": label, "callback_data": f"sig_interval_{iv}"})
+        rows.append(row)
+    rows.append([
+        {"text": "◀️ Назад", "callback_data": SIGNAL_GROUPS_V766[group]["callback"]},
+        {"text": "🏠 Меню", "callback_data": "back_main"},
+    ])
+    return {"inline_keyboard": rows}
+
+
+def compact_signal_keyboard(open_callback=None):
+    group = None
+    if open_callback:
+        group = open_callback
+    return {"inline_keyboard": [
+        [{"text": "🔄 Обновить сигнал", "callback_data": "get_signal"}],
+        [{"text": "🔎 Скан всех активов", "callback_data": "signal_scan_all"}],
+        [
+            {"text": "◀️ Назад", "callback_data": "sig_active_group"},
+            {"text": "🏠 Меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def _ui_scan_status_v779(decision):
+    decision = str(decision or "WAIT").upper()
+    if decision == "LONG":
+        return "🟢 LONG"
+    if decision == "SHORT":
+        return "🔴 SHORT"
+    if decision == "ERROR":
+        return "⚪ ERROR"
+    return "🟡 WAIT"
+
+
+def format_signal_scan_group_v764(chat_id, group):
+    rows, tickers = _signal_scan_all_assets_group_v764(chat_id, group)
+    sample_ticker = (tickers or ["BTCUSDT"])[0]
+    interval = _safe_signal_interval_v765(sample_ticker, user_intervals.get(chat_id, "15m"))
+    meta = SIGNAL_GROUPS_V766.get(group, SIGNAL_GROUPS_V766["crypto"])
+    lines = [
+        f"🔎 <b>Скан: {meta['title']}</b>",
+        _ui_rule_v779(),
+        f"TF: {_ui_code_v779(_ui_tf_short(interval))} | Активов: <b>{len(rows)}/{len(tickers)}</b>",
+        "",
+        "<b>Карта рынка:</b>",
+    ]
+    for row in rows[:9]:
+        ticker = _ui_signal_symbol_v764(row.get("ticker"))
+        decision = str(row.get("decision") or "WAIT").upper()
+        reason = _ui_short_text(row.get("reason"), 40)
+        lines.append(f"{_ui_code_v779(ticker):<18} {_ui_scan_status_v779(decision)} | {reason}")
+    if len(rows) > 9:
+        lines.append(f"• ещё {len(rows) - 9} активов скрыто, чтобы сообщение не стало простынёй")
+    lines += [
+        "",
+        "LONG/SHORT — уверенная идея. WAIT — лучше не входить сейчас.",
+    ]
+    return "\n".join(lines)
+
+
+def signal_scan_group_keyboard_v764(group, chat_id=None):
+    meta = SIGNAL_GROUPS_V766.get(group, SIGNAL_GROUPS_V766["crypto"])
+    return {"inline_keyboard": [
+        [{"text": f"🔄 Перезапустить скан: {meta['title']}", "callback_data": meta["scan_callback"]}],
+        [
+            {"text": "🎛 Изменить активы", "callback_data": meta["asset_callback"]},
+            {"text": "⏱ Изменить TF", "callback_data": meta["tf_callback"]},
+        ],
+        [
+            {"text": "◀️ Назад", "callback_data": meta["callback"]},
+            {"text": "🏠 Меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def format_signal_scan_all_v759(chat_id):
+    interval = user_intervals.get(chat_id, "15m")
+    rows = _signal_scan_all_assets_v759(chat_id)
+    lines = [
+        "🔎 <b>Скан всех активов</b>",
+        _ui_rule_v779(),
+        f"TF: {_ui_code_v779(_ui_tf_short(interval))} | Проверено: <b>{len(rows)}/{len(_signal_scan_tickers_v759())}</b>",
+        "",
+        "<b>Кратко:</b>",
+    ]
+    for row in rows[:12]:
+        ticker = _ui_signal_symbol_v764(row.get("ticker"))
+        decision = str(row.get("decision") or "WAIT").upper()
+        reason = _ui_short_text(row.get("reason"), 36)
+        lines.append(f"{_ui_code_v779(ticker)} — <b>{_ui_html(decision)}</b> | {reason}")
+    if len(rows) > 12:
+        lines.append(f"• ещё {len(rows) - 12} строк скрыто")
+    lines += ["", "Это обзор, а не приказ входить. WAIT не записывается как торговый сигнал."]
+    return "\n".join(lines)
+
+
+def signal_scan_all_keyboard_v759(chat_id):
+    group, ticker, interval = _signal_group_state_v766(chat_id)
+    return {"inline_keyboard": [
+        [{"text": "🔄 Скан всех активов", "callback_data": "signal_scan_all"}],
+        [{"text": f"📡 Сигнал: {_ui_signal_symbol_v764(ticker)} / {_ui_tf_short(interval)}", "callback_data": "get_signal"}],
+        [
+            {"text": "🎛 Актив", "callback_data": SIGNAL_GROUPS_V766[group]["asset_callback"]},
+            {"text": "⏱ TF", "callback_data": SIGNAL_GROUPS_V766[group]["tf_callback"]},
+        ],
+        [
+            {"text": "◀️ Назад", "callback_data": "menu_signal"},
+            {"text": "🏠 Меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def _signal_winrate_bar_v779(winrate):
+    if winrate is None:
+        return "⬜⬜⬜⬜⬜⬜⬜⬜"
+    filled = max(0, min(8, int(round(float(winrate) / 12.5))))
+    return "🟩" * filled + "⬜" * (8 - filled)
+
+
+def _signal_winrate_edge_text_v779(value):
+    if value is None:
+        return "⚪ н/д"
+    value = float(value)
+    icon = "🟢" if value > 0 else "🔴" if value < 0 else "⚪"
+    return f"{icon} {value:+.2f}%"
+
+
+def _signal_winrate_bucket_line_v779(bucket):
+    wr = "н/д" if bucket.get("winrate") is None else f"{bucket['winrate']:.1f}%"
+    edge = _signal_winrate_edge_text_v779(bucket.get("avg_edge"))
+    quality = _signal_winrate_bucket_quality_v778(bucket)
+    return (
+        f"• {_ui_code_v779(bucket.get('label'))}: <b>WR {wr}</b> | "
+        f"🟢 {bucket.get('wins', 0)} WIN | 🔴 {bucket.get('losses', 0)} LOSS | ⚪ {bucket.get('flats', 0)} FLAT | "
+        f"Edge {edge} | {_ui_html(quality)}"
+    )
+
+
+def _signal_winrate_recent_line_v779(row):
+    ticker = _ui_signal_symbol_v764(row.get("ticker"))
+    direction = str(row.get("direction") or "").upper()
+    tf = _ui_tf_short(row.get("interval"))
+    status = str(row.get("status") or "n/a").upper()
+    icon = {"WIN": "🟢", "LOSS": "🔴", "FLAT": "⚪", "PENDING": "⏳"}.get(status, "⚪")
+    edge = row.get("result_edge_pct")
+    edge_text = f" {float(edge):+.2f}%" if isinstance(edge, (int, float)) else ""
+    if status == "PENDING":
+        due = _signal_winrate_parse_dt_v777(row.get("due_at")).strftime("%H:%M UTC")
+        edge_text = f" проверка {due}"
+    return f"{icon} {_ui_code_v779(ticker)} {tf} {direction} → <b>{_ui_html(status)}</b>{_ui_html(edge_text)} | вход {_ui_money_code_v779(row.get('entry_price'), row.get('ticker'))}"
+
+
+def format_signal_winrate_report_v777(chat_id, evaluate=True):
+    completed = _signal_winrate_evaluate_pending_v777(chat_id) if evaluate else []
+    stats = _signal_winrate_stats_v777(chat_id)
+    wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
+    avg = _signal_winrate_edge_text_v779(stats.get("avg_edge"))
+    lines = [
+        "📈 <b>Win Rate: верификация сигналов</b>",
+        "Режим: <b>проверка направления без ордеров</b>",
+        _ui_rule_v779(),
+        "",
+        "📊 <b>Общая статистика</b>",
+        f"• Винрейт: <b>{wr}</b> {_signal_winrate_bar_v779(stats.get('winrate'))}",
+        f"• Результаты: 🟢 {stats['wins']} WIN | 🔴 {stats['losses']} LOSS | ⚪ {stats['flats']} FLAT",
+        f"• Матем. ожидание: {avg}",
+        f"• На проверке: <b>{stats['pending']}</b>",
+    ]
+    if completed:
+        lines += ["", "✅ <b>Новые проверки</b>"]
+        lines += [_signal_winrate_recent_line_v779(row) for row in completed[:4]]
+
+    ticker_rows = _signal_winrate_bucket_stats_v778(chat_id, "ticker", 4)
+    tf_rows = _signal_winrate_bucket_stats_v778(chat_id, "tf", 4)
+    direction_rows = _signal_winrate_bucket_stats_v778(chat_id, "direction", 3)
+    lines += ["", "🧮 <b>По активам</b>"]
+    lines += [_signal_winrate_bucket_line_v779(row) for row in ticker_rows] or ["• данных пока нет"]
+    lines += ["", "⏱ <b>По TF</b>"]
+    lines += [_signal_winrate_bucket_line_v779(row) for row in tf_rows] or ["• данных пока нет"]
+    lines += ["", "↕️ <b>По направлению</b>"]
+    lines += [_signal_winrate_bucket_line_v779(row) for row in direction_rows] or ["• данных пока нет"]
+
+    recent = _signal_winrate_rows_v777(chat_id, limit=5)
+    lines += ["", "📝 <b>Последние идеи</b>"]
+    lines += [_signal_winrate_recent_line_v779(row) for row in recent] or ["• LONG/SHORT сигналов пока нет"]
+    lines += [
+        "",
+        "⚠️ WIN = цена прошла в сторону сигнала после его TF. LOSS = против сигнала. FLAT = почти без движения.",
+        "Маленькая выборка не доказывает преимущество стратегии.",
+    ]
+    return "\n".join(lines)
+
+
+def _signal_winrate_pending_count_v779(chat_id):
+    return len(_signal_winrate_rows_v777(chat_id, limit=SIGNAL_WINRATE_MAX_ROWS_V777, statuses={"PENDING"}))
+
+
+def format_autobot_menu(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    return format_signal_winrate_report_v777(chat_id, evaluate=True)
+
+
+def autobot_keyboard(chat_id):
+    pending = _signal_winrate_pending_count_v779(chat_id)
+    return {"inline_keyboard": [
+        [{"text": "🔄 Обновить статистику", "callback_data": "paper_closed_menu"}],
+        [
+            {"text": "▶️ Скан сейчас", "callback_data": "paper_run_now"},
+            {"text": f"⏳ На проверке ({pending})", "callback_data": "paper_open_positions"},
+        ],
+        [
+            {"text": "⚙️ Настройки", "callback_data": "auto_settings"},
+            {"text": "🏠 Главное меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def auto_settings_keyboard(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    tracker = _get_auto_task_settings(chat_id, "paper_trader")
+    global_on = chat_id in auto_chat_ids
+    return {"inline_keyboard": [
+        [{"text": "🟢 Всё включено" if global_on else "⚪ Всё выключено", "callback_data": "toggle_auto"}],
+        [{"text": f"{'🟢' if sig.get('enabled') else '⚪'} Авто-сигналы · 5м", "callback_data": "auto_task_signals"}],
+        [{"text": f"{'🟢' if tracker.get('enabled') else '⚪'} Win Rate · 5м", "callback_data": "auto_task_paper_trader"}],
+        [
+            {"text": "◀️ Win Rate", "callback_data": "menu_autobot"},
+            {"text": "🏠 Меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def auto_settings_text(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    tracker = _get_auto_task_settings(chat_id, "paper_trader")
+    return "\n".join([
+        "⚙️ <b>Настройки уведомлений</b>",
+        _ui_rule_v779(),
+        f"Общий режим: <b>{'ON' if chat_id in auto_chat_ids else 'OFF'}</b>",
+        f"Авто-сигналы: <b>{'ON' if sig.get('enabled') else 'OFF'}</b> | каждые 5м",
+        f"Win Rate: <b>{'ON' if tracker.get('enabled') else 'OFF'}</b> | проверка каждые 5м",
+        "",
+        "Авто-сигналы присылают только уверенные LONG/SHORT.",
+        "Win Rate проверяет, была ли идея права после своего TF.",
+    ])
+
+
+def main_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🔍 Сканировать рынки", "callback_data": "menu_signal"}],
+        [
+            {"text": "📊 Win Rate", "callback_data": "menu_autobot"},
+            {"text": "⚙️ Настройки", "callback_data": "auto_settings"},
+        ],
+    ]}
+
+
+def format_main_status(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    stats = _signal_winrate_stats_v777(chat_id)
+    auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
+    wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
+    return "\n".join([
+        "🏠 <b>Главное меню</b>",
+        _ui_rule_v779(),
+        f"Актив: {_ui_code_v779(_ui_signal_symbol_v764(ticker))} | TF {_ui_code_v779(_ui_tf_short(interval))}",
+        f"Авто: <b>{auto_state}</b> | Win Rate: <b>{wr}</b>",
+        f"Проверено: <b>{stats['counted']}</b> | На проверке: <b>{stats['pending']}</b>",
+        "",
+        "Выбери действие ниже.",
+    ])
+
+
+BOT_VERSION_LABEL = "v7.79 Telegram UI Specification Polish"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -27400,6 +27951,7 @@ RUNTIME_LAYERS = [
     ("v7.76", "human-readable Demo Trade Report with local technical details hidden"),
     ("v7.77", "signal Win Rate tracker replaces public demo trading execution"),
     ("v7.78", "signal Win Rate breakdown by ticker, timeframe and direction"),
+    ("v7.79", "Telegram UI specification polish for menus, signal cards, scans and Win Rate"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

@@ -30,8 +30,9 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_main_keyboard_keeps_expected_callbacks(self) -> None:
         rows = self.bot.main_keyboard()["inline_keyboard"]
         callbacks = {button["callback_data"] for row in rows for button in row}
-        for callback in {"menu_signal", "menu_autobot", "auto_settings", "back_main"}:
+        for callback in {"menu_signal", "menu_autobot", "auto_settings"}:
             self.assertIn(callback, callbacks)
+        self.assertNotIn("back_main", callbacks)
         for hidden in {"menu_analytics", "menu_positions", "menu_learn", "menu_flow", "get_fg", "entry_point"}:
             self.assertNotIn(hidden, callbacks)
 
@@ -107,12 +108,14 @@ class TelegramUiPolishTests(unittest.TestCase):
             "BTCUSDT",
             "15m",
         )
-        self.assertIn("📡 <b>BTCUSDT — WAIT</b>", text)
-        self.assertIn("идея: <b>LONG</b>", text)
+        self.assertIn("АНАЛИЗ АКТИВА: #BTCUSDT [15м]", text)
+        self.assertIn("ВЕРДИКТ: WAIT", text)
+        self.assertIn("Идея: <b>LONG</b>", text)
+        self.assertIn("Сила паттерна: <b>81/100</b>", text)
         self.assertIn("ждать ретест", text)
         self.assertIn("WAIT", text)
-        self.assertIn("SL/TP", text)
         self.assertIn("не считается без сделки", text)
+        self.assertIn("<code>$100.0000</code>", text)
         self.assertNotIn("n/a", text)
         self.assertIn("Цена &lt; EMA200", text)
         self.assertLessEqual(len(text.splitlines()), 28)
@@ -441,10 +444,10 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("15м", text)
         self.assertIn("LONG", text)
         self.assertIn("данных мало", text)
-        self.assertIn("W/L/F: <b>2/1/0</b>", text)
+        self.assertIn("🟢 2 WIN | 🔴 1 LOSS | ⚪ 0 FLAT", text)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.78 Signal Win Rate Breakdown")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.79 Telegram UI Specification Polish")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -535,6 +538,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.76" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.77" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.78" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.79" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -759,9 +763,9 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._auto_signal_scan_tickers_v764 = old_auto_tickers
 
         self.assertIn("Проверено: <b>3/3</b>", text)
-        self.assertIn("BTC — <b>WAIT</b>", text)
-        self.assertIn("ETH — <b>LONG</b>", text)
-        self.assertIn("XRP — <b>SHORT</b>", text)
+        self.assertIn("<code>BTCUSDT</code> — <b>WAIT</b>", text)
+        self.assertIn("<code>ETHUSDT</code> — <b>LONG</b>", text)
+        self.assertIn("<code>XRPUSDT</code> — <b>SHORT</b>", text)
 
     def test_stock_and_commodity_universe_is_signal_only_and_session_gated(self) -> None:
         self.assertEqual(self.bot.STOCK_SIGNAL_TICKERS_V764, ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL"])
@@ -1149,7 +1153,7 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_testnet_only_menu_hides_paper_language(self) -> None:
         text = self.bot.format_autobot_menu(987654321)
         self.assertIn("Win Rate", text)
-        self.assertIn("ордера: <b>не отправляются</b>", text)
+        self.assertIn("без ордеров", text)
         self.assertNotIn("Paper-", text)
         self.assertNotIn("paper-", text)
         self.assertNotIn("Paper Trader", text)
@@ -1392,7 +1396,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_connection_status_v740 = old_connection
 
         self.assertIn("Win Rate", text)
-        self.assertIn("Winrate: <b>н/д</b>", text)
+        self.assertIn("Винрейт: <b>н/д</b>", text)
         self.assertNotIn("+12.340 USDT", text)
 
     def test_connection_line_is_explicit(self) -> None:
@@ -1461,8 +1465,8 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_closed_trade_rows_v742 = old_closed
             self.bot._testnet_connection_status_v740 = old_connection
 
-        self.assertIn("Winrate: <b>50.0%</b>", text)
-        self.assertIn("W/L/F: <b>1/1/0</b>", text)
+        self.assertIn("Винрейт: <b>50.0%</b>", text)
+        self.assertIn("🟢 1 WIN | 🔴 1 LOSS | ⚪ 0 FLAT", text)
         self.assertNotIn("+999.000 USDT", text)
 
     def test_lifecycle_report_is_compact_and_user_facing(self) -> None:
@@ -1582,7 +1586,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         ]
         report = [button for button in buttons if button.get("callback_data") == "paper_closed_menu"]
         self.assertTrue(report)
-        self.assertIn("Отчёт", report[0]["text"])
+        self.assertIn("статистик", report[0]["text"].lower())
 
 
 if __name__ == "__main__":
