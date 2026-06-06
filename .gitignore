@@ -19,6 +19,7 @@ safety_state.json
 testnet_journal.json
 demo_analysis_state.json
 testnet_lifecycle_state.json
+signal_winrate_state.json
 signal_journal.json
 positions.json
 risk_state.json

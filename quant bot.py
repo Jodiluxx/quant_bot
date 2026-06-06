@@ -26491,7 +26491,654 @@ def format_testnet_lifecycle_report_v744(chat_id, limit=8):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.76 Human Demo Trade Report"
+# ============================================================
+# v7.77 - SIGNAL WIN RATE TRACKER
+# ============================================================
+# Public "Demo bot" mode is replaced by a signal quality tracker. The bot no
+# longer opens Testnet orders from public auto-signals; it records every sent
+# actionable LONG/SHORT signal and checks it after its own timeframe.
+
+_base_build_auto_signals_message_v776_for_v777 = build_auto_signals_message
+_base_auto_signal_select_trade_candidate_v776_for_v777 = _auto_signal_select_trade_candidate_v753
+_base_paper_trader_cycle_v776_for_v777 = paper_trader_cycle
+_base_format_autobot_menu_v776_for_v777 = format_autobot_menu
+_base_autobot_keyboard_v776_for_v777 = autobot_keyboard
+_base_main_keyboard_v776_for_v777 = main_keyboard
+_base_format_main_status_v776_for_v777 = format_main_status
+_base_auto_settings_text_v776_for_v777 = auto_settings_text
+_base_auto_settings_keyboard_v776_for_v777 = auto_settings_keyboard
+_base_auto_task_keyboard_v776_for_v777 = auto_task_keyboard
+_base_build_auto_task_message_v776_for_v777 = build_auto_task_message
+_base_simple_format_open_positions_v776_for_v777 = _simple_format_open_positions
+_base_simple_format_closed_positions_v776_for_v777 = _simple_format_closed_positions
+_base_render_signal_v776_for_v777 = _render_signal_v732
+_base_async_handle_update_v776_for_v777 = async_handle_update
+_base_simple_sync_public_auto_settings_v776_for_v777 = _simple_sync_public_auto_settings
+_base_task_status_line_v776_for_v777 = _task_status_line
+
+SIGNAL_WINRATE_STATE_FILE = "signal_winrate_state.json"
+SIGNAL_WINRATE_MAX_ROWS_V777 = 3000
+SIGNAL_WINRATE_FLAT_PCT_V777 = float(os.getenv("SIGNAL_WINRATE_FLAT_PCT", "0.0005"))
+_signal_winrate_lock_v777 = threading.RLock()
+
+if "paper_trader" in AUTO_TASKS:
+    AUTO_TASKS["paper_trader"]["label"] = "📊 Win Rate"
+    AUTO_TASKS["paper_trader"]["default_enabled"] = True
+    AUTO_TASKS["paper_trader"]["default_interval"] = "5m"
+    AUTO_TASKS["paper_trader"]["default_tf"] = None
+if "AUTO_DEFAULT_PLAN_V78" in globals():
+    AUTO_DEFAULT_PLAN_V78["paper_trader"] = {"enabled": True, "send_interval": "5m", "tf": None}
+
+
+def _signal_winrate_empty_state_v777():
+    return {"signals": [], "updated_at": None}
+
+
+def _signal_winrate_load_v777():
+    with _signal_winrate_lock_v777:
+        try:
+            if os.path.exists(SIGNAL_WINRATE_STATE_FILE):
+                with open(SIGNAL_WINRATE_STATE_FILE, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                if isinstance(state, dict):
+                    state.setdefault("signals", [])
+                    return state
+        except Exception as e:
+            print(f"  [signal_winrate_v777] load error: {e}")
+        return _signal_winrate_empty_state_v777()
+
+
+def _signal_winrate_save_v777(state):
+    with _signal_winrate_lock_v777:
+        signals = list((state or {}).get("signals") or [])
+        if len(signals) > SIGNAL_WINRATE_MAX_ROWS_V777:
+            signals = signals[-SIGNAL_WINRATE_MAX_ROWS_V777:]
+        payload = {"signals": signals, "updated_at": datetime.now(timezone.utc).isoformat()}
+        try:
+            with open(SIGNAL_WINRATE_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"  [signal_winrate_v777] save error: {e}")
+        return payload
+
+
+def _signal_winrate_parse_dt_v777(value):
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        except Exception:
+            dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _signal_winrate_interval_minutes_v777(interval):
+    key = str(interval or "")
+    if key in AUTO_SEND_INTERVALS:
+        return int(AUTO_SEND_INTERVALS[key].get("minutes") or 0)
+    if key.endswith("m"):
+        return int(key[:-1] or 0)
+    if key.endswith("h"):
+        return int(key[:-1] or 0) * 60
+    if key.endswith("d"):
+        return int(key[:-1] or 0) * 1440
+    return 0
+
+
+def _signal_winrate_price_v777(ticker):
+    price = _safe_float(get_price(ticker), None)
+    if price is None or not math.isfinite(price) or price <= 0:
+        raise ValueError(f"no valid price for {ticker}")
+    return float(price)
+
+
+def _signal_winrate_direction_from_data_v777(data):
+    direction = _simple_signal_decision(data or {})
+    return direction if direction in {"LONG", "SHORT"} else None
+
+
+def _signal_winrate_metrics_v777(candidate=None, data=None):
+    candidate = candidate or {}
+    data = data or candidate.get("data") or {}
+    plan = data.get("entry_plan") or candidate.get("entry_plan") or {}
+    metrics = candidate.get("auto_signal_metrics") or {}
+    return {
+        "entry_now": int(metrics.get("entry_now") or plan.get("entry_now_score") or plan.get("score") or 0),
+        "setup": int(metrics.get("setup") or plan.get("setup_score") or plan.get("score") or 0),
+        "confidence": int(metrics.get("confidence") or data.get("confidence") or 0),
+        "rr": _safe_float(metrics.get("rr") or plan.get("rr_now") or ((data.get("risk_levels") or {}).get("rr_ratio")), 0) or 0,
+        "strategy": str(candidate.get("strategy") or data.get("strategy") or ""),
+    }
+
+
+def _signal_winrate_same_pending_v777(state, chat_id, ticker, interval, direction):
+    for row in reversed(list((state or {}).get("signals") or [])):
+        if str(row.get("status") or "").upper() != "PENDING":
+            continue
+        if str(row.get("chat_id")) != str(chat_id):
+            continue
+        if str(row.get("ticker") or "").upper() != str(ticker or "").upper():
+            continue
+        if str(row.get("interval") or "") != str(interval or ""):
+            continue
+        if str(row.get("direction") or "").upper() != str(direction or "").upper():
+            continue
+        return row
+    return None
+
+
+def _signal_winrate_record_v777(chat_id, ticker, interval, direction, entry_price, source="signal", data=None, candidate=None):
+    ticker = str(ticker or "").upper()
+    interval = str(interval or "")
+    direction = str(direction or "").upper()
+    if direction not in {"LONG", "SHORT"}:
+        return None, False
+    minutes = _signal_winrate_interval_minutes_v777(interval)
+    if minutes <= 0:
+        return None, False
+    entry_price = _safe_float(entry_price, None)
+    if entry_price is None or entry_price <= 0:
+        return None, False
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    due_at = now + timedelta(minutes=minutes)
+    state = _signal_winrate_load_v777()
+    duplicate = _signal_winrate_same_pending_v777(state, chat_id, ticker, interval, direction)
+    if duplicate:
+        return duplicate, False
+    signal_id = f"{chat_id}:{ticker}:{interval}:{direction}:{int(now.timestamp())}"
+    metrics = _signal_winrate_metrics_v777(candidate=candidate, data=data)
+    row = {
+        "id": signal_id,
+        "chat_id": str(chat_id),
+        "ticker": ticker,
+        "interval": interval,
+        "direction": direction,
+        "source": str(source or "signal"),
+        "status": "PENDING",
+        "created_at": now.isoformat(),
+        "due_at": due_at.isoformat(),
+        "entry_price": float(entry_price),
+        "exit_price": None,
+        "move_pct": None,
+        "result_edge_pct": None,
+        "metrics": metrics,
+    }
+    state.setdefault("signals", []).append(row)
+    _signal_winrate_save_v777(state)
+    return row, True
+
+
+def _signal_winrate_record_candidate_v777(chat_id, candidate, source="auto_signal"):
+    candidate = candidate or {}
+    data = candidate.get("data") or {}
+    ticker = candidate.get("ticker")
+    interval = candidate.get("interval")
+    direction = str(candidate.get("direction") or _signal_winrate_direction_from_data_v777(data) or "").upper()
+    price = _safe_float(data.get("price"), None)
+    if price is None:
+        try:
+            price = _signal_winrate_price_v777(ticker)
+        except Exception:
+            price = None
+    return _signal_winrate_record_v777(chat_id, ticker, interval, direction, price, source=source, data=data, candidate=candidate)
+
+
+def _signal_winrate_record_data_v777(chat_id, ticker, interval, data, source="manual_signal"):
+    direction = _signal_winrate_direction_from_data_v777(data or {})
+    if not direction:
+        return None, False
+    price = _safe_float((data or {}).get("price"), None)
+    if price is None:
+        try:
+            price = _signal_winrate_price_v777(ticker)
+        except Exception:
+            price = None
+    return _signal_winrate_record_v777(chat_id, ticker, interval, direction, price, source=source, data=data)
+
+
+def _signal_winrate_evaluate_pending_v777(chat_id=None, now=None, limit=200):
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    state = _signal_winrate_load_v777()
+    due_rows = []
+    for row in list(state.get("signals") or []):
+        if str(row.get("status") or "").upper() != "PENDING":
+            continue
+        if chat_id is not None and str(row.get("chat_id")) != str(chat_id):
+            continue
+        if _signal_winrate_parse_dt_v777(row.get("due_at")) <= now:
+            due_rows.append(row)
+        if len(due_rows) >= int(limit):
+            break
+
+    if not due_rows:
+        return []
+
+    updates = {}
+    for row in due_rows:
+        row_id = row.get("id")
+        try:
+            exit_price = _signal_winrate_price_v777(row.get("ticker"))
+            entry_price = _safe_float(row.get("entry_price"), None)
+            if entry_price is None or entry_price <= 0:
+                raise ValueError("entry price is missing")
+            raw_pct = (exit_price - entry_price) / entry_price
+            direction = str(row.get("direction") or "").upper()
+            edge_pct = raw_pct if direction == "LONG" else -raw_pct
+            if edge_pct > SIGNAL_WINRATE_FLAT_PCT_V777:
+                status = "WIN"
+            elif edge_pct < -SIGNAL_WINRATE_FLAT_PCT_V777:
+                status = "LOSS"
+            else:
+                status = "FLAT"
+            updates[row_id] = {
+                "status": status,
+                "evaluated_at": now.isoformat(),
+                "exit_price": float(exit_price),
+                "move_pct": raw_pct * 100.0,
+                "result_edge_pct": edge_pct * 100.0,
+                "error": None,
+            }
+        except Exception as e:
+            updates[row_id] = {
+                "last_check_at": now.isoformat(),
+                "error": _ui_short_text(str(e), 160),
+            }
+
+    state = _signal_winrate_load_v777()
+    completed = []
+    for row in state.get("signals") or []:
+        upd = updates.get(row.get("id"))
+        if not upd:
+            continue
+        row.update(upd)
+        if row.get("status") in {"WIN", "LOSS", "FLAT"}:
+            completed.append(dict(row))
+    _signal_winrate_save_v777(state)
+    return completed
+
+
+def _signal_winrate_rows_v777(chat_id=None, limit=200, statuses=None):
+    statuses = {str(x).upper() for x in statuses} if statuses else None
+    rows = list((_signal_winrate_load_v777().get("signals") or []))
+    if chat_id is not None:
+        rows = [x for x in rows if str(x.get("chat_id")) == str(chat_id)]
+    if statuses:
+        rows = [x for x in rows if str(x.get("status") or "").upper() in statuses]
+    rows.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    return rows[: int(limit)]
+
+
+def _signal_winrate_stats_v777(chat_id=None):
+    rows = _signal_winrate_rows_v777(chat_id, limit=SIGNAL_WINRATE_MAX_ROWS_V777)
+    pending = [x for x in rows if str(x.get("status") or "").upper() == "PENDING"]
+    wins = [x for x in rows if str(x.get("status") or "").upper() == "WIN"]
+    losses = [x for x in rows if str(x.get("status") or "").upper() == "LOSS"]
+    flats = [x for x in rows if str(x.get("status") or "").upper() == "FLAT"]
+    counted = len(wins) + len(losses)
+    winrate = (len(wins) / counted * 100.0) if counted else None
+    avg_edge = None
+    evaluated = wins + losses + flats
+    if evaluated:
+        avg_edge = sum(_safe_float(x.get("result_edge_pct"), 0) or 0 for x in evaluated) / len(evaluated)
+    return {
+        "total": len(rows),
+        "pending": len(pending),
+        "wins": len(wins),
+        "losses": len(losses),
+        "flats": len(flats),
+        "counted": counted,
+        "winrate": winrate,
+        "avg_edge": avg_edge,
+        "last": rows[:8],
+    }
+
+
+def _signal_winrate_status_ru_v777(status):
+    return {
+        "PENDING": "ожидает проверки",
+        "WIN": "WIN",
+        "LOSS": "LOSS",
+        "FLAT": "FLAT",
+    }.get(str(status or "").upper(), str(status or "n/a"))
+
+
+def _signal_winrate_row_line_v777(row, include_price=True):
+    ticker = _ui_signal_symbol_v764(row.get("ticker")) if "_ui_signal_symbol_v764" in globals() else _ui_ticker_short(row.get("ticker"))
+    direction = str(row.get("direction") or "").upper()
+    tf = _ui_tf_short(row.get("interval"))
+    status = _signal_winrate_status_ru_v777(row.get("status"))
+    edge = row.get("result_edge_pct")
+    suffix = ""
+    if isinstance(edge, (int, float)):
+        suffix = f" | {edge:+.2f}%"
+    elif row.get("status") == "PENDING":
+        due = _signal_winrate_parse_dt_v777(row.get("due_at")).strftime("%H:%M UTC")
+        suffix = f" | проверка {due}"
+    price = ""
+    if include_price:
+        price = f" | вход {fmt_price(row.get('entry_price'), row.get('ticker'))}"
+    return f"• {ticker} {direction} {tf} | <b>{status}</b>{suffix}{price}"
+
+
+def format_signal_winrate_report_v777(chat_id, evaluate=True):
+    completed = _signal_winrate_evaluate_pending_v777(chat_id) if evaluate else []
+    stats = _signal_winrate_stats_v777(chat_id)
+    wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
+    avg = "н/д" if stats["avg_edge"] is None else f"{stats['avg_edge']:+.2f}%"
+    lines = [
+        "📊 <b>Win Rate сигналов</b>",
+        "",
+        "Режим: <b>только проверка сигналов</b>",
+        "Binance/Testnet ордера: <b>не отправляются</b>",
+        "",
+        f"Проверено: <b>{stats['counted']}</b> | Winrate: <b>{wr}</b>",
+        f"W/L/F: <b>{stats['wins']}/{stats['losses']}/{stats['flats']}</b> | avg edge: <b>{avg}</b>",
+        f"Ожидают проверки: <b>{stats['pending']}</b>",
+    ]
+    if completed:
+        lines += ["", "<b>Новые результаты:</b>"]
+        lines += [_signal_winrate_row_line_v777(row) for row in completed[:5]]
+    recent = _signal_winrate_rows_v777(chat_id, limit=8)
+    lines += ["", "<b>Последние сигналы:</b>"]
+    if recent:
+        lines += [_signal_winrate_row_line_v777(row) for row in recent[:8]]
+    else:
+        lines.append("Пока нет записанных LONG/SHORT сигналов.")
+    lines += [
+        "",
+        "Как считается: LONG выигрывает, если через свой TF цена выше входа. SHORT — если ниже. Почти ноль считается FLAT.",
+    ]
+    return "\n".join(lines)
+
+
+def _simple_format_open_positions(chat_id):
+    rows = _signal_winrate_rows_v777(chat_id, limit=20, statuses={"PENDING"})
+    lines = ["🕒 <b>Сигналы ожидают проверки</b>", ""]
+    if not rows:
+        lines.append("Ожидающих сигналов нет.")
+        return "\n".join(lines)
+    for row in rows[:12]:
+        lines.append(_signal_winrate_row_line_v777(row))
+    return "\n".join(lines)
+
+
+def _simple_format_closed_positions(chat_id):
+    return format_signal_winrate_report_v777(chat_id, evaluate=True)
+
+
+def _auto_signal_select_trade_candidate_v753(chat_id):
+    candidates, tried = _auto_signal_scan_candidates_v752(chat_id)
+    if not candidates:
+        return None, tried
+    candidates.sort(key=_auto_signal_candidate_score_v752, reverse=True)
+    return candidates[0], tried
+
+
+def build_auto_signals_message(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    _signal_winrate_evaluate_pending_v777(chat_id)
+    selected, _ = _auto_signal_select_trade_candidate_v753(chat_id)
+    if not selected:
+        return None
+    ticker = selected.get("ticker")
+    interval = selected.get("interval")
+    direction = str(selected.get("direction") or "").upper()
+    strategy = str(selected.get("strategy") or "")
+    signature = f"{ticker}:{interval}:{direction}:{strategy}:winrate_v777"
+    cooldown = AUTO_SIGNAL_DUPLICATE_COOLDOWN_MIN_V752 * 60
+    group_id = f"auto_signal_v777_{chat_id}"
+    if not should_send_signal(ticker, interval, signature, cooldown, group_id):
+        return None
+    record, created = _signal_winrate_record_candidate_v777(chat_id, selected, source="auto_signal")
+    if not created:
+        return None
+    data = selected.get("data") or {}
+    universe = _auto_signal_universe_label_v765() if "_auto_signal_universe_label_v765" in globals() else "crypto"
+    due = _signal_winrate_parse_dt_v777(record.get("due_at")).strftime("%H:%M UTC") if record else "n/a"
+    header = [
+        "🔔 <b>Авто-сигнал</b>",
+        f"Scan: <b>{len(_auto_signal_scan_tickers_v764())}</b> активов | каждые <b>5м</b>",
+        f"Universe: <b>{universe}</b>",
+        f"Win Rate: сигнал записан, проверка в <b>{due}</b>",
+        "",
+    ]
+    return "\n".join(header) + "\n" + format_signal_summary(data, ticker, interval)
+
+
+def paper_trader_cycle(chat_id, manual=False):
+    _simple_sync_public_auto_settings(chat_id)
+    completed = _signal_winrate_evaluate_pending_v777(chat_id)
+    lines = [
+        "📊 <b>Win Rate: проверка сигналов</b>",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d • %H:%M UTC"),
+        "",
+        "Ордера не отправляются. Бот только измеряет, был ли сигнал прав через свой TF.",
+    ]
+    if completed:
+        lines += ["", "<b>Новые результаты:</b>"]
+        lines += [_signal_winrate_row_line_v777(row) for row in completed[:5]]
+    if manual:
+        selected, tried = _auto_signal_select_trade_candidate_v753(chat_id)
+        if selected:
+            record, created = _signal_winrate_record_candidate_v777(chat_id, selected, source="manual_scan")
+            data = selected.get("data") or {}
+            lines += [
+                "",
+                "<b>Новый скан:</b>",
+                "Записал новый сигнал." if created else "Такой сигнал уже ожидает проверки.",
+                _signal_winrate_row_line_v777(record) if record else "",
+                "",
+                format_signal_summary(data, selected.get("ticker"), selected.get("interval")),
+            ]
+        else:
+            lines += ["", "<b>Новый скан:</b>", "Уверенного LONG/SHORT сейчас нет."]
+            best = _format_scan_rows(tried)
+            if best:
+                lines += ["", "<b>Ближайшие идеи:</b>"] + best[:3]
+    if not manual and not completed:
+        return None
+    if not manual:
+        stats = _signal_winrate_stats_v777(chat_id)
+        wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
+        lines += ["", f"Текущий Win Rate: <b>{wr}</b> | ждут: <b>{stats['pending']}</b>"]
+    return "\n".join([x for x in lines if x is not None])
+
+
+def format_autobot_menu(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    return format_signal_winrate_report_v777(chat_id, evaluate=True)
+
+
+def autobot_keyboard(chat_id):
+    return {"inline_keyboard": [
+        [
+            {"text": "▶️ Проверить сейчас", "callback_data": "paper_run_now"},
+            {"text": "🕒 Ожидают", "callback_data": "paper_open_positions"},
+        ],
+        [
+            {"text": "📒 Отчёт", "callback_data": "paper_closed_menu"},
+            {"text": "⚙️ Уведомления", "callback_data": "auto_settings"},
+        ],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def paper_trader_keyboard(chat_id):
+    return autobot_keyboard(chat_id)
+
+
+def main_keyboard():
+    return {"inline_keyboard": [
+        [
+            {"text": "📡 Сигнал", "callback_data": "menu_signal"},
+            {"text": "📊 Win Rate", "callback_data": "menu_autobot"},
+        ],
+        [
+            {"text": "⚙️ Уведомления", "callback_data": "auto_settings"},
+            {"text": "🏠 Обновить меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def format_main_status(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
+    sig = _get_auto_task_settings(chat_id, "signals")
+    tracker = _get_auto_task_settings(chat_id, "paper_trader")
+    stats = _signal_winrate_stats_v777(chat_id)
+    wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
+    return "\n".join([
+        "🏠 <b>Главное меню</b>",
+        "",
+        f"Сигнал: <b>{_ui_signal_symbol_v764(ticker)}</b> | TF <b>{_ui_tf_short(interval)}</b>",
+        f"Авто: <b>{auto_state}</b>",
+        f"Win Rate: <b>{wr}</b> | проверено <b>{stats['counted']}</b> | ждут <b>{stats['pending']}</b>",
+        "",
+        "<b>Уведомления:</b>",
+        f"• Авто-сигналы: <b>{'ON' if sig.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | 5м | только LONG/SHORT",
+        f"• Проверка Win Rate: <b>{'ON' if tracker.get('enabled') and chat_id in auto_chat_ids else 'OFF'}</b> | каждые 5м",
+    ])
+
+
+def _simple_sync_public_auto_settings(chat_id):
+    _base_simple_sync_public_auto_settings_v776_for_v777(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    sig["enabled"] = bool(sig.get("enabled", True))
+    sig["send_interval"] = "5m"
+    sig["tf"] = None
+    tracker = _get_auto_task_settings(chat_id, "paper_trader")
+    tracker["enabled"] = bool(tracker.get("enabled", True))
+    tracker["send_interval"] = "5m"
+    tracker["tf"] = None
+
+
+def _task_status_line(chat_id, task_key):
+    if task_key == "paper_trader":
+        st = _get_auto_task_settings(chat_id, "paper_trader")
+        enabled = "ON" if st.get("enabled") else "OFF"
+        stats = _signal_winrate_stats_v777(chat_id)
+        wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
+        return f"📊 Win Rate: <b>{enabled}</b> | 5м | WR {wr} | ждут {stats['pending']}"
+    if task_key == "signals":
+        st = _get_auto_task_settings(chat_id, "signals")
+        enabled = "ON" if st.get("enabled") else "OFF"
+        return f"📡 Авто-сигналы: <b>{enabled}</b> | 5м | записываются в Win Rate"
+    return _base_task_status_line_v776_for_v777(chat_id, task_key)
+
+
+def auto_settings_text(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    tracker = _get_auto_task_settings(chat_id, "paper_trader")
+    return "\n".join([
+        "⚙️ <b>Уведомления</b>",
+        "",
+        f"Общий статус: <b>{'ON' if chat_id in auto_chat_ids else 'OFF'}</b>",
+        f"• Авто-сигналы: <b>{'ON' if sig.get('enabled') else 'OFF'}</b> | каждые 5м",
+        f"• Win Rate проверка: <b>{'ON' if tracker.get('enabled') else 'OFF'}</b> | каждые 5м",
+        "",
+        "Авто-сигнал отправляет только уверенные LONG/SHORT и сразу записывает их для проверки.",
+        "Через TF сигнала бот проверяет направление и обновляет winrate.",
+    ])
+
+
+def auto_settings_keyboard(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    tracker = _get_auto_task_settings(chat_id, "paper_trader")
+    return {"inline_keyboard": [
+        [{"text": "⛔ Отключить всё" if chat_id in auto_chat_ids else "✅ Включить всё", "callback_data": "toggle_auto"}],
+        [{"text": f"📡 Авто-сигналы: {'ON' if sig.get('enabled') else 'OFF'}", "callback_data": "auto_task_signals"}],
+        [{"text": f"📊 Win Rate: {'ON' if tracker.get('enabled') else 'OFF'}", "callback_data": "auto_task_paper_trader"}],
+        [{"text": "◀️ Win Rate", "callback_data": "menu_autobot"}],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def auto_task_keyboard(chat_id, task_key):
+    _simple_sync_public_auto_settings(chat_id)
+    if task_key == "paper_trader":
+        st = _get_auto_task_settings(chat_id, "paper_trader")
+        return {"inline_keyboard": [
+            [{"text": "⛔ Выключить" if st.get("enabled") else "✅ Включить", "callback_data": "auto_tog_paper_trader"}],
+            [{"text": "⏰ Проверка: 5м", "callback_data": "auto_task_paper_trader"}],
+            [{"text": "◀️ Уведомления", "callback_data": "auto_settings"}],
+            [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+        ]}
+    return _base_auto_task_keyboard_v776_for_v777(chat_id, task_key)
+
+
+def build_auto_task_message(chat_id, task_key):
+    _simple_sync_public_auto_settings(chat_id)
+    if task_key == "paper_trader":
+        return paper_trader_cycle(chat_id, manual=False)
+    if task_key == "signals":
+        return build_auto_signals_message(chat_id)
+    return _base_build_auto_task_message_v776_for_v777(chat_id, task_key)
+
+
+async def _render_signal_v732(session, update, chat_id):
+    interval = user_intervals.get(chat_id, "15m")
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    loading = "\n".join([
+        "📡 <b>Сигнал</b>",
+        "",
+        f"Актив: <b>{_ui_signal_symbol_v764(ticker)}</b>",
+        f"TF: <b>{_ui_tf_short(interval)}</b>",
+        "",
+        "Анализирую рынок...",
+    ])
+    await send_or_edit(session, update, loading, compact_signal_keyboard())
+    try:
+        data = await asyncio.to_thread(full_analyze, ticker, interval)
+        _cache_signal_data(chat_id, ticker, interval, data)
+        text = format_msg(data, ticker, interval)
+        record, created = _signal_winrate_record_data_v777(chat_id, ticker, interval, data, source="manual_signal")
+        if record and created:
+            due = _signal_winrate_parse_dt_v777(record.get("due_at")).strftime("%H:%M UTC")
+            text += f"\n\n📊 Win Rate: сигнал записан, проверка в <b>{due}</b>."
+        await send_or_edit(session, update, text, compact_signal_keyboard())
+    except Exception as e:
+        import traceback
+        print(f"  [signal_v777] error: {traceback.format_exc()}")
+        await send_or_edit(session, update, f"❌ Ошибка анализа: {_ui_html(e)}", signal_menu_keyboard(chat_id))
+
+
+async def async_handle_update(session, update, sem):
+    if "callback_query" in update:
+        cb = update["callback_query"]
+        data = cb.get("data", "")
+        chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+        callback_id = cb.get("id")
+        if data in {"menu_autobot", "paper_trader"}:
+            await _answer_callback_once_v732(session, callback_id, "Win Rate")
+            await send_or_edit(session, update, format_autobot_menu(chat_id), autobot_keyboard(chat_id))
+            return
+        if data == "paper_run_now":
+            await _answer_callback_once_v732(session, callback_id, "Проверка")
+            await send_or_edit(session, update, "📊 <b>Win Rate</b>\n\nПроверяю истёкшие сигналы и ищу новый уверенный сигнал...", autobot_keyboard(chat_id))
+            msg = await asyncio.to_thread(paper_trader_cycle, chat_id, True)
+            await send_or_edit(session, update, msg, autobot_keyboard(chat_id))
+            return
+        if data == "paper_open_positions":
+            await _answer_callback_once_v732(session, callback_id, "Ожидают")
+            await send_or_edit(session, update, _simple_format_open_positions(chat_id), autobot_keyboard(chat_id))
+            return
+        if data in {"paper_closed_menu", "paper_closed_win", "paper_closed_loss"}:
+            await _answer_callback_once_v732(session, callback_id, "Отчёт")
+            await send_or_edit(session, update, _simple_format_closed_positions(chat_id), autobot_keyboard(chat_id))
+            return
+    await _base_async_handle_update_v776_for_v777(session, update, sem)
+
+
+BOT_VERSION_LABEL = "v7.77 Signal Win Rate Tracker"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -26594,6 +27241,7 @@ RUNTIME_LAYERS = [
     ("v7.74", "auto-signals execute the same Binance Testnet candidate and explain outcomes in plain language"),
     ("v7.75", "Binance Testnet protection sends one SL and one TP only"),
     ("v7.76", "human-readable Demo Trade Report with local technical details hidden"),
+    ("v7.77", "signal Win Rate tracker replaces public demo trading execution"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -26695,6 +27343,10 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "humanize_testnet_reason": _humanize_testnet_reason_v774,
     "synced_testnet_signal_candidate": _synced_testnet_signal_candidate_v774,
     "testnet_protection_labels": testnet_protection_labels_v775,
+    "signal_winrate_record": _signal_winrate_record_v777,
+    "signal_winrate_evaluate_pending": _signal_winrate_evaluate_pending_v777,
+    "signal_winrate_stats": _signal_winrate_stats_v777,
+    "format_signal_winrate_report": format_signal_winrate_report_v777,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,

@@ -15,6 +15,18 @@ class TelegramUiPolishTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.bot = load_bot_module(reload=True)
 
+    def setUp(self) -> None:
+        self._tmp_signal_winrate = tempfile.TemporaryDirectory()
+        self._old_signal_winrate_file = self.bot.SIGNAL_WINRATE_STATE_FILE
+        self.bot.SIGNAL_WINRATE_STATE_FILE = os.path.join(
+            self._tmp_signal_winrate.name,
+            "signal_winrate_state.json",
+        )
+
+    def tearDown(self) -> None:
+        self.bot.SIGNAL_WINRATE_STATE_FILE = self._old_signal_winrate_file
+        self._tmp_signal_winrate.cleanup()
+
     def test_main_keyboard_keeps_expected_callbacks(self) -> None:
         rows = self.bot.main_keyboard()["inline_keyboard"]
         callbacks = {button["callback_data"] for row in rows for button in row}
@@ -26,7 +38,7 @@ class TelegramUiPolishTests(unittest.TestCase):
     def test_autobot_keyboard_uses_existing_callbacks(self) -> None:
         rows = self.bot.autobot_keyboard(987654321)["inline_keyboard"]
         callbacks = {button["callback_data"] for row in rows for button in row}
-        for callback in {"paper_run_now", "paper_open_positions", "paper_closed_menu", "auto_settings", "runtime_diagnostics", "testnet_last_attempt", "back_main"}:
+        for callback in {"paper_run_now", "paper_open_positions", "paper_closed_menu", "auto_settings", "back_main"}:
             self.assertIn(callback, callbacks)
         for hidden in {"setup_analytics", "prob_calibration", "bot_quality", "execution_status", "live_readiness"}:
             self.assertNotIn(hidden, callbacks)
@@ -268,10 +280,15 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("Авто-сигнал", msg)
         self.assertIn("BTCUSDT", msg)
         self.assertIn("LONG", msg)
+        self.assertIn("Win Rate", msg)
         self.assertNotIn("WAIT", msg.splitlines()[0])
-        self.assertEqual(len(submit_calls), 1)
+        self.assertEqual(len(submit_calls), 0)
+        rows = self.bot._signal_winrate_rows_v777("auto-ready-v752", limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ticker"], "BTCUSDT")
+        self.assertEqual(rows[0]["status"], "PENDING")
 
-    def test_auto_signal_is_silent_when_demo_trade_gate_blocks_candidate(self) -> None:
+    def test_auto_signal_records_even_when_demo_trade_gate_would_block_candidate(self) -> None:
         old_tickers = self.bot.PAPER_TRADER_SCAN_TICKERS
         old_tfs = self.bot.AUTO_SIGNAL_SCAN_TFS_V752
         old_paper_tfs = self.bot.PAPER_TRADER_TFS
@@ -338,10 +355,40 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._build_testnet_trade_plan_v734 = old_plan
             self.bot._auto_signal_scan_tickers_v764 = old_auto_tickers
 
-        self.assertIsNone(msg)
+        self.assertIsNotNone(msg)
+        self.assertIn("XRPUSDT", msg)
+        self.assertIn("Win Rate", msg)
+        rows = self.bot._signal_winrate_rows_v777("auto-blocked-v753", limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["direction"], "SHORT")
+
+    def test_signal_winrate_evaluates_direction_after_own_timeframe(self) -> None:
+        row, created = self.bot._signal_winrate_record_v777(
+            "wr-chat",
+            "BTCUSDT",
+            "5m",
+            "LONG",
+            100.0,
+            source="unit",
+        )
+        self.assertTrue(created)
+        old_price = self.bot.get_price
+        try:
+            self.bot.get_price = lambda ticker: 101.0
+            due = self.bot._signal_winrate_parse_dt_v777(row["due_at"])
+            completed = self.bot._signal_winrate_evaluate_pending_v777("wr-chat", now=due)
+        finally:
+            self.bot.get_price = old_price
+
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["status"], "WIN")
+        self.assertGreater(completed[0]["result_edge_pct"], 0)
+        stats = self.bot._signal_winrate_stats_v777("wr-chat")
+        self.assertEqual(stats["wins"], 1)
+        self.assertEqual(stats["winrate"], 100.0)
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.76 Human Demo Trade Report")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.77 Signal Win Rate Tracker")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -366,6 +413,10 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("synced_testnet_signal_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_protection_labels", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_lifecycle_public_status", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("signal_winrate_record", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("signal_winrate_evaluate_pending", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("signal_winrate_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("format_signal_winrate_report", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_exploration_data_block", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("nyse_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("commodities_market_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -425,6 +476,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.74" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.75" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.76" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.77" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -1030,8 +1082,8 @@ class TelegramUiPolishTests(unittest.TestCase):
 
     def test_testnet_only_menu_hides_paper_language(self) -> None:
         text = self.bot.format_autobot_menu(987654321)
-        self.assertIn("Binance Testnet", text)
-        self.assertIn("Binance:", text)
+        self.assertIn("Win Rate", text)
+        self.assertIn("ордера: <b>не отправляются</b>", text)
         self.assertNotIn("Paper-", text)
         self.assertNotIn("paper-", text)
         self.assertNotIn("Paper Trader", text)
@@ -1061,7 +1113,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_ui_cache_v768.clear()
             self.bot._testnet_ui_cache_v768.update(old_cache)
 
-        self.assertIn("Testnet", text)
+        self.assertIn("Win Rate", text)
         self.assertEqual(calls, {"open": 0, "income": 0})
 
     def test_closed_trade_button_uses_local_lifecycle_without_rebuild(self) -> None:
@@ -1075,19 +1127,23 @@ class TelegramUiPolishTests(unittest.TestCase):
             raise AssertionError("closed report button should not rebuild lifecycle")
 
         try:
-            self.bot._testnet_lifecycle_load_v740 = lambda: {
-                "trades": [
+            self.bot._signal_winrate_save_v777({
+                "signals": [
                     {
-                        "plan_id": "p1",
+                        "id": "s1",
+                        "chat_id": "987654321",
                         "ticker": "BTCUSDT",
-                        "direction": "long",
+                        "direction": "LONG",
                         "interval": "15m",
                         "created_at": "2026-06-04T00:00:00+00:00",
-                        "status": "PLANNED",
-                        "pnl": {"status": "UNATTRIBUTED"},
+                        "due_at": "2026-06-04T00:15:00+00:00",
+                        "status": "WIN",
+                        "entry_price": 100.0,
+                        "exit_price": 101.0,
+                        "result_edge_pct": 1.0,
                     }
                 ]
-            }
+            })
             self.bot._execution_last_plans_v715 = lambda chat_id, limit=500: [{"plan_id": "p1"}]
             self.bot.rebuild_testnet_lifecycle_v740 = fail_rebuild
             text = self.bot._simple_format_closed_positions(987654321)
@@ -1096,7 +1152,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._execution_last_plans_v715 = old_plans
             self.bot.rebuild_testnet_lifecycle_v740 = old_rebuild
 
-        self.assertIn("Demo Trade Report", text)
+        self.assertIn("Win Rate", text)
         self.assertIn("BTC", text)
         self.assertEqual(calls["rebuild"], 0)
 
@@ -1269,8 +1325,8 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._recent_testnet_monitor_events_v730 = old_monitor
             self.bot._testnet_connection_status_v740 = old_connection
 
-        self.assertIn("Закрытые сделки бота: <b>0</b>", text)
-        self.assertIn("Winrate / PnL: <b>н/д</b>", text)
+        self.assertIn("Win Rate", text)
+        self.assertIn("Winrate: <b>н/д</b>", text)
         self.assertNotIn("+12.340 USDT", text)
 
     def test_connection_line_is_explicit(self) -> None:
@@ -1302,6 +1358,36 @@ class TelegramUiPolishTests(unittest.TestCase):
                 "signed_ok": True,
                 "reason": "ok",
             }
+            self.bot._signal_winrate_save_v777({
+                "signals": [
+                    {
+                        "id": "w1",
+                        "chat_id": "987654321",
+                        "ticker": "BTCUSDT",
+                        "direction": "LONG",
+                        "interval": "15m",
+                        "created_at": "2026-06-04T00:00:00+00:00",
+                        "due_at": "2026-06-04T00:15:00+00:00",
+                        "status": "WIN",
+                        "entry_price": 100.0,
+                        "exit_price": 101.0,
+                        "result_edge_pct": 1.0,
+                    },
+                    {
+                        "id": "l1",
+                        "chat_id": "987654321",
+                        "ticker": "ETHUSDT",
+                        "direction": "SHORT",
+                        "interval": "30m",
+                        "created_at": "2026-06-04T00:00:00+00:00",
+                        "due_at": "2026-06-04T00:30:00+00:00",
+                        "status": "LOSS",
+                        "entry_price": 100.0,
+                        "exit_price": 101.0,
+                        "result_edge_pct": -1.0,
+                    },
+                ]
+            })
             text = self.bot.format_autobot_menu(987654321)
         finally:
             self.bot._testnet_open_positions_v734 = old_open
@@ -1310,7 +1396,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_connection_status_v740 = old_connection
 
         self.assertIn("Winrate: <b>50.0%</b>", text)
-        self.assertIn("+1.500 USDT", text)
+        self.assertIn("W/L/F: <b>1/1/0</b>", text)
         self.assertNotIn("+999.000 USDT", text)
 
     def test_lifecycle_report_is_compact_and_user_facing(self) -> None:
