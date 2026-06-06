@@ -27326,6 +27326,20 @@ def _ui_rule_v779():
     return "───────────────────"
 
 
+def _ui_score_bar_v780(value, width=10):
+    score = _safe_float(value, 0) or 0
+    score = max(0.0, min(100.0, float(score)))
+    width = max(4, int(width))
+    filled = int(round(score / 100.0 * width))
+    if score >= 75:
+        block = "🟩"
+    elif score >= 50:
+        block = "🟨"
+    else:
+        block = "🟥"
+    return block * filled + "⬜" * (width - filled)
+
+
 def _ui_code_v779(value):
     return f"<code>{_ui_html(value)}</code>"
 
@@ -27417,9 +27431,11 @@ def format_signal_summary(data, ticker, interval):
         _ui_rule_v779(),
         f"{emoji} <b>ВЕРДИКТ: {_ui_html(decision)}</b>",
         f"Идея: <b>{_ui_html(idea_direction)}</b> | Статус: <b>{_ui_html(_ui_status_human_v779(status))}</b>",
-        f"Сила паттерна: <b>{setup_score}/100</b>",
+        f"Сила паттерна: <b>{setup_score}/100</b> {_ui_score_bar_v780(setup_score)}",
         f"Текущий вход: <b>{_ui_html(_ui_decision_sentence_v779(status, decision, entry_now))}</b>",
-        f"Confidence: <b>{confidence}/100</b> | Вероятность: <b>{_ui_probability_text_v779(data, decision)}</b>",
+        f"EntryNow: <b>{entry_now}/100</b> {_ui_score_bar_v780(entry_now)}",
+        f"Confidence: <b>{confidence}/100</b> {_ui_score_bar_v780(confidence)}",
+        f"Вероятность: <b>{_ui_probability_text_v779(data, decision)}</b>",
         _ui_rule_v779(),
         source_line,
         f"Цена: {_ui_money_code_v779(price, ticker)}",
@@ -27839,14 +27855,14 @@ def format_main_status(chat_id):
         "🏠 <b>Главное меню</b>",
         _ui_rule_v779(),
         f"Актив: {_ui_code_v779(_ui_signal_symbol_v764(ticker))} | TF {_ui_code_v779(_ui_tf_short(interval))}",
-        f"Авто: <b>{auto_state}</b> | Win Rate: <b>{wr}</b>",
+        f"Авто: <b>{auto_state}</b> | Win Rate: <b>{wr}</b> {_signal_winrate_bar_v779(stats.get('winrate'))}",
         f"Проверено: <b>{stats['counted']}</b> | На проверке: <b>{stats['pending']}</b>",
         "",
         "Выбери действие ниже.",
     ])
 
 
-BOT_VERSION_LABEL = "v7.79 Telegram UI Specification Polish"
+BOT_VERSION_LABEL = "v7.80 Visual Signal Score Bars"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -27952,6 +27968,7 @@ RUNTIME_LAYERS = [
     ("v7.77", "signal Win Rate tracker replaces public demo trading execution"),
     ("v7.78", "signal Win Rate breakdown by ticker, timeframe and direction"),
     ("v7.79", "Telegram UI specification polish for menus, signal cards, scans and Win Rate"),
+    ("v7.80", "visual progress bars for signal scores and main Win Rate status"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
