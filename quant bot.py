@@ -26856,6 +26856,163 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
+# ============================================================
+# v7.78 - SIGNAL WIN RATE BREAKDOWN
+# ============================================================
+# Adds useful analytics to the public Win Rate report: grouped statistics by
+# ticker, timeframe and direction. Small samples are explicitly marked, so the
+# bot does not pretend that one lucky signal proves a setup is strong.
+
+_base_format_signal_winrate_report_v777_for_v778 = format_signal_winrate_report_v777
+
+SIGNAL_WINRATE_MIN_BUCKET_SAMPLES_V778 = int(os.getenv("SIGNAL_WINRATE_MIN_BUCKET_SAMPLES", "5"))
+
+
+def _signal_winrate_evaluated_rows_v778(chat_id=None):
+    return _signal_winrate_rows_v777(chat_id, limit=SIGNAL_WINRATE_MAX_ROWS_V777, statuses={"WIN", "LOSS", "FLAT"})
+
+
+def _signal_winrate_bucket_label_v778(row, group):
+    if group == "ticker":
+        return _ui_signal_symbol_v764(row.get("ticker")) if "_ui_signal_symbol_v764" in globals() else _ui_ticker_short(row.get("ticker"))
+    if group == "tf":
+        return _ui_tf_short(row.get("interval"))
+    if group == "direction":
+        return str(row.get("direction") or "n/a").upper()
+    if group == "strategy":
+        metrics = row.get("metrics") or {}
+        return str(metrics.get("strategy") or "unknown")
+    return str(row.get(group) or "n/a")
+
+
+def _signal_winrate_bucket_stats_v778(chat_id=None, group="ticker", limit=6):
+    buckets = {}
+    for row in _signal_winrate_evaluated_rows_v778(chat_id):
+        label = _signal_winrate_bucket_label_v778(row, group)
+        item = buckets.setdefault(label, {"label": label, "wins": 0, "losses": 0, "flats": 0, "edges": []})
+        status = str(row.get("status") or "").upper()
+        if status == "WIN":
+            item["wins"] += 1
+        elif status == "LOSS":
+            item["losses"] += 1
+        elif status == "FLAT":
+            item["flats"] += 1
+        edge = _safe_float(row.get("result_edge_pct"), None)
+        if edge is not None and math.isfinite(edge):
+            item["edges"].append(float(edge))
+
+    rows = []
+    for item in buckets.values():
+        counted = item["wins"] + item["losses"]
+        evaluated = counted + item["flats"]
+        winrate = (item["wins"] / counted * 100.0) if counted else None
+        avg_edge = (sum(item["edges"]) / len(item["edges"])) if item["edges"] else None
+        rows.append({
+            "label": item["label"],
+            "wins": item["wins"],
+            "losses": item["losses"],
+            "flats": item["flats"],
+            "counted": counted,
+            "evaluated": evaluated,
+            "winrate": winrate,
+            "avg_edge": avg_edge,
+        })
+
+    def sort_key(bucket):
+        enough = bucket["counted"] >= SIGNAL_WINRATE_MIN_BUCKET_SAMPLES_V778
+        wr = bucket["winrate"] if bucket["winrate"] is not None else -1.0
+        avg = bucket["avg_edge"] if bucket["avg_edge"] is not None else -999.0
+        return (1 if enough else 0, wr, avg, bucket["counted"], bucket["evaluated"])
+
+    rows.sort(key=sort_key, reverse=True)
+    return rows[: int(limit)]
+
+
+def _signal_winrate_bucket_quality_v778(bucket):
+    counted = int((bucket or {}).get("counted") or 0)
+    winrate = bucket.get("winrate")
+    avg_edge = bucket.get("avg_edge")
+    if counted < SIGNAL_WINRATE_MIN_BUCKET_SAMPLES_V778:
+        return "данных мало"
+    if winrate is not None and winrate >= 60 and (avg_edge is None or avg_edge >= 0):
+        return "сильнее"
+    if winrate is not None and winrate <= 45:
+        return "слабее"
+    if avg_edge is not None and avg_edge < -0.15:
+        return "слабее"
+    return "нейтрально"
+
+
+def _signal_winrate_bucket_line_v778(bucket):
+    wr = "н/д" if bucket.get("winrate") is None else f"{bucket['winrate']:.1f}%"
+    avg = "н/д" if bucket.get("avg_edge") is None else f"{bucket['avg_edge']:+.2f}%"
+    quality = _signal_winrate_bucket_quality_v778(bucket)
+    return (
+        f"• <b>{_ui_html(bucket.get('label'))}</b>: WR <b>{wr}</b> | "
+        f"W/L/F {bucket.get('wins', 0)}/{bucket.get('losses', 0)}/{bucket.get('flats', 0)} | "
+        f"avg {avg} | {quality}"
+    )
+
+
+def _signal_winrate_section_lines_v778(title, buckets):
+    lines = [f"<b>{title}</b>"]
+    if not buckets:
+        lines.append("• данных пока нет")
+        return lines
+    lines.extend(_signal_winrate_bucket_line_v778(bucket) for bucket in buckets[:4])
+    return lines
+
+
+def _signal_winrate_summary_note_v778(stats):
+    if int(stats.get("counted") or 0) < SIGNAL_WINRATE_MIN_BUCKET_SAMPLES_V778:
+        return "Выводы пока осторожные: сигналов мало, статистика ещё может сильно прыгать."
+    if stats.get("winrate") is not None and stats["winrate"] >= 60 and (stats.get("avg_edge") or 0) >= 0:
+        return "Пока статистика выглядит лучше случайной, но риск всё равно считать отдельно."
+    if stats.get("winrate") is not None and stats["winrate"] <= 45:
+        return "Пока статистика слабая: такие сигналы лучше разбирать, а не усиливать риск."
+    return "Статистика смешанная: нужен больший журнал по тикерам и TF."
+
+
+def format_signal_winrate_report_v777(chat_id, evaluate=True):
+    completed = _signal_winrate_evaluate_pending_v777(chat_id) if evaluate else []
+    stats = _signal_winrate_stats_v777(chat_id)
+    wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
+    avg = "н/д" if stats["avg_edge"] is None else f"{stats['avg_edge']:+.2f}%"
+    lines = [
+        "📊 <b>Win Rate сигналов</b>",
+        "",
+        "Режим: <b>только проверка сигналов</b>",
+        "Binance/Testnet ордера: <b>не отправляются</b>",
+        "",
+        f"Проверено: <b>{stats['counted']}</b> | Winrate: <b>{wr}</b>",
+        f"W/L/F: <b>{stats['wins']}/{stats['losses']}/{stats['flats']}</b> | avg edge: <b>{avg}</b>",
+        f"Ожидают проверки: <b>{stats['pending']}</b>",
+        f"Итог: {_ui_html(_signal_winrate_summary_note_v778(stats))}",
+    ]
+    if completed:
+        lines += ["", "<b>Новые результаты:</b>"]
+        lines += [_signal_winrate_row_line_v777(row) for row in completed[:4]]
+
+    ticker_rows = _signal_winrate_bucket_stats_v778(chat_id, "ticker", 4)
+    tf_rows = _signal_winrate_bucket_stats_v778(chat_id, "tf", 4)
+    direction_rows = _signal_winrate_bucket_stats_v778(chat_id, "direction", 3)
+    lines += ["", *_signal_winrate_section_lines_v778("По активам", ticker_rows)]
+    lines += ["", *_signal_winrate_section_lines_v778("По TF", tf_rows)]
+    lines += ["", *_signal_winrate_section_lines_v778("По направлению", direction_rows)]
+
+    recent = _signal_winrate_rows_v777(chat_id, limit=5)
+    lines += ["", "<b>Последние сигналы:</b>"]
+    if recent:
+        lines += [_signal_winrate_row_line_v777(row) for row in recent[:5]]
+    else:
+        lines.append("Пока нет записанных LONG/SHORT сигналов.")
+    lines += [
+        "",
+        "Как считается: LONG выигрывает, если через свой TF цена выше входа. SHORT — если ниже. Почти ноль считается FLAT.",
+    ]
+    return "\n".join(lines)
+
+
 def _simple_format_open_positions(chat_id):
     rows = _signal_winrate_rows_v777(chat_id, limit=20, statuses={"PENDING"})
     lines = ["🕒 <b>Сигналы ожидают проверки</b>", ""]
@@ -27138,7 +27295,7 @@ async def async_handle_update(session, update, sem):
     await _base_async_handle_update_v776_for_v777(session, update, sem)
 
 
-BOT_VERSION_LABEL = "v7.77 Signal Win Rate Tracker"
+BOT_VERSION_LABEL = "v7.78 Signal Win Rate Breakdown"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -27242,6 +27399,7 @@ RUNTIME_LAYERS = [
     ("v7.75", "Binance Testnet protection sends one SL and one TP only"),
     ("v7.76", "human-readable Demo Trade Report with local technical details hidden"),
     ("v7.77", "signal Win Rate tracker replaces public demo trading execution"),
+    ("v7.78", "signal Win Rate breakdown by ticker, timeframe and direction"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -27346,6 +27504,7 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "signal_winrate_record": _signal_winrate_record_v777,
     "signal_winrate_evaluate_pending": _signal_winrate_evaluate_pending_v777,
     "signal_winrate_stats": _signal_winrate_stats_v777,
+    "signal_winrate_bucket_stats": _signal_winrate_bucket_stats_v778,
     "format_signal_winrate_report": format_signal_winrate_report_v777,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,

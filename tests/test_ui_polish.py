@@ -387,8 +387,64 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertEqual(stats["wins"], 1)
         self.assertEqual(stats["winrate"], 100.0)
 
+    def test_signal_winrate_report_breaks_down_by_ticker_tf_and_direction(self) -> None:
+        self.bot._signal_winrate_save_v777({
+            "signals": [
+                {
+                    "id": "btc-win-1",
+                    "chat_id": "wr-breakdown",
+                    "ticker": "BTCUSDT",
+                    "direction": "LONG",
+                    "interval": "15m",
+                    "created_at": "2026-06-04T00:00:00+00:00",
+                    "due_at": "2026-06-04T00:15:00+00:00",
+                    "status": "WIN",
+                    "entry_price": 100.0,
+                    "exit_price": 101.0,
+                    "result_edge_pct": 1.0,
+                },
+                {
+                    "id": "btc-win-2",
+                    "chat_id": "wr-breakdown",
+                    "ticker": "BTCUSDT",
+                    "direction": "LONG",
+                    "interval": "15m",
+                    "created_at": "2026-06-04T01:00:00+00:00",
+                    "due_at": "2026-06-04T01:15:00+00:00",
+                    "status": "WIN",
+                    "entry_price": 100.0,
+                    "exit_price": 102.0,
+                    "result_edge_pct": 2.0,
+                },
+                {
+                    "id": "eth-loss",
+                    "chat_id": "wr-breakdown",
+                    "ticker": "ETHUSDT",
+                    "direction": "SHORT",
+                    "interval": "30m",
+                    "created_at": "2026-06-04T02:00:00+00:00",
+                    "due_at": "2026-06-04T02:30:00+00:00",
+                    "status": "LOSS",
+                    "entry_price": 100.0,
+                    "exit_price": 101.0,
+                    "result_edge_pct": -1.0,
+                },
+            ]
+        })
+
+        text = self.bot.format_signal_winrate_report_v777("wr-breakdown", evaluate=False)
+
+        self.assertIn("По активам", text)
+        self.assertIn("По TF", text)
+        self.assertIn("По направлению", text)
+        self.assertIn("BTCUSDT", text)
+        self.assertIn("15м", text)
+        self.assertIn("LONG", text)
+        self.assertIn("данных мало", text)
+        self.assertIn("W/L/F: <b>2/1/0</b>", text)
+
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.77 Signal Win Rate Tracker")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.78 Signal Win Rate Breakdown")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -416,6 +472,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("signal_winrate_record", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("signal_winrate_evaluate_pending", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("signal_winrate_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("signal_winrate_bucket_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("format_signal_winrate_report", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_exploration_data_block", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("nyse_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -477,6 +534,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.75" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.76" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.77" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.78" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -507,47 +565,55 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("submit_testnet_trade", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
 
     def test_demo_cycle_uses_plain_human_execution_language(self) -> None:
-        old_selector = self.bot._synced_testnet_signal_candidate_v774
-        old_submit = self.bot._submit_testnet_trade_v734
-        old_stats = self.bot._testnet_stats_line_v734
-        old_attempts = self.bot._testnet_today_attempts_label_v772
+        old_selector = self.bot._auto_signal_select_trade_candidate_v753
+        old_price = self.bot.get_price
         try:
+            data = {
+                "signal": "LONG",
+                "direction": "long",
+                "price": 100.0,
+                "confidence": 82,
+                "prob": 0.68,
+                "bull_args": ["test"],
+                "bear_args": ["test"],
+                "risk_levels": {"sl": 98.0, "tp1": 103.0, "tp2": 105.0, "rr_ratio": 1.67},
+                "risk_blockers": [],
+                "entry_plan": {
+                    "status": "ENTER_NOW",
+                    "entry_now_score": 88,
+                    "setup_score": 90,
+                    "rr_now": 1.67,
+                    "sl": 98.0,
+                    "tp1": 103.0,
+                    "tp2": 105.0,
+                },
+            }
             candidate = {
                 "ticker": "BTCUSDT",
                 "interval": "15m",
                 "direction": "long",
                 "strategy": "strict_quality_v1",
                 "reason": "strict quality test",
-                "data": {},
-                "entry_plan": {"entry_now_score": 88, "setup_score": 90, "rr_now": 1.67},
+                "data": data,
+                "entry_plan": data["entry_plan"],
             }
-            self.bot._synced_testnet_signal_candidate_v774 = lambda chat_id: (candidate, [])
-            self.bot._submit_testnet_trade_v734 = lambda chat_id, cand: {
-                "ok": True,
-                "stage": "done",
-                "plan": {
-                    "ticker": "BTCUSDT",
-                    "interval": "15m",
-                    "direction": "long",
-                    "entry_order": {"entry_reference": 100.0, "leverage": 10},
-                },
-                "monitor": {"status": "PROTECTED", "sl_count": 1, "tp_count": 1},
-                "protection": {"orders": [{"label": "SL"}, {"label": "TP1"}]},
-            }
-            self.bot._testnet_stats_line_v734 = lambda allow_refresh=True: {"open": 0}
-            self.bot._testnet_today_attempts_label_v772 = lambda chat_id: "0 attempts"
+            self.bot._auto_signal_select_trade_candidate_v753 = lambda chat_id: (candidate, [])
+            self.bot.get_price = lambda ticker: 100.0
             text = self.bot.paper_trader_cycle("human-demo", manual=True)
         finally:
-            self.bot._synced_testnet_signal_candidate_v774 = old_selector
-            self.bot._submit_testnet_trade_v734 = old_submit
-            self.bot._testnet_stats_line_v734 = old_stats
-            self.bot._testnet_today_attempts_label_v772 = old_attempts
+            self.bot._auto_signal_select_trade_candidate_v753 = old_selector
+            self.bot.get_price = old_price
 
-        self.assertIn("SL", text)
-        self.assertIn("TP", text)
+        self.assertIn("Ордера не отправляются", text)
+        self.assertIn("Записал новый сигнал", text)
+        self.assertIn("BTCUSDT", text)
+        self.assertIn("Win Rate", text)
         self.assertNotIn("reduce-only", text)
         self.assertNotIn("Protection:", text)
         self.assertNotIn("Monitor:", text)
+        rows = self.bot._signal_winrate_rows_v777("human-demo", limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "PENDING")
 
     def test_last_trade_attempt_report_explains_risk_gate_and_chain(self) -> None:
         old_cycles = self.bot._demo_analysis_recent_cycles_v736
