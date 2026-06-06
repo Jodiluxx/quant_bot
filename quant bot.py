@@ -27327,17 +27327,7 @@ def _ui_rule_v779():
 
 
 def _ui_score_bar_v780(value, width=10):
-    score = _safe_float(value, 0) or 0
-    score = max(0.0, min(100.0, float(score)))
-    width = max(4, int(width))
-    filled = int(round(score / 100.0 * width))
-    if score >= 75:
-        block = "🟩"
-    elif score >= 50:
-        block = "🟨"
-    else:
-        block = "🟥"
-    return block * filled + "⬜" * (width - filled)
+    return _ui_format_score_bar_v782(value, width)
 
 
 def _ui_code_v779(value):
@@ -27698,18 +27688,11 @@ def signal_scan_all_keyboard_v759(chat_id):
 
 
 def _signal_winrate_bar_v779(winrate):
-    if winrate is None:
-        return "⬜⬜⬜⬜⬜⬜⬜⬜"
-    filled = max(0, min(8, int(round(float(winrate) / 12.5))))
-    return "🟩" * filled + "⬜" * (8 - filled)
+    return _ui_format_winrate_bar_v782(winrate, 8)
 
 
 def _signal_winrate_edge_text_v779(value):
-    if value is None:
-        return "⚪ н/д"
-    value = float(value)
-    icon = "🟢" if value > 0 else "🔴" if value < 0 else "⚪"
-    return f"{icon} {value:+.2f}%"
+    return _ui_format_edge_text_v782(value)
 
 
 def _signal_winrate_bucket_line_v779(bucket):
@@ -28091,7 +28074,17 @@ async def async_handle_update(session, update, sem):
     await _base_async_handle_update_v780_for_v781(session, update, sem)
 
 
-BOT_VERSION_LABEL = "v7.81 Paginated Win Rate and Signal Tabs"
+# ============================================================
+# v7.82 - UI FORMAT HELPER EXTRACTION
+# ============================================================
+from quant_bot.ui_format import (
+    edge_text as _ui_format_edge_text_v782,
+    score_bar as _ui_format_score_bar_v782,
+    winrate_bar as _ui_format_winrate_bar_v782,
+)
+
+
+BOT_VERSION_LABEL = "v7.82 UI Format Helper Extraction"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28199,6 +28192,7 @@ RUNTIME_LAYERS = [
     ("v7.79", "Telegram UI specification polish for menus, signal cards, scans and Win Rate"),
     ("v7.80", "visual progress bars for signal scores and main Win Rate status"),
     ("v7.81", "paginated Win Rate history and lightweight signal tabs"),
+    ("v7.82", "pure Telegram UI formatting helpers extracted to quant_bot.ui_format"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -28309,6 +28303,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "signal_winrate_page_keyboard": signal_winrate_page_keyboard_v781,
     "format_signal_entry_tab": format_signal_entry_tab_v781,
     "format_signal_context_tab": format_signal_context_tab_v781,
+    "ui_score_bar": _ui_score_bar_v780,
+    "ui_winrate_bar": _signal_winrate_bar_v779,
+    "ui_edge_text": _signal_winrate_edge_text_v779,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,
