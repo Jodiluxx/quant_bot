@@ -41,6 +41,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         callbacks = {button["callback_data"] for row in rows for button in row}
         for callback in {"paper_run_now", "paper_open_positions", "paper_closed_menu", "auto_settings", "back_main"}:
             self.assertIn(callback, callbacks)
+        self.assertIn("wr_page_recent_0", callbacks)
         for hidden in {"setup_analytics", "prob_calibration", "bot_quality", "execution_status", "live_readiness"}:
             self.assertNotIn(hidden, callbacks)
 
@@ -446,8 +447,90 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("данных мало", text)
         self.assertIn("🟢 2 WIN | 🔴 1 LOSS | ⚪ 0 FLAT", text)
 
+    def test_signal_winrate_history_is_paginated(self) -> None:
+        rows = []
+        for idx in range(8):
+            rows.append({
+                "id": f"sig-{idx}",
+                "chat_id": "wr-pages",
+                "ticker": "BTCUSDT",
+                "direction": "LONG",
+                "interval": "15m",
+                "created_at": f"2026-06-04T0{idx}:00:00+00:00",
+                "due_at": f"2026-06-04T0{idx}:15:00+00:00",
+                "status": "WIN" if idx % 2 else "LOSS",
+                "entry_price": 100.0 + idx,
+                "exit_price": 101.0 + idx,
+                "result_edge_pct": 1.0 if idx % 2 else -1.0,
+            })
+        self.bot._signal_winrate_save_v777({"signals": rows})
+
+        text = self.bot.format_signal_winrate_page_v781("wr-pages", "recent", 1)
+        keyboard = self.bot.signal_winrate_page_keyboard_v781("wr-pages", "recent", 1)
+        callbacks = {button["callback_data"] for row in keyboard["inline_keyboard"] for button in row}
+
+        self.assertIn("История сигналов", text)
+        self.assertIn("Стр. <b>2/2</b>", text)
+        self.assertIn("BTCUSDT", text)
+        self.assertIn("wr_page_recent_0", callbacks)
+        self.assertIn("wr_page_recent_1", callbacks)
+
+    def test_signal_tabs_use_cached_signal_data(self) -> None:
+        chat_id = "signal-tabs"
+        old_tickers = dict(self.bot.user_tickers)
+        old_intervals = dict(self.bot.user_intervals)
+        old_cache = dict(self.bot._SIGNAL_DETAIL_CACHE)
+        try:
+            self.bot.user_tickers[chat_id] = "BTCUSDT"
+            self.bot.user_intervals[chat_id] = "15m"
+            data = {
+                "signal": "LONG",
+                "direction": "long",
+                "price": 100.0,
+                "confidence": 82,
+                "vol_ratio": 1.2,
+                "regime": "trend",
+                "risk_levels": {"sl": 98.0, "tp1": 103.0, "rr_ratio": 1.7},
+                "entry_plan": {
+                    "status": "ENTER_NOW",
+                    "entry_now_score": 86,
+                    "setup_score": 88,
+                    "rr_now": 1.7,
+                    "entry_gate_reason": "score и защитные фильтры разрешают вход сейчас",
+                },
+                "futures_context": {
+                    "funding_rate_pct": 0.01,
+                    "open_interest_usdt": 1000000,
+                    "basis_pct": 0.02,
+                    "warnings": [],
+                },
+            }
+            self.bot._cache_signal_data(chat_id, "BTCUSDT", "15m", data)
+
+            entry_text = self.bot.format_signal_entry_tab_v781(chat_id)
+            context_text = self.bot.format_signal_context_tab_v781(chat_id)
+            callbacks = {
+                button["callback_data"]
+                for row in self.bot.compact_signal_keyboard()["inline_keyboard"]
+                for button in row
+            }
+        finally:
+            self.bot.user_tickers.clear()
+            self.bot.user_tickers.update(old_tickers)
+            self.bot.user_intervals.clear()
+            self.bot.user_intervals.update(old_intervals)
+            self.bot._SIGNAL_DETAIL_CACHE.clear()
+            self.bot._SIGNAL_DETAIL_CACHE.update(old_cache)
+
+        self.assertIn("Вход: #BTCUSDT [15м]", entry_text)
+        self.assertIn("EntryNow: <b>86/100</b>", entry_text)
+        self.assertIn("Контекст: #BTCUSDT [15м]", context_text)
+        self.assertIn("Funding", context_text)
+        self.assertIn("signal_tab_entry", callbacks)
+        self.assertIn("signal_tab_context", callbacks)
+
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.80 Visual Signal Score Bars")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.81 Paginated Win Rate and Signal Tabs")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -477,6 +560,9 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("signal_winrate_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("signal_winrate_bucket_stats", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("format_signal_winrate_report", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("format_signal_winrate_page", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("format_signal_entry_tab", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("format_signal_context_tab", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_exploration_data_block", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("nyse_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("commodities_market_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -540,6 +626,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.78" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.79" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.80" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.81" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)

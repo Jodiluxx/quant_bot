@@ -27862,7 +27862,236 @@ def format_main_status(chat_id):
     ])
 
 
-BOT_VERSION_LABEL = "v7.80 Visual Signal Score Bars"
+# ============================================================
+# v7.81 - PAGINATED WIN RATE AND SIGNAL TABS
+# ============================================================
+# Still presentation-only: reports become paginated, and signal details are
+# shown as lightweight tabs without re-enabling the old heavy simple-mode UI.
+
+_base_compact_signal_keyboard_v780_for_v781 = compact_signal_keyboard
+_base_autobot_keyboard_v780_for_v781 = autobot_keyboard
+_base_async_handle_update_v780_for_v781 = async_handle_update
+
+SIGNAL_WINRATE_PAGE_SIZE_V781 = int(os.getenv("SIGNAL_WINRATE_PAGE_SIZE", "6"))
+
+
+def _signal_winrate_statuses_for_view_v781(view):
+    view = str(view or "recent").lower()
+    if view == "pending":
+        return {"PENDING"}
+    if view == "done":
+        return {"WIN", "LOSS", "FLAT"}
+    return None
+
+
+def _signal_winrate_view_title_v781(view):
+    return {
+        "pending": "⏳ На проверке",
+        "done": "📋 Проверенные сигналы",
+        "recent": "📋 История сигналов",
+    }.get(str(view or "recent").lower(), "📋 История сигналов")
+
+
+def _signal_winrate_page_payload_v781(chat_id, view="recent", page=0, page_size=None):
+    page_size = int(page_size or SIGNAL_WINRATE_PAGE_SIZE_V781)
+    page = max(0, int(page or 0))
+    rows = _signal_winrate_rows_v777(
+        chat_id,
+        limit=SIGNAL_WINRATE_MAX_ROWS_V777,
+        statuses=_signal_winrate_statuses_for_view_v781(view),
+    )
+    total = len(rows)
+    pages = max(1, math.ceil(total / page_size)) if page_size > 0 else 1
+    page = min(page, pages - 1)
+    start = page * page_size
+    return {
+        "view": str(view or "recent").lower(),
+        "page": page,
+        "pages": pages,
+        "total": total,
+        "rows": rows[start:start + page_size],
+    }
+
+
+def format_signal_winrate_page_v781(chat_id, view="recent", page=0):
+    _signal_winrate_evaluate_pending_v777(chat_id)
+    payload = _signal_winrate_page_payload_v781(chat_id, view, page)
+    lines = [
+        f"{_signal_winrate_view_title_v781(payload['view'])} <b>Win Rate</b>",
+        _ui_rule_v779(),
+        f"Стр. <b>{payload['page'] + 1}/{payload['pages']}</b> | записей: <b>{payload['total']}</b>",
+        "",
+    ]
+    if not payload["rows"]:
+        if payload["view"] == "pending":
+            lines.append("Ожидающих сигналов нет. Кнопка показывает счётчик, чтобы не заходить сюда вслепую.")
+        else:
+            lines.append("История LONG/SHORT сигналов пока пустая.")
+    else:
+        lines.extend(_signal_winrate_recent_line_v779(row) for row in payload["rows"])
+    lines += [
+        "",
+        "WIN/LOSS считается только после истечения TF сигнала. WAIT не записывается как сделка.",
+    ]
+    return "\n".join(lines)
+
+
+def signal_winrate_page_keyboard_v781(chat_id, view="recent", page=0):
+    payload = _signal_winrate_page_payload_v781(chat_id, view, page)
+    view = payload["view"]
+    page = payload["page"]
+    prev_page = max(0, page - 1)
+    next_page = min(payload["pages"] - 1, page + 1)
+    return {"inline_keyboard": [
+        [
+            {"text": "◀️", "callback_data": f"wr_page_{view}_{prev_page}"},
+            {"text": f"Стр. {page + 1}/{payload['pages']}", "callback_data": f"wr_page_{view}_{page}"},
+            {"text": "▶️", "callback_data": f"wr_page_{view}_{next_page}"},
+        ],
+        [
+            {"text": "📈 Сводка", "callback_data": "menu_autobot"},
+            {"text": "🏠 Меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def autobot_keyboard(chat_id):
+    pending = _signal_winrate_pending_count_v779(chat_id)
+    total = len(_signal_winrate_rows_v777(chat_id, limit=SIGNAL_WINRATE_MAX_ROWS_V777))
+    return {"inline_keyboard": [
+        [{"text": "🔄 Обновить статистику", "callback_data": "paper_closed_menu"}],
+        [
+            {"text": "▶️ Скан сейчас", "callback_data": "paper_run_now"},
+            {"text": f"⏳ На проверке ({pending})", "callback_data": "paper_open_positions"},
+        ],
+        [
+            {"text": f"📋 История ({total})", "callback_data": "wr_page_recent_0"},
+            {"text": "⚙️ Настройки", "callback_data": "auto_settings"},
+        ],
+        [{"text": "🏠 Главное меню", "callback_data": "back_main"}],
+    ]}
+
+
+def compact_signal_keyboard(open_callback=None):
+    return {"inline_keyboard": [
+        [{"text": "🔄 Обновить сигнал", "callback_data": "get_signal"}],
+        [
+            {"text": "🎯 Вход", "callback_data": "signal_tab_entry"},
+            {"text": "📡 Контекст", "callback_data": "signal_tab_context"},
+        ],
+        [{"text": "🔎 Скан всех активов", "callback_data": "signal_scan_all"}],
+        [
+            {"text": "◀️ Назад", "callback_data": "sig_active_group"},
+            {"text": "🏠 Меню", "callback_data": "back_main"},
+        ],
+    ]}
+
+
+def _signal_tab_data_v781(chat_id):
+    data, ticker, interval = _signal_data_for_chat(chat_id, force_refresh=False)
+    return data or {}, ticker, interval
+
+
+def format_signal_entry_tab_v781(chat_id):
+    data, ticker, interval = _signal_tab_data_v781(chat_id)
+    plan = data.get("entry_plan") or {}
+    risk = data.get("risk_levels") or {}
+    decision, status, _ = _ui_signal_status_label_v779(data)
+    raw = int(plan.get("setup_score", plan.get("score", 0)) or 0)
+    now_score = int(plan.get("entry_now_score", 0) or 0)
+    rr = _safe_float(plan.get("rr_now"), None)
+    if rr is None or rr <= 0:
+        rr = _safe_float(risk.get("rr_ratio"), 0) or 0
+    lines = [
+        f"🎯 <b>Вход: #{_ui_signal_symbol_v764(ticker)} [{_ui_tf_short(interval)}]</b>",
+        _ui_rule_v779(),
+        f"Вердикт: <b>{_ui_html(decision)}</b> | статус: <b>{_ui_html(_ui_status_human_v779(status))}</b>",
+        f"EntryNow: <b>{now_score}/100</b> {_ui_score_bar_v780(now_score)}",
+        f"Setup: <b>{raw}/100</b> {_ui_score_bar_v780(raw)}",
+        f"RR: <b>{rr:.2f}x</b>",
+        "",
+        f"Цена: {_ui_money_code_v779(data.get('price'), ticker)}",
+    ]
+    low = plan.get("entry_zone_low")
+    high = plan.get("entry_zone_high")
+    if low is not None and high is not None:
+        lines.append(f"Зона: {_ui_money_code_v779(low, ticker)} — {_ui_money_code_v779(high, ticker)}")
+    if risk:
+        lines += [
+            f"SL: {_ui_money_code_v779(risk.get('sl') or plan.get('sl'), ticker)}",
+            f"TP: {_ui_money_code_v779(risk.get('tp1') or plan.get('tp1'), ticker)}",
+        ]
+    gate = plan.get("entry_gate_reason") or _entry_gate_reason(plan)
+    lines += [
+        "",
+        f"Причина: {_ui_short_text(gate, 150)}",
+        "Правило: лучше пропустить вход, чем входить в плохой зоне.",
+    ]
+    return "\n".join(lines)
+
+
+def format_signal_context_tab_v781(chat_id):
+    data, ticker, interval = _signal_tab_data_v781(chat_id)
+    lines = [
+        f"📡 <b>Контекст: #{_ui_signal_symbol_v764(ticker)} [{_ui_tf_short(interval)}]</b>",
+        _ui_rule_v779(),
+        _ui_source_line_v779(ticker),
+        f"Цена: {_ui_money_code_v779(data.get('price'), ticker)}",
+        f"Trend: <b>{_ui_html(_ui_regime_text(data))}</b>",
+        f"Volume: <b>{_ui_html(_ui_volume_text(data))}</b>",
+    ]
+    if _is_crypto_ticker_v764(ticker):
+        ctx = data.get("futures_context") or build_futures_context(ticker, data.get("price"))
+        lines += [
+            "",
+            f"Funding: <b>{_fmt_pct(ctx.get('funding_rate_pct'), 4)}</b> / 8h",
+            f"Open Interest: <b>{_fmt_usdt_notional(ctx.get('open_interest_usdt'))}</b>",
+            f"Basis: <b>{_fmt_pct(ctx.get('basis_pct'), 2)}</b>",
+        ]
+        if ctx.get("warnings"):
+            lines.append("⚠️ " + _ui_short_text(" | ".join(ctx.get("warnings")[:2]), 150))
+    else:
+        lines += [
+            "",
+            "Для акций/сырья это источник данных и рыночный контекст, а не Binance Futures context.",
+        ]
+    lines.append("Контекст помогает оценить риск, но сам по себе не является сигналом входа.")
+    return "\n".join(lines)
+
+
+async def async_handle_update(session, update, sem):
+    if "callback_query" in update:
+        cb = update["callback_query"]
+        data = cb.get("data", "")
+        chat_id = _normalize_chat_id_v78(cb["message"]["chat"]["id"])
+        callback_id = cb.get("id")
+        if data == "paper_open_positions":
+            await _answer_callback_once_v732(session, callback_id, "На проверке")
+            text = await asyncio.to_thread(format_signal_winrate_page_v781, chat_id, "pending", 0)
+            await send_or_edit(session, update, text, signal_winrate_page_keyboard_v781(chat_id, "pending", 0))
+            return
+        if data.startswith("wr_page_"):
+            parts = data.split("_")
+            view = parts[2] if len(parts) >= 3 else "recent"
+            page = int(parts[3]) if len(parts) >= 4 and str(parts[3]).isdigit() else 0
+            await _answer_callback_once_v732(session, callback_id, "Win Rate")
+            text = await asyncio.to_thread(format_signal_winrate_page_v781, chat_id, view, page)
+            await send_or_edit(session, update, text, signal_winrate_page_keyboard_v781(chat_id, view, page))
+            return
+        if data == "signal_tab_entry":
+            await _answer_callback_once_v732(session, callback_id, "Вход")
+            text = await asyncio.to_thread(format_signal_entry_tab_v781, chat_id)
+            await send_or_edit(session, update, text, compact_signal_keyboard())
+            return
+        if data == "signal_tab_context":
+            await _answer_callback_once_v732(session, callback_id, "Контекст")
+            text = await asyncio.to_thread(format_signal_context_tab_v781, chat_id)
+            await send_or_edit(session, update, text, compact_signal_keyboard())
+            return
+    await _base_async_handle_update_v780_for_v781(session, update, sem)
+
+
+BOT_VERSION_LABEL = "v7.81 Paginated Win Rate and Signal Tabs"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -27969,6 +28198,7 @@ RUNTIME_LAYERS = [
     ("v7.78", "signal Win Rate breakdown by ticker, timeframe and direction"),
     ("v7.79", "Telegram UI specification polish for menus, signal cards, scans and Win Rate"),
     ("v7.80", "visual progress bars for signal scores and main Win Rate status"),
+    ("v7.81", "paginated Win Rate history and lightweight signal tabs"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -28075,6 +28305,10 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "signal_winrate_stats": _signal_winrate_stats_v777,
     "signal_winrate_bucket_stats": _signal_winrate_bucket_stats_v778,
     "format_signal_winrate_report": format_signal_winrate_report_v777,
+    "format_signal_winrate_page": format_signal_winrate_page_v781,
+    "signal_winrate_page_keyboard": signal_winrate_page_keyboard_v781,
+    "format_signal_entry_tab": format_signal_entry_tab_v781,
+    "format_signal_context_tab": format_signal_context_tab_v781,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,
