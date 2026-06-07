@@ -7,7 +7,18 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 
-from quant_bot.ui_format import code, compact_tf, edge_text, html_escape, score_bar, short_text, winrate_bar
+from quant_bot.ui_format import (
+    code,
+    compact_tf,
+    edge_text,
+    html_escape,
+    scan_status,
+    score_bar,
+    short_text,
+    status_human,
+    status_plain,
+    winrate_bar,
+)
 from quant_bot.legacy import load_bot_module
 
 
@@ -538,6 +549,10 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertEqual(code("BTC<USDT>"), self.bot._ui_code_v779("BTC<USDT>"))
         self.assertEqual(compact_tf("45m"), self.bot._ui_tf_short("45m"))
         self.assertEqual(compact_tf("1h"), self.bot._ui_tf_short("1h"))
+        self.assertEqual(status_plain("WAIT_RETEST"), self.bot._ui_status_plain("WAIT_RETEST"))
+        self.assertEqual(status_plain("ENTER_NOW"), "READY")
+        self.assertEqual(status_human("WAIT_RETEST"), self.bot._ui_status_human_v779("WAIT_RETEST"))
+        self.assertEqual(scan_status("SHORT"), self.bot._ui_scan_status_v779("SHORT"))
         self.assertEqual(score_bar(81), self.bot._ui_score_bar_v780(81))
         self.assertEqual(score_bar("bad"), "⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜")
         self.assertEqual(winrate_bar(None), "⬜⬜⬜⬜⬜⬜⬜⬜")
@@ -546,7 +561,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertEqual(edge_text("bad"), "⚪ н/д")
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.83 Telegram UI Primitive Extraction")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.84 Telegram Status Formatting Extraction")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -585,6 +600,9 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("ui_html", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("ui_code", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("ui_tf_short", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("ui_status_plain", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("ui_status_human", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
+        self.assertIn("ui_scan_status", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("testnet_exploration_data_block", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("nyse_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("commodities_market_is_open", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -651,6 +669,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertTrue(any(layer[0] == "v7.81" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.82" for layer in self.bot.RUNTIME_LAYERS))
         self.assertTrue(any(layer[0] == "v7.83" for layer in self.bot.RUNTIME_LAYERS))
+        self.assertTrue(any(layer[0] == "v7.84" for layer in self.bot.RUNTIME_LAYERS))
         self.assertIn("testnet_select_trade_candidate", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("demo_analysis_record_cycle", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
         self.assertIn("run_immediate_testnet_monitor", self.bot.ACTIVE_RUNTIME_FUNCTIONS)

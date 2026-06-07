@@ -49,6 +49,56 @@ def compact_tf(interval: object, fallback_label: object | None = None) -> str:
     )
 
 
+def status_plain(status: object) -> str:
+    """Normalize internal setup statuses for user-facing cards."""
+    raw = str(status or "").upper()
+    return {
+        "ENTER_NOW": "READY",
+        "WAIT_RETEST": "WAIT RETEST",
+        "WAIT_CONFIRMATION": "WAIT CONFIRM",
+        "NO_ENTRY": "BLOCKED",
+        "NO_SETUP": "WAIT",
+        "TP1_PARTIAL": "TP1",
+        "SL_BE": "BE STOP",
+    }.get(raw, str(status or "WAIT").replace("_", " "))
+
+
+def status_emoji(status: object) -> str:
+    """Status label with one clear emoji."""
+    plain = status_plain(status)
+    if plain == "READY":
+        return "🟢 READY"
+    if plain.startswith("WAIT"):
+        return "🟡 " + plain
+    if plain == "BLOCKED":
+        return "🔴 BLOCKED"
+    return "⚪ " + plain
+
+
+def status_human(status: object) -> str:
+    """Human wording for signal detail cards."""
+    plain = status_plain(status)
+    return {
+        "READY": "READY",
+        "WAIT RETEST": "WAIT: ожидание ретеста",
+        "WAIT CONFIRM": "WAIT: нужно подтверждение",
+        "BLOCKED": "BLOCKED",
+        "WAIT": "WAIT",
+    }.get(plain, plain)
+
+
+def scan_status(decision: object) -> str:
+    """Compact status marker for all-asset scan rows."""
+    text = str(decision or "WAIT").upper()
+    if text == "LONG":
+        return "🟢 LONG"
+    if text == "SHORT":
+        return "🔴 SHORT"
+    if text == "ERROR":
+        return "⚪ ERROR"
+    return "🟡 WAIT"
+
+
 def clamp_score(value: object, default: float = 0.0) -> float:
     """Return a 0..100 float for UI scores."""
     try:

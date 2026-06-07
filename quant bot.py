@@ -17075,26 +17075,11 @@ def _ui_signal_direction(data):
 
 
 def _ui_status_plain(status):
-    return {
-        "ENTER_NOW": "READY",
-        "WAIT_RETEST": "WAIT RETEST",
-        "WAIT_CONFIRMATION": "WAIT CONFIRM",
-        "NO_ENTRY": "BLOCKED",
-        "NO_SETUP": "WAIT",
-        "TP1_PARTIAL": "TP1",
-        "SL_BE": "BE STOP",
-    }.get(str(status or "").upper(), str(status or "WAIT").replace("_", " "))
+    return _ui_format_status_plain_v784(status)
 
 
 def _ui_status_emoji(status):
-    plain = _ui_status_plain(status)
-    if plain == "READY":
-        return "🟢 READY"
-    if plain.startswith("WAIT"):
-        return "🟡 " + plain
-    if plain == "BLOCKED":
-        return "🔴 BLOCKED"
-    return "⚪ " + plain
+    return _ui_format_status_emoji_v784(status)
 
 
 def _ui_regime_text(data):
@@ -27379,14 +27364,7 @@ def _ui_signal_status_label_v779(data):
 
 
 def _ui_status_human_v779(status):
-    plain = _ui_status_plain(status)
-    return {
-        "READY": "READY",
-        "WAIT RETEST": "WAIT: ожидание ретеста",
-        "WAIT CONFIRM": "WAIT: нужно подтверждение",
-        "BLOCKED": "BLOCKED",
-        "WAIT": "WAIT",
-    }.get(plain, plain)
+    return _ui_format_status_human_v784(status)
 
 
 def format_signal_summary(data, ticker, interval):
@@ -27589,14 +27567,7 @@ def compact_signal_keyboard(open_callback=None):
 
 
 def _ui_scan_status_v779(decision):
-    decision = str(decision or "WAIT").upper()
-    if decision == "LONG":
-        return "🟢 LONG"
-    if decision == "SHORT":
-        return "🔴 SHORT"
-    if decision == "ERROR":
-        return "⚪ ERROR"
-    return "🟡 WAIT"
+    return _ui_format_scan_status_v784(decision)
 
 
 def format_signal_scan_group_v764(chat_id, group):
@@ -28073,13 +28044,17 @@ from quant_bot.ui_format import (
     compact_tf as _ui_format_compact_tf_v783,
     edge_text as _ui_format_edge_text_v782,
     html_escape as _ui_format_html_escape_v783,
+    scan_status as _ui_format_scan_status_v784,
     score_bar as _ui_format_score_bar_v782,
     short_text as _ui_format_short_text_v783,
+    status_emoji as _ui_format_status_emoji_v784,
+    status_human as _ui_format_status_human_v784,
+    status_plain as _ui_format_status_plain_v784,
     winrate_bar as _ui_format_winrate_bar_v782,
 )
 
 
-BOT_VERSION_LABEL = "v7.83 Telegram UI Primitive Extraction"
+BOT_VERSION_LABEL = "v7.84 Telegram Status Formatting Extraction"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28189,6 +28164,7 @@ RUNTIME_LAYERS = [
     ("v7.81", "paginated Win Rate history and lightweight signal tabs"),
     ("v7.82", "pure Telegram UI formatting helpers extracted to quant_bot.ui_format"),
     ("v7.83", "Telegram HTML, code, rule and timeframe primitives extracted to quant_bot.ui_format"),
+    ("v7.84", "Telegram signal and scan status formatting extracted to quant_bot.ui_format"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -28305,6 +28281,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "ui_html": _ui_html,
     "ui_code": _ui_code_v779,
     "ui_tf_short": _ui_tf_short,
+    "ui_status_plain": _ui_status_plain,
+    "ui_status_human": _ui_status_human_v779,
+    "ui_scan_status": _ui_scan_status_v779,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,
