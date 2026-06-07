@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from quant_bot.signal_winrate import (
     action_note_text,
     basis_counts_text,
+    flat_warning_text,
     focus_note_text,
     outcome_hint,
     outcome_legend_lines,
@@ -160,6 +161,24 @@ class SignalWinrateHelperTests(unittest.TestCase):
         ], min_samples=5)
 
         self.assertIn("лучше: LONG WR 62.8% (35, рабочая)", note)
+
+    def test_flat_warning_text_highlights_no_momentum_group(self) -> None:
+        note = flat_warning_text([
+            {"group": "tf", "label": "15м", "wins": 1, "losses": 1, "flats": 4},
+            {"group": "ticker", "label": "BTCUSDT", "wins": 3, "losses": 2, "flats": 1},
+        ], min_samples=5)
+
+        self.assertIn("много FLAT: TF 15м 66.7% (4/6)", note)
+
+    def test_flat_warning_text_waits_for_enough_data_or_no_skew(self) -> None:
+        self.assertIn(
+            "копим данные",
+            flat_warning_text([{"label": "BTCUSDT", "wins": 1, "losses": 0, "flats": 1}], min_samples=5),
+        )
+        self.assertEqual(
+            flat_warning_text([{"label": "BTCUSDT", "wins": 4, "losses": 3, "flats": 1}], min_samples=5),
+            "явного тихого перекоса нет",
+        )
 
 
 if __name__ == "__main__":

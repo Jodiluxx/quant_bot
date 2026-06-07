@@ -159,6 +159,44 @@ def focus_note_text(buckets: Any, min_samples: int = 5) -> str:
     return " | ".join(parts)
 
 
+def flat_warning_text(buckets: Any, min_samples: int = 5, threshold: float = 50.0) -> str:
+    """Return a short warning when a group often ends as FLAT/no movement."""
+    minimum = max(1, int(min_samples or 5))
+    try:
+        threshold_value = max(0.0, min(100.0, float(threshold)))
+    except (TypeError, ValueError):
+        threshold_value = 50.0
+
+    candidates: list[dict[str, Any]] = []
+    for raw in list(buckets or []):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            wins = max(0, int(raw.get("wins") or 0))
+            losses = max(0, int(raw.get("losses") or 0))
+            flats = max(0, int(raw.get("flats") or 0))
+        except (TypeError, ValueError):
+            continue
+        evaluated = wins + losses + flats
+        if evaluated < minimum or flats <= 0:
+            continue
+        flat_rate = flats / evaluated * 100.0
+        candidates.append({
+            "label": _focus_bucket_label(raw),
+            "evaluated": evaluated,
+            "flat_rate": flat_rate,
+            "flats": flats,
+        })
+
+    if not candidates:
+        return f"копим данные; для шума нужно минимум {minimum} проверенных исходов в группе"
+
+    quiet = max(candidates, key=lambda x: (x["flat_rate"], x["flats"], x["evaluated"]))
+    if quiet["flat_rate"] < threshold_value:
+        return "явного тихого перекоса нет"
+    return f"много FLAT: {quiet['label']} {quiet['flat_rate']:.1f}% ({quiet['flats']}/{quiet['evaluated']})"
+
+
 def basis_counts_text(wins: Any, losses: Any, flats: Any, pending: Any | None = None) -> str:
     """Explain which outcomes are counted in WR and which are tracked aside."""
     def to_int(value: Any) -> int:

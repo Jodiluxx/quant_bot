@@ -28067,6 +28067,7 @@ from quant_bot.signal_winrate import (
     action_note_text as _signal_wr_action_note_text_v794,
     basis_counts_text as _signal_wr_basis_counts_text_v792,
     focus_note_text as _signal_wr_focus_note_text_v796,
+    flat_warning_text as _signal_wr_flat_warning_text_v799,
     outcome_hint as _signal_wr_outcome_hint_v789,
     outcome_legend_lines as _signal_wr_legend_lines_v789,
     outcome_streak_text as _signal_wr_streak_text_v793,
@@ -28373,6 +28374,10 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
         focus_rows,
         SIGNAL_WINRATE_MIN_BUCKET_SAMPLES_V778,
     )
+    flat_warning = _signal_wr_flat_warning_text_v799(
+        focus_rows,
+        SIGNAL_WINRATE_MIN_BUCKET_SAMPLES_V778,
+    )
     lines = [
         "📈 <b>Win Rate: проверка сигналов</b>",
         "Режим: <b>проверка направления без ордеров</b>",
@@ -28389,6 +28394,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
         f"• Что делать: {_ui_html(_signal_wr_action_note_text_v794(stats.get('counted'), stats.get('winrate'), recent_evaluated))}",
         f"• Проверка: {_ui_html(_signal_wr_pending_check_text_v795(pending_rows))}",
         f"• Фокус анализа: {_ui_html(focus_note)}",
+        f"• FLAT/шум: {_ui_html(flat_warning)}",
     ]
     if completed:
         lines += ["", "✅ <b>Новые проверки</b>"]
@@ -28414,7 +28420,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.98 Win Rate Focus Evidence"
+BOT_VERSION_LABEL = "v7.99 Win Rate Flat Focus Warning"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28539,6 +28545,7 @@ RUNTIME_LAYERS = [
     ("v7.96", "focus note for Win Rate group analysis"),
     ("v7.97", "group-labeled Win Rate focus notes"),
     ("v7.98", "evidence labels for Win Rate focus notes"),
+    ("v7.99", "FLAT/no-momentum warning for Win Rate focus"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
