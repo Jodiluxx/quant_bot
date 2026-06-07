@@ -28067,6 +28067,7 @@ from quant_bot.signal_winrate import (
     outcome_hint as _signal_wr_outcome_hint_v789,
     outcome_legend_lines as _signal_wr_legend_lines_v789,
     result_suffix as _signal_wr_result_suffix_v788,
+    sample_quality_badge as _signal_wr_sample_quality_badge_v791,
     sample_quality_text as _signal_wr_sample_quality_text_v790,
     signal_status_icon as _signal_wr_status_icon_v788,
     winrate_text as _signal_wr_text_v788,
@@ -28306,6 +28307,7 @@ def format_main_status(chat_id):
         f"Актив: {_ui_code_v779(_ui_signal_symbol_v764(ticker))} | TF {_ui_code_v779(_ui_tf_short(interval))}",
         f"Авто: <b>{auto_state}</b> | Win Rate: <b>{wr}</b> {_signal_winrate_bar_v779(stats.get('winrate'))}",
         f"Проверено: <b>{stats['counted']}</b> | На проверке: <b>{stats['pending']}</b>",
+        f"Надёжность WR: <b>{_ui_html(_signal_wr_sample_quality_badge_v791(stats.get('counted')))}</b>",
         "",
         "Выбери действие ниже.",
     )
@@ -28388,7 +28390,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.90 Win Rate Sample Quality Wording"
+BOT_VERSION_LABEL = "v7.91 Main Menu Win Rate Reliability Badge"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28505,6 +28507,7 @@ RUNTIME_LAYERS = [
     ("v7.88", "signal Win Rate formatting helpers extracted to quant_bot.signal_winrate"),
     ("v7.89", "clear Win Rate outcome wording for WIN, LOSS, FLAT and PENDING"),
     ("v7.90", "clear Win Rate sample-size wording before trusting statistics"),
+    ("v7.91", "compact Win Rate reliability badge in the main menu"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

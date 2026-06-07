@@ -7,6 +7,7 @@ from quant_bot.signal_winrate import (
     outcome_hint,
     outcome_legend_lines,
     result_suffix,
+    sample_quality_badge,
     sample_quality_text,
     signal_status_icon,
     signed_percent_text,
@@ -51,6 +52,13 @@ class SignalWinrateHelperTests(unittest.TestCase):
         self.assertIn("нужно ещё 12", sample_quality_text(18))
         self.assertIn("выборка рабочая", sample_quality_text(30))
         self.assertIn("выборка сильная", sample_quality_text(120))
+
+    def test_sample_quality_badge_is_compact_for_menu_cards(self) -> None:
+        self.assertEqual(sample_quality_badge(0), "нет данных")
+        self.assertEqual(sample_quality_badge(5), "очень мало")
+        self.assertEqual(sample_quality_badge(18), "мало")
+        self.assertEqual(sample_quality_badge(30), "рабочая")
+        self.assertEqual(sample_quality_badge(120), "сильная")
 
 
 if __name__ == "__main__":

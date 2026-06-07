@@ -80,6 +80,24 @@ def sample_quality_text(counted: Any, min_samples: int = 30) -> str:
     return f"выборка сильная: {count}; можно сравнивать группы"
 
 
+def sample_quality_badge(counted: Any, min_samples: int = 30) -> str:
+    """Return a compact sample-size badge for menu cards."""
+    try:
+        count = max(0, int(counted))
+    except (TypeError, ValueError):
+        count = 0
+    minimum = max(1, int(min_samples or 30))
+    if count == 0:
+        return "нет данных"
+    if count < 10:
+        return "очень мало"
+    if count < minimum:
+        return "мало"
+    if count < minimum * 3:
+        return "рабочая"
+    return "сильная"
+
+
 def result_suffix(status: Any, edge: Any = None, due_at: datetime | None = None) -> str:
     """Build the short suffix after a Win Rate row status."""
     text = str(status or "").upper()

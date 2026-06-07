@@ -564,7 +564,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertEqual(edge_text("bad"), "⚪ н/д")
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.90 Win Rate Sample Quality Wording")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.91 Main Menu Win Rate Reliability Badge")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -1318,6 +1318,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_ui_cache_v768.update(old_cache)
 
         self.assertIn("Win Rate", text)
+        self.assertIn("Надёжность WR", text)
         self.assertEqual(calls, {"open": 0, "income": 0})
 
     def test_closed_trade_button_uses_local_lifecycle_without_rebuild(self) -> None:
