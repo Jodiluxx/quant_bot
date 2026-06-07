@@ -17030,27 +17030,17 @@ LEARN_TEXTS["learn_new_terms"] += """
 # Trading calculations, filters, risk gates and exchange logic are unchanged.
 
 def _ui_html(value):
-    text = str(value or "")
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _ui_format_html_escape_v783(value)
 
 
 def _ui_short_text(value, limit=96):
-    text = " ".join(str(value or "").replace("\n", " ").split())
-    if len(text) <= int(limit):
-        return _ui_html(text)
-    return _ui_html(text[: max(0, int(limit) - 1)].rstrip() + "…")
+    return _ui_format_short_text_v783(value, limit)
 
 
 def _ui_tf_short(interval):
     text = str(interval or "")
-    if text.endswith("m"):
-        return text[:-1] + "м"
-    if text.endswith("h"):
-        return text[:-1] + "ч"
-    if text.endswith("d"):
-        return text[:-1] + "д"
     label = str(INTERVALS.get(text, {}).get("label") or AUTO_SEND_INTERVALS.get(text, {}).get("label") or text)
-    return label.replace(" минут", "м").replace(" минута", "м").replace(" мин", "м").replace(" часа", "ч").replace(" час", "ч")
+    return _ui_format_compact_tf_v783(text, label)
 
 
 def _ui_ticker_short(ticker):
@@ -27323,7 +27313,7 @@ _base_auto_settings_text_v778_for_v779 = auto_settings_text
 
 
 def _ui_rule_v779():
-    return "───────────────────"
+    return _ui_format_rule_v783
 
 
 def _ui_score_bar_v780(value, width=10):
@@ -27331,7 +27321,7 @@ def _ui_score_bar_v780(value, width=10):
 
 
 def _ui_code_v779(value):
-    return f"<code>{_ui_html(value)}</code>"
+    return _ui_format_code_v783(value)
 
 
 def _ui_money_code_v779(value, ticker):
@@ -28078,13 +28068,18 @@ async def async_handle_update(session, update, sem):
 # v7.82 - UI FORMAT HELPER EXTRACTION
 # ============================================================
 from quant_bot.ui_format import (
+    RULE as _ui_format_rule_v783,
+    code as _ui_format_code_v783,
+    compact_tf as _ui_format_compact_tf_v783,
     edge_text as _ui_format_edge_text_v782,
+    html_escape as _ui_format_html_escape_v783,
     score_bar as _ui_format_score_bar_v782,
+    short_text as _ui_format_short_text_v783,
     winrate_bar as _ui_format_winrate_bar_v782,
 )
 
 
-BOT_VERSION_LABEL = "v7.82 UI Format Helper Extraction"
+BOT_VERSION_LABEL = "v7.83 Telegram UI Primitive Extraction"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28193,6 +28188,7 @@ RUNTIME_LAYERS = [
     ("v7.80", "visual progress bars for signal scores and main Win Rate status"),
     ("v7.81", "paginated Win Rate history and lightweight signal tabs"),
     ("v7.82", "pure Telegram UI formatting helpers extracted to quant_bot.ui_format"),
+    ("v7.83", "Telegram HTML, code, rule and timeframe primitives extracted to quant_bot.ui_format"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
@@ -28306,6 +28302,9 @@ ACTIVE_RUNTIME_FUNCTIONS = {
     "ui_score_bar": _ui_score_bar_v780,
     "ui_winrate_bar": _signal_winrate_bar_v779,
     "ui_edge_text": _signal_winrate_edge_text_v779,
+    "ui_html": _ui_html,
+    "ui_code": _ui_code_v779,
+    "ui_tf_short": _ui_tf_short,
     "async_auto_signal_loop": async_auto_signal_loop,
     "run_backtest": run_backtest,
     "_bt_score_signal": _bt_score_signal,
