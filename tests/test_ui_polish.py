@@ -466,6 +466,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("Свежая динамика", text)
         self.assertIn("Серия", text)
         self.assertIn("Что делать", text)
+        self.assertIn("Проверка", text)
 
     def test_signal_winrate_history_is_paginated(self) -> None:
         rows = []
@@ -569,7 +570,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertEqual(edge_text("bad"), "⚪ н/д")
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.94 Win Rate Action Note")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.95 Win Rate Pending Check ETA")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -1325,6 +1326,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("Win Rate", text)
         self.assertIn("WR база", text)
         self.assertIn("Надёжность WR", text)
+        self.assertIn("Проверка WR", text)
         self.assertEqual(calls, {"open": 0, "income": 0})
 
     def test_closed_trade_button_uses_local_lifecycle_without_rebuild(self) -> None:

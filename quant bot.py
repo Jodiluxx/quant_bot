@@ -28069,6 +28069,7 @@ from quant_bot.signal_winrate import (
     outcome_hint as _signal_wr_outcome_hint_v789,
     outcome_legend_lines as _signal_wr_legend_lines_v789,
     outcome_streak_text as _signal_wr_streak_text_v793,
+    pending_check_text as _signal_wr_pending_check_text_v795,
     recent_outcome_sequence as _signal_wr_recent_sequence_v793,
     result_suffix as _signal_wr_result_suffix_v788,
     sample_quality_badge as _signal_wr_sample_quality_badge_v791,
@@ -28303,6 +28304,7 @@ def format_main_status(chat_id):
     ticker = user_tickers.get(chat_id, "BTCUSDT")
     interval = user_intervals.get(chat_id, "15m")
     stats = _signal_winrate_stats_v777(chat_id)
+    pending_rows = _signal_winrate_rows_v777(chat_id, limit=20, statuses={"PENDING"})
     auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
     wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
     return _tg_text_card_v787(
@@ -28312,6 +28314,7 @@ def format_main_status(chat_id):
         f"Авто: <b>{auto_state}</b> | Win Rate: <b>{wr}</b> {_signal_winrate_bar_v779(stats.get('winrate'))}",
         _ui_html(_signal_wr_basis_counts_text_v792(stats["wins"], stats["losses"], stats["flats"], stats["pending"])),
         f"Надёжность WR: <b>{_ui_html(_signal_wr_sample_quality_badge_v791(stats.get('counted')))}</b>",
+        f"Проверка WR: {_ui_html(_signal_wr_pending_check_text_v795(pending_rows))}",
         "",
         "Выбери действие ниже.",
     )
@@ -28356,6 +28359,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
     avg = _signal_winrate_edge_text_v779(stats.get("avg_edge"))
     recent_evaluated = _signal_winrate_rows_v777(chat_id, limit=8, statuses={"WIN", "LOSS", "FLAT"})
+    pending_rows = _signal_winrate_rows_v777(chat_id, limit=20, statuses={"PENDING"})
     lines = [
         "📈 <b>Win Rate: проверка сигналов</b>",
         "Режим: <b>проверка направления без ордеров</b>",
@@ -28370,6 +28374,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
         f"• Свежая динамика: {_ui_html(_signal_wr_recent_sequence_v793(recent_evaluated))}",
         f"• Серия: {_ui_html(_signal_wr_streak_text_v793(recent_evaluated))}",
         f"• Что делать: {_ui_html(_signal_wr_action_note_text_v794(stats.get('counted'), stats.get('winrate'), recent_evaluated))}",
+        f"• Проверка: {_ui_html(_signal_wr_pending_check_text_v795(pending_rows))}",
     ]
     if completed:
         lines += ["", "✅ <b>Новые проверки</b>"]
@@ -28398,7 +28403,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.94 Win Rate Action Note"
+BOT_VERSION_LABEL = "v7.95 Win Rate Pending Check ETA"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28519,6 +28524,7 @@ RUNTIME_LAYERS = [
     ("v7.92", "clear Win Rate counted base versus separate FLAT outcomes"),
     ("v7.93", "recent Win Rate outcome sequence and current streak in reports"),
     ("v7.94", "risk-first action note for Win Rate reports"),
+    ("v7.95", "show next pending Win Rate check time in menu and report"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

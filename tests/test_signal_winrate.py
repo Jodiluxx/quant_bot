@@ -9,6 +9,7 @@ from quant_bot.signal_winrate import (
     outcome_hint,
     outcome_legend_lines,
     outcome_streak_text,
+    pending_check_text,
     recent_outcome_sequence,
     result_suffix,
     sample_quality_badge,
@@ -98,6 +99,21 @@ class SignalWinrateHelperTests(unittest.TestCase):
         self.assertIn("осторожное преимущество", action_note_text(40, 65, ["WIN", "LOSS"]))
         self.assertIn("качество слабое", action_note_text(40, 40, ["LOSS", "WIN"]))
         self.assertIn("режим наблюдения", action_note_text(40, 52, ["FLAT", "WIN"]))
+
+    def test_pending_check_text_shows_next_or_overdue_check(self) -> None:
+        now = datetime(2026, 6, 7, 12, 0, tzinfo=timezone.utc)
+        rows = [
+            {"status": "PENDING", "due_at": "2026-06-07T12:45:00+00:00"},
+            {"status": "PENDING", "due_at": "2026-06-07T12:15:00+00:00"},
+            {"status": "WIN", "due_at": "2026-06-07T12:05:00+00:00"},
+        ]
+
+        self.assertEqual(pending_check_text([], now), "pending-сигналов нет")
+        self.assertEqual(pending_check_text(rows, now), "ближайшая проверка: 12:15 UTC")
+        self.assertEqual(
+            pending_check_text(rows, datetime(2026, 6, 7, 12, 20, tzinfo=timezone.utc)),
+            "просрочены: 1; обнови Win Rate",
+        )
 
 
 if __name__ == "__main__":

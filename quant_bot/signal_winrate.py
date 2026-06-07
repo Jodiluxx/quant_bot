@@ -5,7 +5,7 @@ already-calculated values for Telegram cards.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -191,6 +191,48 @@ def action_note_text(counted: Any, winrate: Any, statuses: Any, min_samples: int
     if wr_value is not None and wr_value <= 45:
         return "качество слабое; ищи фильтры по активам, TF и причинам LOSS"
     return "режим наблюдения; сравнивай группы без резких изменений"
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    """Parse a journal datetime without depending on the legacy runtime."""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def pending_check_text(rows: Any, now: datetime | None = None) -> str:
+    """Explain when pending Win Rate signals will be checked next."""
+    pending: list[datetime] = []
+    for row in list(rows or []):
+        if _status_text(row) != "PENDING":
+            continue
+        due = _parse_datetime(row.get("due_at") if isinstance(row, dict) else None)
+        if due is not None:
+            pending.append(due)
+    if not pending:
+        return "pending-сигналов нет"
+
+    pending.sort()
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    overdue = [dt for dt in pending if dt <= current]
+    if overdue:
+        return f"просрочены: {len(overdue)}; обнови Win Rate"
+    return f"ближайшая проверка: {pending[0].strftime('%H:%M UTC')}"
 
 
 def result_suffix(status: Any, edge: Any = None, due_at: datetime | None = None) -> str:
