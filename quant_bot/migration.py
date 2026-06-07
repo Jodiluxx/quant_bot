@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .code_audit import audit_payload, cleanup_priority
+
 
 MIGRATION_AREAS: list[dict[str, Any]] = [
     {
@@ -115,6 +117,7 @@ def migration_next_steps(areas: list[dict[str, Any]] | None = None, limit: int =
 
 def checklist_payload(runtime_version: str, runtime_layers: list[tuple[str, str]], active_functions: dict[str, Any]) -> dict[str, Any]:
     summary = migration_summary()
+    audit = audit_payload(active_runtime_names=(active_functions or {}).keys(), duplicate_limit=10)
     return {
         "runtime_version": runtime_version,
         "runtime_layers": len(runtime_layers or []),
@@ -122,4 +125,6 @@ def checklist_payload(runtime_version: str, runtime_layers: list[tuple[str, str]
         "summary": summary,
         "areas": list(MIGRATION_AREAS),
         "next_steps": migration_next_steps(),
+        "code_audit": audit,
+        "cleanup_priority": cleanup_priority(audit),
     }
