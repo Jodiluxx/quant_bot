@@ -28053,8 +28053,78 @@ from quant_bot.ui_format import (
     winrate_bar as _ui_format_winrate_bar_v782,
 )
 
+from quant_bot.telegram_ui import (
+    button as _tg_button_v785,
+    keyboard as _tg_keyboard_v785,
+    row as _tg_row_v785,
+)
 
-BOT_VERSION_LABEL = "v7.84 Telegram Status Formatting Extraction"
+
+# ============================================================
+# v7.85 - TELEGRAM KEYBOARD HELPER EXTRACTION
+# ============================================================
+# UI-only layer: active public keyboards are rebuilt through pure helpers in
+# quant_bot.telegram_ui. Callback data is intentionally unchanged.
+
+def main_keyboard():
+    return _tg_keyboard_v785(
+        _tg_row_v785(_tg_button_v785("🔍 Сканировать рынки", "menu_signal")),
+        _tg_row_v785(
+            _tg_button_v785("📊 Win Rate", "menu_autobot"),
+            _tg_button_v785("⚙️ Настройки", "auto_settings"),
+        ),
+    )
+
+
+def autobot_keyboard(chat_id):
+    pending = _signal_winrate_pending_count_v779(chat_id)
+    total = len(_signal_winrate_rows_v777(chat_id, limit=SIGNAL_WINRATE_MAX_ROWS_V777))
+    return _tg_keyboard_v785(
+        _tg_row_v785(_tg_button_v785("🔄 Обновить статистику", "paper_closed_menu")),
+        _tg_row_v785(
+            _tg_button_v785("▶️ Скан сейчас", "paper_run_now"),
+            _tg_button_v785(f"⏳ На проверке ({pending})", "paper_open_positions"),
+        ),
+        _tg_row_v785(
+            _tg_button_v785(f"📋 История ({total})", "wr_page_recent_0"),
+            _tg_button_v785("⚙️ Настройки", "auto_settings"),
+        ),
+        _tg_row_v785(_tg_button_v785("🏠 Главное меню", "back_main")),
+    )
+
+
+def auto_settings_keyboard(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    tracker = _get_auto_task_settings(chat_id, "paper_trader")
+    global_on = chat_id in auto_chat_ids
+    return _tg_keyboard_v785(
+        _tg_row_v785(_tg_button_v785("🟢 Всё включено" if global_on else "⚪ Всё выключено", "toggle_auto")),
+        _tg_row_v785(_tg_button_v785(f"{'🟢' if sig.get('enabled') else '⚪'} Авто-сигналы · 5м", "auto_task_signals")),
+        _tg_row_v785(_tg_button_v785(f"{'🟢' if tracker.get('enabled') else '⚪'} Win Rate · 5м", "auto_task_paper_trader")),
+        _tg_row_v785(
+            _tg_button_v785("◀️ Win Rate", "menu_autobot"),
+            _tg_button_v785("🏠 Меню", "back_main"),
+        ),
+    )
+
+
+def compact_signal_keyboard(open_callback=None):
+    return _tg_keyboard_v785(
+        _tg_row_v785(_tg_button_v785("🔄 Обновить сигнал", "get_signal")),
+        _tg_row_v785(
+            _tg_button_v785("🎯 Вход", "signal_tab_entry"),
+            _tg_button_v785("📡 Контекст", "signal_tab_context"),
+        ),
+        _tg_row_v785(_tg_button_v785("🔎 Скан всех активов", "signal_scan_all")),
+        _tg_row_v785(
+            _tg_button_v785("◀️ Назад", "sig_active_group"),
+            _tg_button_v785("🏠 Меню", "back_main"),
+        ),
+    )
+
+
+BOT_VERSION_LABEL = "v7.85 Telegram Keyboard Helper Extraction"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28165,6 +28235,7 @@ RUNTIME_LAYERS = [
     ("v7.82", "pure Telegram UI formatting helpers extracted to quant_bot.ui_format"),
     ("v7.83", "Telegram HTML, code, rule and timeframe primitives extracted to quant_bot.ui_format"),
     ("v7.84", "Telegram signal and scan status formatting extracted to quant_bot.ui_format"),
+    ("v7.85", "Telegram keyboard helpers extracted to quant_bot.telegram_ui"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
