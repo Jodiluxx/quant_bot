@@ -55,6 +55,38 @@ def nav_row(back_callback: object, *, back_text: object = "◀️ Назад", h
     return row(button(back_text, back_callback), button(home_text, home_callback))
 
 
+def text_card(*parts: object) -> str:
+    """Join Telegram card lines while skipping ``None`` values.
+
+    Lists/tuples are flattened one level. Empty strings are preserved because
+    they intentionally create visual spacing in Telegram cards.
+    """
+    lines: list[str] = []
+    for part in parts:
+        if part is None:
+            continue
+        if isinstance(part, (list, tuple)):
+            lines.extend(str(item) for item in part if item is not None)
+        else:
+            lines.append(str(part))
+    return "\n".join(lines)
+
+
+def title_line(icon: object, title: object) -> str:
+    """Build a compact HTML title line."""
+    prefix = str(icon or "").strip()
+    if prefix:
+        return f"{prefix} <b>{title}</b>"
+    return f"<b>{title}</b>"
+
+
+def kv_line(label: object, value: object, *, bold: bool = False) -> str:
+    """Build a Telegram-friendly ``label: value`` line."""
+    if bold:
+        return f"{label}: <b>{value}</b>"
+    return f"{label}: {value}"
+
+
 def callback_values(markup: dict[str, Any] | None) -> list[str]:
     """Return callback_data values in display order for regression tests."""
     values: list[str] = []

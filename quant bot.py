@@ -28057,8 +28057,11 @@ from quant_bot.telegram_ui import (
     button as _tg_button_v785,
     chunked_buttons as _tg_chunked_buttons_v786,
     keyboard as _tg_keyboard_v785,
+    kv_line as _tg_kv_line_v787,
     nav_row as _tg_nav_row_v786,
     row as _tg_row_v785,
+    text_card as _tg_text_card_v787,
+    title_line as _tg_title_line_v787,
 )
 
 
@@ -28222,7 +28225,85 @@ def signal_scan_all_keyboard_v759(chat_id):
     )
 
 
-BOT_VERSION_LABEL = "v7.86 Signal Keyboard Helper Extraction"
+# ============================================================
+# v7.87 - TELEGRAM TEXT CARD HELPER EXTRACTION
+# ============================================================
+# UI-only layer: compact menu/status cards use shared text-card helpers.
+# No signal, risk, exchange, journal or data calculations are changed.
+
+def format_signal_menu_text(chat_id):
+    group, ticker, interval = _signal_group_state_v766(chat_id)
+    meta = SIGNAL_GROUPS_V766[group]
+    return _tg_text_card_v787(
+        _tg_title_line_v787("🔍", "Сканирование рынков"),
+        _ui_rule_v779(),
+        f"Выбран: {_ui_code_v779(_ui_signal_symbol_v764(ticker))} | TF {_ui_code_v779(_ui_tf_short(interval))}",
+        _tg_kv_line_v787("Рынок", _ui_html(meta["title"]), bold=True),
+        "",
+        "Авто-сигналы проверяют рынки каждые <b>5м</b> и присылают только уверенные LONG/SHORT.",
+        "Выбери рынок ниже.",
+    )
+
+
+def format_signal_group_menu_text_v766(chat_id, group):
+    group, ticker, interval = _signal_group_state_v766(chat_id, group)
+    meta = SIGNAL_GROUPS_V766[group]
+    if group == "crypto":
+        source = "Binance Futures, TF 5м-4ч."
+    elif group == "stocks" and _alpaca_enabled_for_ticker_v771(ticker):
+        source = f"Alpaca Market Data ({_ui_html(_alpaca_feed_v771().upper())}), TF 5м-4ч."
+    elif group == "stocks":
+        source = "Yahoo delayed, TF 30м+ во время NYSE."
+    elif _oanda_enabled_for_ticker_v770(ticker):
+        source = "OANDA v20, TF 5м-4ч."
+    else:
+        source = "Yahoo futures proxy, TF 30м+, рынок 24/5."
+    return _tg_text_card_v787(
+        _tg_title_line_v787(meta["emoji"], meta["title"]),
+        _ui_rule_v779(),
+        f"Актив: {_ui_code_v779(_ui_signal_symbol_v764(ticker))}",
+        f"TF: {_ui_code_v779(_ui_tf_short(interval))}",
+        _tg_kv_line_v787("Источник", source, bold=True),
+        "",
+        "Сигнал покажет LONG / SHORT / WAIT. Подробные расчёты остаются внутри бота.",
+    )
+
+
+def auto_settings_text(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    sig = _get_auto_task_settings(chat_id, "signals")
+    tracker = _get_auto_task_settings(chat_id, "paper_trader")
+    return _tg_text_card_v787(
+        _tg_title_line_v787("⚙️", "Настройки уведомлений"),
+        _ui_rule_v779(),
+        _tg_kv_line_v787("Общий режим", "ON" if chat_id in auto_chat_ids else "OFF", bold=True),
+        f"Авто-сигналы: <b>{'ON' if sig.get('enabled') else 'OFF'}</b> | каждые 5м",
+        f"Win Rate: <b>{'ON' if tracker.get('enabled') else 'OFF'}</b> | проверка каждые 5м",
+        "",
+        "Авто-сигналы присылают только уверенные LONG/SHORT.",
+        "Win Rate проверяет, была ли идея права после своего TF.",
+    )
+
+
+def format_main_status(chat_id):
+    _simple_sync_public_auto_settings(chat_id)
+    ticker = user_tickers.get(chat_id, "BTCUSDT")
+    interval = user_intervals.get(chat_id, "15m")
+    stats = _signal_winrate_stats_v777(chat_id)
+    auto_state = "ON" if chat_id in auto_chat_ids else "OFF"
+    wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
+    return _tg_text_card_v787(
+        _tg_title_line_v787("🏠", "Главное меню"),
+        _ui_rule_v779(),
+        f"Актив: {_ui_code_v779(_ui_signal_symbol_v764(ticker))} | TF {_ui_code_v779(_ui_tf_short(interval))}",
+        f"Авто: <b>{auto_state}</b> | Win Rate: <b>{wr}</b> {_signal_winrate_bar_v779(stats.get('winrate'))}",
+        f"Проверено: <b>{stats['counted']}</b> | На проверке: <b>{stats['pending']}</b>",
+        "",
+        "Выбери действие ниже.",
+    )
+
+
+BOT_VERSION_LABEL = "v7.87 Telegram Text Card Helper Extraction"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28335,6 +28416,7 @@ RUNTIME_LAYERS = [
     ("v7.84", "Telegram signal and scan status formatting extracted to quant_bot.ui_format"),
     ("v7.85", "Telegram keyboard helpers extracted to quant_bot.telegram_ui"),
     ("v7.86", "signal keyboard helpers extracted to quant_bot.telegram_ui"),
+    ("v7.87", "Telegram text-card helpers extracted to quant_bot.telegram_ui"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from quant_bot.telegram_ui import button, callback_values, chunked_buttons, has_callback, keyboard, nav_row, row
+from quant_bot.telegram_ui import button, callback_values, chunked_buttons, has_callback, keyboard, kv_line, nav_row, row, text_card, title_line
 
 
 class TelegramUiHelperTests(unittest.TestCase):
@@ -31,6 +31,18 @@ class TelegramUiHelperTests(unittest.TestCase):
         self.assertEqual([len(item) for item in rows], [2, 2, 1])
         markup = keyboard(*rows, nav_row("menu_signal"))
         self.assertEqual(callback_values(markup)[-2:], ["menu_signal", "back_main"])
+
+    def test_text_card_helpers_keep_spacing_and_skip_none(self) -> None:
+        text = text_card(
+            title_line("X", "Screen"),
+            "-----",
+            [kv_line("Mode", "ON", bold=True), None],
+            "",
+            "Hint",
+            None,
+        )
+
+        self.assertEqual(text.splitlines(), ["X <b>Screen</b>", "-----", "Mode: <b>ON</b>", "", "Hint"])
 
 
 if __name__ == "__main__":
