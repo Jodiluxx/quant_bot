@@ -98,6 +98,26 @@ def sample_quality_badge(counted: Any, min_samples: int = 30) -> str:
     return "сильная"
 
 
+def basis_counts_text(wins: Any, losses: Any, flats: Any, pending: Any | None = None) -> str:
+    """Explain which outcomes are counted in WR and which are tracked aside."""
+    def to_int(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    win_count = to_int(wins)
+    loss_count = to_int(losses)
+    flat_count = to_int(flats)
+    parts = [
+        f"WR база: {win_count + loss_count} WIN/LOSS",
+        f"FLAT отдельно: {flat_count}",
+    ]
+    if pending is not None:
+        parts.append(f"ждут: {to_int(pending)}")
+    return " | ".join(parts)
+
+
 def result_suffix(status: Any, edge: Any = None, due_at: datetime | None = None) -> str:
     """Build the short suffix after a Win Rate row status."""
     text = str(status or "").upper()

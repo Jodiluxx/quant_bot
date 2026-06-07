@@ -28064,6 +28064,7 @@ from quant_bot.telegram_ui import (
     title_line as _tg_title_line_v787,
 )
 from quant_bot.signal_winrate import (
+    basis_counts_text as _signal_wr_basis_counts_text_v792,
     outcome_hint as _signal_wr_outcome_hint_v789,
     outcome_legend_lines as _signal_wr_legend_lines_v789,
     result_suffix as _signal_wr_result_suffix_v788,
@@ -28306,7 +28307,7 @@ def format_main_status(chat_id):
         _ui_rule_v779(),
         f"Актив: {_ui_code_v779(_ui_signal_symbol_v764(ticker))} | TF {_ui_code_v779(_ui_tf_short(interval))}",
         f"Авто: <b>{auto_state}</b> | Win Rate: <b>{wr}</b> {_signal_winrate_bar_v779(stats.get('winrate'))}",
-        f"Проверено: <b>{stats['counted']}</b> | На проверке: <b>{stats['pending']}</b>",
+        _ui_html(_signal_wr_basis_counts_text_v792(stats["wins"], stats["losses"], stats["flats"], stats["pending"])),
         f"Надёжность WR: <b>{_ui_html(_signal_wr_sample_quality_badge_v791(stats.get('counted')))}</b>",
         "",
         "Выбери действие ниже.",
@@ -28359,9 +28360,9 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
         "📊 <b>Общая статистика</b>",
         f"• Винрейт: <b>{wr}</b> {_signal_winrate_bar_v779(stats.get('winrate'))}",
         f"• Результаты: 🟢 {stats['wins']} WIN | 🔴 {stats['losses']} LOSS | ⚪ {stats['flats']} FLAT",
+        f"• {_ui_html(_signal_wr_basis_counts_text_v792(stats['wins'], stats['losses'], stats['flats'], stats['pending']))}",
         f"• Надёжность: {_ui_html(_signal_wr_sample_quality_text_v790(stats.get('counted')))}",
         f"• Матем. ожидание: {avg}",
-        f"• На проверке: <b>{stats['pending']}</b>",
     ]
     if completed:
         lines += ["", "✅ <b>Новые проверки</b>"]
@@ -28390,7 +28391,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.91 Main Menu Win Rate Reliability Badge"
+BOT_VERSION_LABEL = "v7.92 Clear Win Rate Count Basis"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28508,6 +28509,7 @@ RUNTIME_LAYERS = [
     ("v7.89", "clear Win Rate outcome wording for WIN, LOSS, FLAT and PENDING"),
     ("v7.90", "clear Win Rate sample-size wording before trusting statistics"),
     ("v7.91", "compact Win Rate reliability badge in the main menu"),
+    ("v7.92", "clear Win Rate counted base versus separate FLAT outcomes"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

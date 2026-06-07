@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timezone
 
 from quant_bot.signal_winrate import (
+    basis_counts_text,
     outcome_hint,
     outcome_legend_lines,
     result_suffix,
@@ -59,6 +60,16 @@ class SignalWinrateHelperTests(unittest.TestCase):
         self.assertEqual(sample_quality_badge(18), "мало")
         self.assertEqual(sample_quality_badge(30), "рабочая")
         self.assertEqual(sample_quality_badge(120), "сильная")
+
+    def test_basis_counts_text_separates_wr_base_from_flat(self) -> None:
+        self.assertEqual(
+            basis_counts_text(2, 1, 3, 4),
+            "WR база: 3 WIN/LOSS | FLAT отдельно: 3 | ждут: 4",
+        )
+        self.assertEqual(
+            basis_counts_text("bad", None, -5),
+            "WR база: 0 WIN/LOSS | FLAT отдельно: 0",
+        )
 
 
 if __name__ == "__main__":

@@ -459,6 +459,8 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("данных мало", text)
         self.assertIn("🟢 2 WIN | 🔴 1 LOSS | ⚪ 0 FLAT", text)
         self.assertIn("FLAT — движение слабое; это не победа и не поражение", text)
+        self.assertIn("WR база: 3 WIN/LOSS", text)
+        self.assertIn("FLAT отдельно: 0", text)
         self.assertIn("Надёжность", text)
         self.assertIn("очень мало данных", text)
 
@@ -564,7 +566,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertEqual(edge_text("bad"), "⚪ н/д")
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.91 Main Menu Win Rate Reliability Badge")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.92 Clear Win Rate Count Basis")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
@@ -1318,6 +1320,7 @@ class TelegramUiPolishTests(unittest.TestCase):
             self.bot._testnet_ui_cache_v768.update(old_cache)
 
         self.assertIn("Win Rate", text)
+        self.assertIn("WR база", text)
         self.assertIn("Надёжность WR", text)
         self.assertEqual(calls, {"open": 0, "income": 0})
 
