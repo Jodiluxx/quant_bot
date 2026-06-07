@@ -33,11 +33,11 @@ def code(value: object) -> str:
 def compact_tf(interval: object, fallback_label: object | None = None) -> str:
     """Compact timeframe label for Telegram buttons and cards."""
     text = str(interval or "")
-    if text.endswith("m"):
+    if text.endswith("m") and text[:-1].isdigit():
         return text[:-1] + "м"
-    if text.endswith("h"):
+    if text.endswith("h") and text[:-1].isdigit():
         return text[:-1] + "ч"
-    if text.endswith("d"):
+    if text.endswith("d") and text[:-1].isdigit():
         return text[:-1] + "д"
     label = str(fallback_label if fallback_label is not None else text)
     return (
