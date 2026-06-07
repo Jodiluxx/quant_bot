@@ -28063,6 +28063,11 @@ from quant_bot.telegram_ui import (
     text_card as _tg_text_card_v787,
     title_line as _tg_title_line_v787,
 )
+from quant_bot.signal_winrate import (
+    result_suffix as _signal_wr_result_suffix_v788,
+    signal_status_icon as _signal_wr_status_icon_v788,
+    winrate_text as _signal_wr_text_v788,
+)
 
 
 # ============================================================
@@ -28303,7 +28308,34 @@ def format_main_status(chat_id):
     )
 
 
-BOT_VERSION_LABEL = "v7.87 Telegram Text Card Helper Extraction"
+# ============================================================
+# v7.88 - SIGNAL WIN RATE FORMAT HELPER EXTRACTION
+# ============================================================
+# UI-only layer: Win Rate row formatting uses pure package helpers. Journal
+# loading, signal evaluation and statistics are unchanged.
+
+def _signal_winrate_bucket_line_v779(bucket):
+    wr = _signal_wr_text_v788(bucket.get("winrate"))
+    edge = _signal_winrate_edge_text_v779(bucket.get("avg_edge"))
+    quality = _signal_winrate_bucket_quality_v778(bucket)
+    return (
+        f"• {_ui_code_v779(bucket.get('label'))}: <b>WR {wr}</b> | "
+        f"🟢 {bucket.get('wins', 0)} WIN | 🔴 {bucket.get('losses', 0)} LOSS | ⚪ {bucket.get('flats', 0)} FLAT | "
+        f"Edge {edge} | {_ui_html(quality)}"
+    )
+
+
+def _signal_winrate_recent_line_v779(row):
+    ticker = _ui_signal_symbol_v764(row.get("ticker"))
+    direction = str(row.get("direction") or "").upper()
+    tf = _ui_tf_short(row.get("interval"))
+    status = str(row.get("status") or "n/a").upper()
+    due = _signal_winrate_parse_dt_v777(row.get("due_at")) if status == "PENDING" else None
+    suffix = _signal_wr_result_suffix_v788(status, row.get("result_edge_pct"), due)
+    return f"{_signal_wr_status_icon_v788(status)} {_ui_code_v779(ticker)} {tf} {direction} → <b>{_ui_html(status)}</b>{_ui_html(suffix)} | вход {_ui_money_code_v779(row.get('entry_price'), row.get('ticker'))}"
+
+
+BOT_VERSION_LABEL = "v7.88 Signal Win Rate Format Helper Extraction"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28417,6 +28449,7 @@ RUNTIME_LAYERS = [
     ("v7.85", "Telegram keyboard helpers extracted to quant_bot.telegram_ui"),
     ("v7.86", "signal keyboard helpers extracted to quant_bot.telegram_ui"),
     ("v7.87", "Telegram text-card helpers extracted to quant_bot.telegram_ui"),
+    ("v7.88", "signal Win Rate formatting helpers extracted to quant_bot.signal_winrate"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
