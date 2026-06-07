@@ -138,6 +138,7 @@ def focus_note_text(buckets: Any, min_samples: int = 5) -> str:
         usable.append({
             "label": _focus_bucket_label(raw),
             "counted": counted,
+            "evidence": sample_quality_badge(counted),
             "winrate": winrate,
             "edge": edge,
         })
@@ -150,9 +151,9 @@ def focus_note_text(buckets: Any, min_samples: int = 5) -> str:
 
     parts: list[str] = []
     if best["winrate"] >= 60.0:
-        parts.append(f"лучше: {best['label']} WR {best['winrate']:.1f}% ({best['counted']})")
+        parts.append(f"лучше: {best['label']} WR {best['winrate']:.1f}% ({best['counted']}, {best['evidence']})")
     if weak["winrate"] <= 45.0 and (weak["label"] != best["label"] or not parts):
-        parts.append(f"слабее: {weak['label']} WR {weak['winrate']:.1f}% ({weak['counted']})")
+        parts.append(f"слабее: {weak['label']} WR {weak['winrate']:.1f}% ({weak['counted']}, {weak['evidence']})")
     if not parts:
         return "яркого перекоса нет; продолжай копить статистику по группам"
     return " | ".join(parts)

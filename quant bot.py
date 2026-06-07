@@ -28414,7 +28414,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.97 Group-Labeled Win Rate Focus"
+BOT_VERSION_LABEL = "v7.98 Win Rate Focus Evidence"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28538,6 +28538,7 @@ RUNTIME_LAYERS = [
     ("v7.95", "show next pending Win Rate check time in menu and report"),
     ("v7.96", "focus note for Win Rate group analysis"),
     ("v7.97", "group-labeled Win Rate focus notes"),
+    ("v7.98", "evidence labels for Win Rate focus notes"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

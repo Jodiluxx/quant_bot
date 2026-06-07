@@ -125,8 +125,8 @@ class SignalWinrateHelperTests(unittest.TestCase):
 
         note = focus_note_text(buckets, min_samples=5)
 
-        self.assertIn("лучше: BTCUSDT WR 75.0% (8)", note)
-        self.assertIn("слабее: ETHUSDT WR 42.8% (7)", note)
+        self.assertIn("лучше: BTCUSDT WR 75.0% (8, очень мало)", note)
+        self.assertIn("слабее: ETHUSDT WR 42.8% (7, очень мало)", note)
 
     def test_focus_note_text_labels_bucket_group_context(self) -> None:
         buckets = [
@@ -152,7 +152,14 @@ class SignalWinrateHelperTests(unittest.TestCase):
             {"label": "15м", "counted": 6, "winrate": 33.3, "avg_edge": -0.5},
         ], min_samples=5)
 
-        self.assertIn("слабее: 15м WR 33.3% (6)", note)
+        self.assertIn("слабее: 15м WR 33.3% (6, очень мало)", note)
+
+    def test_focus_note_text_marks_working_sample_size(self) -> None:
+        note = focus_note_text([
+            {"label": "LONG", "counted": 35, "winrate": 62.8, "avg_edge": 0.1},
+        ], min_samples=5)
+
+        self.assertIn("лучше: LONG WR 62.8% (35, рабочая)", note)
 
 
 if __name__ == "__main__":
