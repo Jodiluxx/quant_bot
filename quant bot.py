@@ -28055,7 +28055,9 @@ from quant_bot.ui_format import (
 
 from quant_bot.telegram_ui import (
     button as _tg_button_v785,
+    chunked_buttons as _tg_chunked_buttons_v786,
     keyboard as _tg_keyboard_v785,
+    nav_row as _tg_nav_row_v786,
     row as _tg_row_v785,
 )
 
@@ -28124,7 +28126,103 @@ def compact_signal_keyboard(open_callback=None):
     )
 
 
-BOT_VERSION_LABEL = "v7.85 Telegram Keyboard Helper Extraction"
+# ============================================================
+# v7.86 - SIGNAL KEYBOARD HELPER EXTRACTION
+# ============================================================
+# UI-only layer: signal market, asset, TF and scan keyboards use the shared
+# telegram_ui helpers. Callback data stays exactly the same.
+
+def _signal_group_button_v786(chat_id, group):
+    active = _signal_group_state_v766(chat_id)[0]
+    meta = SIGNAL_GROUPS_V766[group]
+    mark = "✅" if active == group else meta["emoji"]
+    return _tg_button_v785(f"{mark} {meta['title']}", meta["callback"])
+
+
+def signal_menu_keyboard(chat_id):
+    return _tg_keyboard_v785(
+        _tg_row_v785(
+            _signal_group_button_v786(chat_id, "crypto"),
+            _signal_group_button_v786(chat_id, "stocks"),
+        ),
+        _tg_row_v785(_signal_group_button_v786(chat_id, "commodities")),
+        _tg_row_v785(_tg_button_v785("🔎 Скан всех активов", "signal_scan_all")),
+        _tg_row_v785(
+            _tg_button_v785("⚙️ Настройки", "auto_settings"),
+            _tg_button_v785("🏠 Меню", "back_main"),
+        ),
+    )
+
+
+def signal_group_keyboard_v766(chat_id, group):
+    group, ticker, interval = _signal_group_state_v766(chat_id, group)
+    meta = SIGNAL_GROUPS_V766[group]
+    return _tg_keyboard_v785(
+        _tg_row_v785(_tg_button_v785(f"📡 Сигнал: {_ui_signal_symbol_v764(ticker)} / {_ui_tf_short(interval)}", "get_signal")),
+        _tg_row_v785(_tg_button_v785(f"🔎 Сканировать все: {meta['title']}", meta["scan_callback"])),
+        _tg_row_v785(
+            _tg_button_v785(f"🎛 Актив: {_ui_signal_symbol_v764(ticker)}", meta["asset_callback"]),
+            _tg_button_v785(f"⏱ TF: {_ui_tf_short(interval)}", meta["tf_callback"]),
+        ),
+        _tg_nav_row_v786("menu_signal"),
+    )
+
+
+def signal_group_asset_keyboard_v766(chat_id, group):
+    group, ticker, _ = _signal_group_state_v766(chat_id, group)
+    buttons = []
+    for item in _signal_group_tickers_v766(group):
+        label = TICKERS[item]["label"]
+        if item == ticker:
+            label = "✅ " + label
+        buttons.append(_tg_button_v785(label, f"sig_ticker_{item}"))
+    return _tg_keyboard_v785(
+        *_tg_chunked_buttons_v786(buttons, width=2),
+        _tg_nav_row_v786(SIGNAL_GROUPS_V766[group]["callback"]),
+    )
+
+
+def signal_group_tf_keyboard_v766(chat_id, group):
+    group, _, interval = _signal_group_state_v766(chat_id, group)
+    buttons = []
+    for iv in _signal_group_tfs_v766(group):
+        label = _ui_tf_short(iv)
+        if iv == interval:
+            label = f"• {label} •"
+        buttons.append(_tg_button_v785(label, f"sig_interval_{iv}"))
+    return _tg_keyboard_v785(
+        *_tg_chunked_buttons_v786(buttons, width=3),
+        _tg_nav_row_v786(SIGNAL_GROUPS_V766[group]["callback"]),
+    )
+
+
+def signal_scan_group_keyboard_v764(group, chat_id=None):
+    meta = SIGNAL_GROUPS_V766.get(group, SIGNAL_GROUPS_V766["crypto"])
+    return _tg_keyboard_v785(
+        _tg_row_v785(_tg_button_v785(f"🔄 Перезапустить скан: {meta['title']}", meta["scan_callback"])),
+        _tg_row_v785(
+            _tg_button_v785("🎛 Изменить активы", meta["asset_callback"]),
+            _tg_button_v785("⏱ Изменить TF", meta["tf_callback"]),
+        ),
+        _tg_nav_row_v786(meta["callback"]),
+    )
+
+
+def signal_scan_all_keyboard_v759(chat_id):
+    group, ticker, interval = _signal_group_state_v766(chat_id)
+    meta = SIGNAL_GROUPS_V766[group]
+    return _tg_keyboard_v785(
+        _tg_row_v785(_tg_button_v785("🔄 Скан всех активов", "signal_scan_all")),
+        _tg_row_v785(_tg_button_v785(f"📡 Сигнал: {_ui_signal_symbol_v764(ticker)} / {_ui_tf_short(interval)}", "get_signal")),
+        _tg_row_v785(
+            _tg_button_v785("🎛 Актив", meta["asset_callback"]),
+            _tg_button_v785("⏱ TF", meta["tf_callback"]),
+        ),
+        _tg_nav_row_v786("menu_signal"),
+    )
+
+
+BOT_VERSION_LABEL = "v7.86 Signal Keyboard Helper Extraction"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28236,6 +28334,7 @@ RUNTIME_LAYERS = [
     ("v7.83", "Telegram HTML, code, rule and timeframe primitives extracted to quant_bot.ui_format"),
     ("v7.84", "Telegram signal and scan status formatting extracted to quant_bot.ui_format"),
     ("v7.85", "Telegram keyboard helpers extracted to quant_bot.telegram_ui"),
+    ("v7.86", "signal keyboard helpers extracted to quant_bot.telegram_ui"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

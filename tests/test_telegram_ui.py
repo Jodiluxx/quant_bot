@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from quant_bot.telegram_ui import button, callback_values, has_callback, keyboard, row
+from quant_bot.telegram_ui import button, callback_values, chunked_buttons, has_callback, keyboard, nav_row, row
 
 
 class TelegramUiHelperTests(unittest.TestCase):
@@ -23,6 +23,14 @@ class TelegramUiHelperTests(unittest.TestCase):
         self.assertEqual(callback_values(markup), ["3"])
         self.assertTrue(has_callback(markup, "3"))
         self.assertFalse(has_callback(markup, "missing"))
+
+    def test_chunked_buttons_and_nav_row_are_stable(self) -> None:
+        buttons = [button(f"B{i}", f"cb{i}") for i in range(5)]
+        rows = chunked_buttons(buttons, width=2)
+
+        self.assertEqual([len(item) for item in rows], [2, 2, 1])
+        markup = keyboard(*rows, nav_row("menu_signal"))
+        self.assertEqual(callback_values(markup)[-2:], ["menu_signal", "back_main"])
 
 
 if __name__ == "__main__":

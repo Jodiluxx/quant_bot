@@ -35,6 +35,26 @@ def keyboard(*rows: Iterable[Button] | None) -> Keyboard:
     return {"inline_keyboard": clean_rows}
 
 
+def chunked_buttons(buttons: Iterable[Button], width: int = 2) -> list[list[Button]]:
+    """Split buttons into Telegram rows with a stable width."""
+    width = max(1, int(width))
+    rows: list[list[Button]] = []
+    current: list[Button] = []
+    for btn in buttons:
+        current.append(btn)
+        if len(current) >= width:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    return rows
+
+
+def nav_row(back_callback: object, *, back_text: object = "◀️ Назад", home_callback: object = "back_main", home_text: object = "🏠 Меню") -> list[Button]:
+    """Standard back/home row for compact Telegram screens."""
+    return row(button(back_text, back_callback), button(home_text, home_callback))
+
+
 def callback_values(markup: dict[str, Any] | None) -> list[str]:
     """Return callback_data values in display order for regression tests."""
     values: list[str] = []
