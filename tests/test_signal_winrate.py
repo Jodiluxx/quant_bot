@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timezone
 
 from quant_bot.signal_winrate import (
+    action_note_text,
     basis_counts_text,
     outcome_hint,
     outcome_legend_lines,
@@ -88,6 +89,15 @@ class SignalWinrateHelperTests(unittest.TestCase):
         self.assertEqual(outcome_streak_text(rows), "серия LOSS: 2")
         self.assertEqual(outcome_streak_text(["FLAT", "FLAT", "WIN"]), "серия FLAT: 2")
         self.assertEqual(outcome_streak_text([]), "серии нет")
+
+    def test_action_note_text_is_risk_first(self) -> None:
+        self.assertIn("копим данные", action_note_text(3, 90, ["WIN", "WIN"]))
+        self.assertIn("серия LOSS", action_note_text(12, 50, ["LOSS", "LOSS", "LOSS", "WIN"]))
+        self.assertIn("риск не повышать", action_note_text(15, 80, ["WIN"] * 5))
+        self.assertIn("до рабочей выборки", action_note_text(20, 55, ["FLAT", "WIN"]))
+        self.assertIn("осторожное преимущество", action_note_text(40, 65, ["WIN", "LOSS"]))
+        self.assertIn("качество слабое", action_note_text(40, 40, ["LOSS", "WIN"]))
+        self.assertIn("режим наблюдения", action_note_text(40, 52, ["FLAT", "WIN"]))
 
 
 if __name__ == "__main__":

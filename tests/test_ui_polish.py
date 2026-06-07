@@ -465,6 +465,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("очень мало данных", text)
         self.assertIn("Свежая динамика", text)
         self.assertIn("Серия", text)
+        self.assertIn("Что делать", text)
 
     def test_signal_winrate_history_is_paginated(self) -> None:
         rows = []
@@ -568,7 +569,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertEqual(edge_text("bad"), "⚪ н/д")
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.93 Win Rate Recent Outcome Dynamics")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.94 Win Rate Action Note")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)

@@ -28064,6 +28064,7 @@ from quant_bot.telegram_ui import (
     title_line as _tg_title_line_v787,
 )
 from quant_bot.signal_winrate import (
+    action_note_text as _signal_wr_action_note_text_v794,
     basis_counts_text as _signal_wr_basis_counts_text_v792,
     outcome_hint as _signal_wr_outcome_hint_v789,
     outcome_legend_lines as _signal_wr_legend_lines_v789,
@@ -28368,6 +28369,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
         f"• Матем. ожидание: {avg}",
         f"• Свежая динамика: {_ui_html(_signal_wr_recent_sequence_v793(recent_evaluated))}",
         f"• Серия: {_ui_html(_signal_wr_streak_text_v793(recent_evaluated))}",
+        f"• Что делать: {_ui_html(_signal_wr_action_note_text_v794(stats.get('counted'), stats.get('winrate'), recent_evaluated))}",
     ]
     if completed:
         lines += ["", "✅ <b>Новые проверки</b>"]
@@ -28396,7 +28398,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.93 Win Rate Recent Outcome Dynamics"
+BOT_VERSION_LABEL = "v7.94 Win Rate Action Note"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28516,6 +28518,7 @@ RUNTIME_LAYERS = [
     ("v7.91", "compact Win Rate reliability badge in the main menu"),
     ("v7.92", "clear Win Rate counted base versus separate FLAT outcomes"),
     ("v7.93", "recent Win Rate outcome sequence and current streak in reports"),
+    ("v7.94", "risk-first action note for Win Rate reports"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

@@ -157,6 +157,42 @@ def outcome_streak_text(statuses: Any) -> str:
     return f"серия {first}: {count}"
 
 
+def action_note_text(counted: Any, winrate: Any, statuses: Any, min_samples: int = 30) -> str:
+    """Return a short, risk-first action note for current Win Rate evidence."""
+    try:
+        count = max(0, int(counted))
+    except (TypeError, ValueError):
+        count = 0
+    minimum = max(1, int(min_samples or 30))
+    values = [_status_text(value) for value in list(statuses or [])]
+    values = [value for value in values if value in {"WIN", "LOSS", "FLAT"}]
+    first = values[0] if values else ""
+    streak = 0
+    for value in values:
+        if value != first:
+            break
+        streak += 1
+
+    try:
+        wr_value = float(winrate)
+    except (TypeError, ValueError):
+        wr_value = None
+
+    if count < 10:
+        return "копим данные; Win Rate пока не оценка качества"
+    if first == "LOSS" and streak >= 3:
+        return "серия LOSS; проверь последние идеи, но не меняй правила на эмоциях"
+    if first == "WIN" and streak >= 5 and count < minimum:
+        return "серия WIN приятная, но выборка мала; риск не повышать"
+    if count < minimum:
+        return f"продолжай сбор; до рабочей выборки ещё {minimum - count}"
+    if wr_value is not None and wr_value >= 60:
+        return "есть осторожное преимущество; сравнивай активы и TF"
+    if wr_value is not None and wr_value <= 45:
+        return "качество слабое; ищи фильтры по активам, TF и причинам LOSS"
+    return "режим наблюдения; сравнивай группы без резких изменений"
+
+
 def result_suffix(status: Any, edge: Any = None, due_at: datetime | None = None) -> str:
     """Build the short suffix after a Win Rate row status."""
     text = str(status or "").upper()
