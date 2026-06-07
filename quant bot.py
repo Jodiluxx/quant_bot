@@ -28067,6 +28067,8 @@ from quant_bot.signal_winrate import (
     basis_counts_text as _signal_wr_basis_counts_text_v792,
     outcome_hint as _signal_wr_outcome_hint_v789,
     outcome_legend_lines as _signal_wr_legend_lines_v789,
+    outcome_streak_text as _signal_wr_streak_text_v793,
+    recent_outcome_sequence as _signal_wr_recent_sequence_v793,
     result_suffix as _signal_wr_result_suffix_v788,
     sample_quality_badge as _signal_wr_sample_quality_badge_v791,
     sample_quality_text as _signal_wr_sample_quality_text_v790,
@@ -28352,6 +28354,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     stats = _signal_winrate_stats_v777(chat_id)
     wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
     avg = _signal_winrate_edge_text_v779(stats.get("avg_edge"))
+    recent_evaluated = _signal_winrate_rows_v777(chat_id, limit=8, statuses={"WIN", "LOSS", "FLAT"})
     lines = [
         "📈 <b>Win Rate: проверка сигналов</b>",
         "Режим: <b>проверка направления без ордеров</b>",
@@ -28363,6 +28366,8 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
         f"• {_ui_html(_signal_wr_basis_counts_text_v792(stats['wins'], stats['losses'], stats['flats'], stats['pending']))}",
         f"• Надёжность: {_ui_html(_signal_wr_sample_quality_text_v790(stats.get('counted')))}",
         f"• Матем. ожидание: {avg}",
+        f"• Свежая динамика: {_ui_html(_signal_wr_recent_sequence_v793(recent_evaluated))}",
+        f"• Серия: {_ui_html(_signal_wr_streak_text_v793(recent_evaluated))}",
     ]
     if completed:
         lines += ["", "✅ <b>Новые проверки</b>"]
@@ -28391,7 +28396,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.92 Clear Win Rate Count Basis"
+BOT_VERSION_LABEL = "v7.93 Win Rate Recent Outcome Dynamics"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28510,6 +28515,7 @@ RUNTIME_LAYERS = [
     ("v7.90", "clear Win Rate sample-size wording before trusting statistics"),
     ("v7.91", "compact Win Rate reliability badge in the main menu"),
     ("v7.92", "clear Win Rate counted base versus separate FLAT outcomes"),
+    ("v7.93", "recent Win Rate outcome sequence and current streak in reports"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

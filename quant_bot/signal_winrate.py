@@ -118,6 +118,45 @@ def basis_counts_text(wins: Any, losses: Any, flats: Any, pending: Any | None = 
     return " | ".join(parts)
 
 
+def _status_text(value: Any) -> str:
+    """Extract an upper-case status from a raw status or journal row."""
+    if isinstance(value, dict):
+        value = value.get("status")
+    return str(value or "").upper()
+
+
+def recent_outcome_sequence(statuses: Any, limit: int = 8) -> str:
+    """Build a compact newest-first sequence of recent Win Rate outcomes."""
+    icon_map = {
+        "WIN": "🟢W",
+        "LOSS": "🔴L",
+        "FLAT": "⚪F",
+    }
+    items: list[str] = []
+    for value in list(statuses or [])[:max(1, int(limit or 8))]:
+        token = icon_map.get(_status_text(value))
+        if token:
+            items.append(token)
+    if not items:
+        return "нет проверенных исходов"
+    return " ".join(items)
+
+
+def outcome_streak_text(statuses: Any) -> str:
+    """Return the current same-outcome streak from newest-first statuses."""
+    values = [_status_text(value) for value in list(statuses or [])]
+    values = [value for value in values if value in {"WIN", "LOSS", "FLAT"}]
+    if not values:
+        return "серии нет"
+    first = values[0]
+    count = 0
+    for value in values:
+        if value != first:
+            break
+        count += 1
+    return f"серия {first}: {count}"
+
+
 def result_suffix(status: Any, edge: Any = None, due_at: datetime | None = None) -> str:
     """Build the short suffix after a Win Rate row status."""
     text = str(status or "").upper()

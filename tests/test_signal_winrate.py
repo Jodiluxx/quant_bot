@@ -7,6 +7,8 @@ from quant_bot.signal_winrate import (
     basis_counts_text,
     outcome_hint,
     outcome_legend_lines,
+    outcome_streak_text,
+    recent_outcome_sequence,
     result_suffix,
     sample_quality_badge,
     sample_quality_text,
@@ -70,6 +72,22 @@ class SignalWinrateHelperTests(unittest.TestCase):
             basis_counts_text("bad", None, -5),
             "WR база: 0 WIN/LOSS | FLAT отдельно: 0",
         )
+
+    def test_recent_outcome_sequence_and_streak_are_compact(self) -> None:
+        rows = [
+            {"status": "LOSS"},
+            {"status": "LOSS"},
+            {"status": "FLAT"},
+            {"status": "WIN"},
+            {"status": "PENDING"},
+        ]
+
+        self.assertEqual(recent_outcome_sequence(rows), "🔴L 🔴L ⚪F 🟢W")
+        self.assertEqual(recent_outcome_sequence(["WIN", "LOSS"], limit=1), "🟢W")
+        self.assertEqual(recent_outcome_sequence([]), "нет проверенных исходов")
+        self.assertEqual(outcome_streak_text(rows), "серия LOSS: 2")
+        self.assertEqual(outcome_streak_text(["FLAT", "FLAT", "WIN"]), "серия FLAT: 2")
+        self.assertEqual(outcome_streak_text([]), "серии нет")
 
 
 if __name__ == "__main__":
