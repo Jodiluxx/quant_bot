@@ -40,6 +40,27 @@ def signal_status_icon(status: Any) -> str:
     }.get(text, "⚪")
 
 
+def outcome_hint(status: Any) -> str:
+    """Return a short human explanation for a Win Rate outcome."""
+    text = str(status or "").upper()
+    return {
+        "WIN": "в сторону сигнала",
+        "LOSS": "против сигнала",
+        "FLAT": "нейтрально: слабое движение",
+        "PENDING": "ждём закрытия TF",
+    }.get(text, "статус не распознан")
+
+
+def outcome_legend_lines() -> list[str]:
+    """Return compact legend lines for Telegram Win Rate cards."""
+    return [
+        "WIN — цена пошла в сторону сигнала после его TF",
+        "LOSS — цена пошла против сигнала",
+        "FLAT — движение слабое; это не победа и не поражение",
+        "PENDING — сигнал ещё ждёт проверки после своего TF",
+    ]
+
+
 def result_suffix(status: Any, edge: Any = None, due_at: datetime | None = None) -> str:
     """Build the short suffix after a Win Rate row status."""
     text = str(status or "").upper()

@@ -3,7 +3,14 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from quant_bot.signal_winrate import result_suffix, signal_status_icon, signed_percent_text, winrate_text
+from quant_bot.signal_winrate import (
+    outcome_hint,
+    outcome_legend_lines,
+    result_suffix,
+    signal_status_icon,
+    signed_percent_text,
+    winrate_text,
+)
 
 
 class SignalWinrateHelperTests(unittest.TestCase):
@@ -26,6 +33,16 @@ class SignalWinrateHelperTests(unittest.TestCase):
         self.assertEqual(result_suffix("LOSS", -1.0), " -1.00%")
         self.assertEqual(result_suffix("PENDING", due_at=due), " проверка 12:30 UTC")
         self.assertEqual(result_suffix("WIN", "bad"), "")
+
+    def test_outcome_explanations_are_human_readable(self) -> None:
+        self.assertEqual(outcome_hint("WIN"), "в сторону сигнала")
+        self.assertEqual(outcome_hint("loss"), "против сигнала")
+        self.assertEqual(outcome_hint("FLAT"), "нейтрально: слабое движение")
+        self.assertEqual(outcome_hint("PENDING"), "ждём закрытия TF")
+
+        legend = "\n".join(outcome_legend_lines())
+        self.assertIn("FLAT", legend)
+        self.assertIn("не победа и не поражение", legend)
 
 
 if __name__ == "__main__":

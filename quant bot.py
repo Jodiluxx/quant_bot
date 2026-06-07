@@ -28064,6 +28064,8 @@ from quant_bot.telegram_ui import (
     title_line as _tg_title_line_v787,
 )
 from quant_bot.signal_winrate import (
+    outcome_hint as _signal_wr_outcome_hint_v789,
+    outcome_legend_lines as _signal_wr_legend_lines_v789,
     result_suffix as _signal_wr_result_suffix_v788,
     signal_status_icon as _signal_wr_status_icon_v788,
     winrate_text as _signal_wr_text_v788,
@@ -28332,10 +28334,59 @@ def _signal_winrate_recent_line_v779(row):
     status = str(row.get("status") or "n/a").upper()
     due = _signal_winrate_parse_dt_v777(row.get("due_at")) if status == "PENDING" else None
     suffix = _signal_wr_result_suffix_v788(status, row.get("result_edge_pct"), due)
-    return f"{_signal_wr_status_icon_v788(status)} {_ui_code_v779(ticker)} {tf} {direction} → <b>{_ui_html(status)}</b>{_ui_html(suffix)} | вход {_ui_money_code_v779(row.get('entry_price'), row.get('ticker'))}"
+    hint = _signal_wr_outcome_hint_v789(status)
+    hint_part = f" · {_ui_html(hint)}" if hint else ""
+    return f"{_signal_wr_status_icon_v788(status)} {_ui_code_v779(ticker)} {tf} {direction} → <b>{_ui_html(status)}</b>{hint_part}{_ui_html(suffix)} | вход {_ui_money_code_v779(row.get('entry_price'), row.get('ticker'))}"
 
 
-BOT_VERSION_LABEL = "v7.88 Signal Win Rate Format Helper Extraction"
+def _signal_winrate_legend_lines_v789():
+    return [f"• {_ui_html(line)}" for line in _signal_wr_legend_lines_v789()]
+
+
+def format_signal_winrate_report_v777(chat_id, evaluate=True):
+    completed = _signal_winrate_evaluate_pending_v777(chat_id) if evaluate else []
+    stats = _signal_winrate_stats_v777(chat_id)
+    wr = "н/д" if stats["winrate"] is None else f"{stats['winrate']:.1f}%"
+    avg = _signal_winrate_edge_text_v779(stats.get("avg_edge"))
+    lines = [
+        "📈 <b>Win Rate: проверка сигналов</b>",
+        "Режим: <b>проверка направления без ордеров</b>",
+        _ui_rule_v779(),
+        "",
+        "📊 <b>Общая статистика</b>",
+        f"• Винрейт: <b>{wr}</b> {_signal_winrate_bar_v779(stats.get('winrate'))}",
+        f"• Результаты: 🟢 {stats['wins']} WIN | 🔴 {stats['losses']} LOSS | ⚪ {stats['flats']} FLAT",
+        f"• Матем. ожидание: {avg}",
+        f"• На проверке: <b>{stats['pending']}</b>",
+    ]
+    if completed:
+        lines += ["", "✅ <b>Новые проверки</b>"]
+        lines += [_signal_winrate_recent_line_v779(row) for row in completed[:4]]
+
+    ticker_rows = _signal_winrate_bucket_stats_v778(chat_id, "ticker", 4)
+    tf_rows = _signal_winrate_bucket_stats_v778(chat_id, "tf", 4)
+    direction_rows = _signal_winrate_bucket_stats_v778(chat_id, "direction", 3)
+    lines += ["", "🧮 <b>По активам</b>"]
+    lines += [_signal_winrate_bucket_line_v779(row) for row in ticker_rows] or ["• данных пока нет"]
+    lines += ["", "⏱ <b>По TF</b>"]
+    lines += [_signal_winrate_bucket_line_v779(row) for row in tf_rows] or ["• данных пока нет"]
+    lines += ["", "↕️ <b>По направлению</b>"]
+    lines += [_signal_winrate_bucket_line_v779(row) for row in direction_rows] or ["• данных пока нет"]
+
+    recent = _signal_winrate_rows_v777(chat_id, limit=5)
+    lines += ["", "📝 <b>Последние идеи</b>"]
+    lines += [_signal_winrate_recent_line_v779(row) for row in recent] or ["• LONG/SHORT сигналов пока нет"]
+    lines += [
+        "",
+        "ℹ️ <b>Как читать статусы</b>",
+        *_signal_winrate_legend_lines_v789(),
+        "",
+        "Маленькая выборка не доказывает преимущество стратегии.",
+    ]
+    return "\n".join(lines)
+
+
+BOT_VERSION_LABEL = "v7.89 Clear Win Rate Outcome Wording"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28450,6 +28501,7 @@ RUNTIME_LAYERS = [
     ("v7.86", "signal keyboard helpers extracted to quant_bot.telegram_ui"),
     ("v7.87", "Telegram text-card helpers extracted to quant_bot.telegram_ui"),
     ("v7.88", "signal Win Rate formatting helpers extracted to quant_bot.signal_winrate"),
+    ("v7.89", "clear Win Rate outcome wording for WIN, LOSS, FLAT and PENDING"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
