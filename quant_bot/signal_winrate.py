@@ -5,6 +5,7 @@ already-calculated values for Telegram cards.
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -96,6 +97,34 @@ def sample_quality_badge(counted: Any, min_samples: int = 30) -> str:
     if count < minimum * 3:
         return "рабочая"
     return "сильная"
+
+
+def winrate_uncertainty_text(wins: Any, losses: Any, z: float = 1.96) -> str:
+    """Return a Wilson interval for the true Win Rate behind observed W/L."""
+    try:
+        win_count = max(0, int(wins))
+    except (TypeError, ValueError):
+        win_count = 0
+    try:
+        loss_count = max(0, int(losses))
+    except (TypeError, ValueError):
+        loss_count = 0
+    counted = win_count + loss_count
+    if counted <= 0:
+        return "н/д: нет WIN/LOSS"
+
+    try:
+        z_value = max(0.1, float(z))
+    except (TypeError, ValueError):
+        z_value = 1.96
+    p = win_count / counted
+    z2 = z_value * z_value
+    denominator = 1.0 + z2 / counted
+    center = (p + z2 / (2.0 * counted)) / denominator
+    margin = z_value * math.sqrt((p * (1.0 - p) / counted) + (z2 / (4.0 * counted * counted))) / denominator
+    low = max(0.0, (center - margin) * 100.0)
+    high = min(100.0, (center + margin) * 100.0)
+    return f"{low:.1f}%–{high:.1f}% по {counted} WIN/LOSS"
 
 
 def _focus_bucket_label(raw: dict[str, Any]) -> str:

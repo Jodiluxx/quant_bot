@@ -28077,6 +28077,7 @@ from quant_bot.signal_winrate import (
     sample_quality_badge as _signal_wr_sample_quality_badge_v791,
     sample_quality_text as _signal_wr_sample_quality_text_v790,
     signal_status_icon as _signal_wr_status_icon_v788,
+    winrate_uncertainty_text as _signal_wr_uncertainty_text_v7100,
     winrate_text as _signal_wr_text_v788,
 )
 
@@ -28385,6 +28386,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
         "",
         "📊 <b>Общая статистика</b>",
         f"• Винрейт: <b>{wr}</b> {_signal_winrate_bar_v779(stats.get('winrate'))}",
+        f"• Диапазон WR: {_ui_html(_signal_wr_uncertainty_text_v7100(stats['wins'], stats['losses']))}",
         f"• Результаты: 🟢 {stats['wins']} WIN | 🔴 {stats['losses']} LOSS | ⚪ {stats['flats']} FLAT",
         f"• {_ui_html(_signal_wr_basis_counts_text_v792(stats['wins'], stats['losses'], stats['flats'], stats['pending']))}",
         f"• Надёжность: {_ui_html(_signal_wr_sample_quality_text_v790(stats.get('counted')))}",
@@ -28420,7 +28422,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.99 Win Rate Flat Focus Warning"
+BOT_VERSION_LABEL = "v7.100 Win Rate Uncertainty Band"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28546,6 +28548,7 @@ RUNTIME_LAYERS = [
     ("v7.97", "group-labeled Win Rate focus notes"),
     ("v7.98", "evidence labels for Win Rate focus notes"),
     ("v7.99", "FLAT/no-momentum warning for Win Rate focus"),
+    ("v7.100", "Wilson uncertainty band for signal Win Rate"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

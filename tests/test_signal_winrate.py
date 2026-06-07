@@ -18,6 +18,7 @@ from quant_bot.signal_winrate import (
     sample_quality_text,
     signal_status_icon,
     signed_percent_text,
+    winrate_uncertainty_text,
     winrate_text,
 )
 
@@ -66,6 +67,11 @@ class SignalWinrateHelperTests(unittest.TestCase):
         self.assertEqual(sample_quality_badge(18), "мало")
         self.assertEqual(sample_quality_badge(30), "рабочая")
         self.assertEqual(sample_quality_badge(120), "сильная")
+
+    def test_winrate_uncertainty_text_shows_wilson_interval(self) -> None:
+        self.assertEqual(winrate_uncertainty_text(0, 0), "н/д: нет WIN/LOSS")
+        self.assertEqual(winrate_uncertainty_text(6, 4), "31.3%–83.2% по 10 WIN/LOSS")
+        self.assertEqual(winrate_uncertainty_text("bad", 4), "0.0%–49.0% по 4 WIN/LOSS")
 
     def test_basis_counts_text_separates_wr_base_from_flat(self) -> None:
         self.assertEqual(

@@ -461,6 +461,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertIn("FLAT — движение слабое; это не победа и не поражение", text)
         self.assertIn("WR база: 3 WIN/LOSS", text)
         self.assertIn("FLAT отдельно: 0", text)
+        self.assertIn("Диапазон WR", text)
         self.assertIn("Надёжность", text)
         self.assertIn("очень мало данных", text)
         self.assertIn("Фокус анализа", text)
@@ -572,7 +573,7 @@ class TelegramUiPolishTests(unittest.TestCase):
         self.assertEqual(edge_text("bad"), "⚪ н/д")
 
     def test_single_message_navigation_helpers_are_registered(self) -> None:
-        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.99 Win Rate Flat Focus Warning")
+        self.assertEqual(self.bot.BOT_VERSION_LABEL, "v7.100 Win Rate Uncertainty Band")
         self.assertTrue(callable(self.bot.async_edit_message_text))
         self.assertTrue(callable(self.bot.send_or_edit))
         self.assertIn("async_edit_message_text", self.bot.ACTIVE_RUNTIME_FUNCTIONS)
