@@ -28066,6 +28066,7 @@ from quant_bot.telegram_ui import (
 from quant_bot.signal_winrate import (
     action_note_text as _signal_wr_action_note_text_v794,
     basis_counts_text as _signal_wr_basis_counts_text_v792,
+    focus_note_text as _signal_wr_focus_note_text_v796,
     outcome_hint as _signal_wr_outcome_hint_v789,
     outcome_legend_lines as _signal_wr_legend_lines_v789,
     outcome_streak_text as _signal_wr_streak_text_v793,
@@ -28360,6 +28361,13 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     avg = _signal_winrate_edge_text_v779(stats.get("avg_edge"))
     recent_evaluated = _signal_winrate_rows_v777(chat_id, limit=8, statuses={"WIN", "LOSS", "FLAT"})
     pending_rows = _signal_winrate_rows_v777(chat_id, limit=20, statuses={"PENDING"})
+    ticker_rows = _signal_winrate_bucket_stats_v778(chat_id, "ticker", 4)
+    tf_rows = _signal_winrate_bucket_stats_v778(chat_id, "tf", 4)
+    direction_rows = _signal_winrate_bucket_stats_v778(chat_id, "direction", 3)
+    focus_note = _signal_wr_focus_note_text_v796(
+        ticker_rows + tf_rows + direction_rows,
+        SIGNAL_WINRATE_MIN_BUCKET_SAMPLES_V778,
+    )
     lines = [
         "📈 <b>Win Rate: проверка сигналов</b>",
         "Режим: <b>проверка направления без ордеров</b>",
@@ -28375,14 +28383,12 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
         f"• Серия: {_ui_html(_signal_wr_streak_text_v793(recent_evaluated))}",
         f"• Что делать: {_ui_html(_signal_wr_action_note_text_v794(stats.get('counted'), stats.get('winrate'), recent_evaluated))}",
         f"• Проверка: {_ui_html(_signal_wr_pending_check_text_v795(pending_rows))}",
+        f"• Фокус анализа: {_ui_html(focus_note)}",
     ]
     if completed:
         lines += ["", "✅ <b>Новые проверки</b>"]
         lines += [_signal_winrate_recent_line_v779(row) for row in completed[:4]]
 
-    ticker_rows = _signal_winrate_bucket_stats_v778(chat_id, "ticker", 4)
-    tf_rows = _signal_winrate_bucket_stats_v778(chat_id, "tf", 4)
-    direction_rows = _signal_winrate_bucket_stats_v778(chat_id, "direction", 3)
     lines += ["", "🧮 <b>По активам</b>"]
     lines += [_signal_winrate_bucket_line_v779(row) for row in ticker_rows] or ["• данных пока нет"]
     lines += ["", "⏱ <b>По TF</b>"]
@@ -28403,7 +28409,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.95 Win Rate Pending Check ETA"
+BOT_VERSION_LABEL = "v7.96 Win Rate Focus Note"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28525,6 +28531,7 @@ RUNTIME_LAYERS = [
     ("v7.93", "recent Win Rate outcome sequence and current streak in reports"),
     ("v7.94", "risk-first action note for Win Rate reports"),
     ("v7.95", "show next pending Win Rate check time in menu and report"),
+    ("v7.96", "focus note for Win Rate group analysis"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from quant_bot.signal_winrate import (
     action_note_text,
     basis_counts_text,
+    focus_note_text,
     outcome_hint,
     outcome_legend_lines,
     outcome_streak_text,
@@ -114,6 +115,33 @@ class SignalWinrateHelperTests(unittest.TestCase):
             pending_check_text(rows, datetime(2026, 6, 7, 12, 20, tzinfo=timezone.utc)),
             "просрочены: 1; обнови Win Rate",
         )
+
+    def test_focus_note_text_highlights_best_and_weak_groups(self) -> None:
+        buckets = [
+            {"label": "BTCUSDT", "counted": 8, "winrate": 75.0, "avg_edge": 0.4},
+            {"label": "ETHUSDT", "counted": 7, "winrate": 42.8, "avg_edge": -0.2},
+            {"label": "SOLUSDT", "counted": 2, "winrate": 100.0, "avg_edge": 1.0},
+        ]
+
+        note = focus_note_text(buckets, min_samples=5)
+
+        self.assertIn("лучше: BTCUSDT WR 75.0% (8)", note)
+        self.assertIn("слабее: ETHUSDT WR 42.8% (7)", note)
+
+    def test_focus_note_text_waits_for_enough_group_data(self) -> None:
+        note = focus_note_text([
+            {"label": "BTCUSDT", "counted": 2, "winrate": 100.0},
+        ], min_samples=5)
+
+        self.assertIn("копим группы", note)
+        self.assertIn("минимум 5 WIN/LOSS", note)
+
+    def test_focus_note_text_can_show_single_weak_group(self) -> None:
+        note = focus_note_text([
+            {"label": "15м", "counted": 6, "winrate": 33.3, "avg_edge": -0.5},
+        ], min_samples=5)
+
+        self.assertIn("слабее: 15м WR 33.3% (6)", note)
 
 
 if __name__ == "__main__":

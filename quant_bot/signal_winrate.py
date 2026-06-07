@@ -98,6 +98,50 @@ def sample_quality_badge(counted: Any, min_samples: int = 30) -> str:
     return "сильная"
 
 
+def focus_note_text(buckets: Any, min_samples: int = 5) -> str:
+    """Return one short note about which Win Rate group deserves attention."""
+    minimum = max(1, int(min_samples or 5))
+    usable: list[dict[str, Any]] = []
+    for raw in list(buckets or []):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            counted = max(0, int(raw.get("counted") or 0))
+        except (TypeError, ValueError):
+            counted = 0
+        if counted < minimum:
+            continue
+        try:
+            winrate = float(raw.get("winrate"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            edge = float(raw.get("avg_edge"))
+        except (TypeError, ValueError):
+            edge = 0.0
+        usable.append({
+            "label": str(raw.get("label") or "n/a"),
+            "counted": counted,
+            "winrate": winrate,
+            "edge": edge,
+        })
+
+    if not usable:
+        return f"копим группы; для сравнения нужно минимум {minimum} WIN/LOSS в группе"
+
+    best = max(usable, key=lambda x: (x["winrate"], x["edge"], x["counted"]))
+    weak = min(usable, key=lambda x: (x["winrate"], x["edge"], -x["counted"]))
+
+    parts: list[str] = []
+    if best["winrate"] >= 60.0:
+        parts.append(f"лучше: {best['label']} WR {best['winrate']:.1f}% ({best['counted']})")
+    if weak["winrate"] <= 45.0 and (weak["label"] != best["label"] or not parts):
+        parts.append(f"слабее: {weak['label']} WR {weak['winrate']:.1f}% ({weak['counted']})")
+    if not parts:
+        return "яркого перекоса нет; продолжай копить статистику по группам"
+    return " | ".join(parts)
+
+
 def basis_counts_text(wins: Any, losses: Any, flats: Any, pending: Any | None = None) -> str:
     """Explain which outcomes are counted in WR and which are tracked aside."""
     def to_int(value: Any) -> int:
