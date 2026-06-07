@@ -98,6 +98,22 @@ def sample_quality_badge(counted: Any, min_samples: int = 30) -> str:
     return "сильная"
 
 
+def _focus_bucket_label(raw: dict[str, Any]) -> str:
+    """Return a clear group-aware label for a Win Rate bucket."""
+    label = str(raw.get("label") or "n/a")
+    group = str(raw.get("group") or "").lower()
+    prefix = {
+        "ticker": "актив",
+        "asset": "актив",
+        "tf": "TF",
+        "timeframe": "TF",
+        "direction": "направление",
+    }.get(group)
+    if not prefix:
+        return label
+    return f"{prefix} {label}"
+
+
 def focus_note_text(buckets: Any, min_samples: int = 5) -> str:
     """Return one short note about which Win Rate group deserves attention."""
     minimum = max(1, int(min_samples or 5))
@@ -120,7 +136,7 @@ def focus_note_text(buckets: Any, min_samples: int = 5) -> str:
         except (TypeError, ValueError):
             edge = 0.0
         usable.append({
-            "label": str(raw.get("label") or "n/a"),
+            "label": _focus_bucket_label(raw),
             "counted": counted,
             "winrate": winrate,
             "edge": edge,

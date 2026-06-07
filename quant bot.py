@@ -28364,8 +28364,13 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     ticker_rows = _signal_winrate_bucket_stats_v778(chat_id, "ticker", 4)
     tf_rows = _signal_winrate_bucket_stats_v778(chat_id, "tf", 4)
     direction_rows = _signal_winrate_bucket_stats_v778(chat_id, "direction", 3)
+    focus_rows = (
+        [dict(row, group="ticker") for row in ticker_rows]
+        + [dict(row, group="tf") for row in tf_rows]
+        + [dict(row, group="direction") for row in direction_rows]
+    )
     focus_note = _signal_wr_focus_note_text_v796(
-        ticker_rows + tf_rows + direction_rows,
+        focus_rows,
         SIGNAL_WINRATE_MIN_BUCKET_SAMPLES_V778,
     )
     lines = [
@@ -28409,7 +28414,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.96 Win Rate Focus Note"
+BOT_VERSION_LABEL = "v7.97 Group-Labeled Win Rate Focus"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28532,6 +28537,7 @@ RUNTIME_LAYERS = [
     ("v7.94", "risk-first action note for Win Rate reports"),
     ("v7.95", "show next pending Win Rate check time in menu and report"),
     ("v7.96", "focus note for Win Rate group analysis"),
+    ("v7.97", "group-labeled Win Rate focus notes"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {

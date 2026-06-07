@@ -128,6 +128,17 @@ class SignalWinrateHelperTests(unittest.TestCase):
         self.assertIn("лучше: BTCUSDT WR 75.0% (8)", note)
         self.assertIn("слабее: ETHUSDT WR 42.8% (7)", note)
 
+    def test_focus_note_text_labels_bucket_group_context(self) -> None:
+        buckets = [
+            {"group": "ticker", "label": "BTCUSDT", "counted": 8, "winrate": 75.0},
+            {"group": "tf", "label": "15м", "counted": 7, "winrate": 42.8},
+        ]
+
+        note = focus_note_text(buckets, min_samples=5)
+
+        self.assertIn("актив BTCUSDT", note)
+        self.assertIn("TF 15м", note)
+
     def test_focus_note_text_waits_for_enough_group_data(self) -> None:
         note = focus_note_text([
             {"label": "BTCUSDT", "counted": 2, "winrate": 100.0},
