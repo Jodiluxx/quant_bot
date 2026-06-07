@@ -61,6 +61,25 @@ def outcome_legend_lines() -> list[str]:
     ]
 
 
+def sample_quality_text(counted: Any, min_samples: int = 30) -> str:
+    """Explain whether a Win Rate sample is large enough to trust."""
+    try:
+        count = max(0, int(counted))
+    except (TypeError, ValueError):
+        count = 0
+    minimum = max(1, int(min_samples or 30))
+    missing = max(0, minimum - count)
+    if count == 0:
+        return f"данных нет: нужно минимум {minimum} проверенных LONG/SHORT"
+    if count < 10:
+        return f"очень мало данных: {count}/{minimum}; выводы нельзя делать"
+    if count < minimum:
+        return f"данных мало: {count}/{minimum}; нужно ещё {missing}"
+    if count < minimum * 3:
+        return f"выборка рабочая: {count}; выводы осторожные"
+    return f"выборка сильная: {count}; можно сравнивать группы"
+
+
 def result_suffix(status: Any, edge: Any = None, due_at: datetime | None = None) -> str:
     """Build the short suffix after a Win Rate row status."""
     text = str(status or "").upper()

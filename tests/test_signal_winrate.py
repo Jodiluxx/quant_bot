@@ -7,6 +7,7 @@ from quant_bot.signal_winrate import (
     outcome_hint,
     outcome_legend_lines,
     result_suffix,
+    sample_quality_text,
     signal_status_icon,
     signed_percent_text,
     winrate_text,
@@ -43,6 +44,13 @@ class SignalWinrateHelperTests(unittest.TestCase):
         legend = "\n".join(outcome_legend_lines())
         self.assertIn("FLAT", legend)
         self.assertIn("не победа и не поражение", legend)
+
+    def test_sample_quality_text_explains_small_and_large_samples(self) -> None:
+        self.assertIn("данных нет", sample_quality_text(0))
+        self.assertIn("очень мало данных", sample_quality_text(5))
+        self.assertIn("нужно ещё 12", sample_quality_text(18))
+        self.assertIn("выборка рабочая", sample_quality_text(30))
+        self.assertIn("выборка сильная", sample_quality_text(120))
 
 
 if __name__ == "__main__":

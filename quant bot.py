@@ -28067,6 +28067,7 @@ from quant_bot.signal_winrate import (
     outcome_hint as _signal_wr_outcome_hint_v789,
     outcome_legend_lines as _signal_wr_legend_lines_v789,
     result_suffix as _signal_wr_result_suffix_v788,
+    sample_quality_text as _signal_wr_sample_quality_text_v790,
     signal_status_icon as _signal_wr_status_icon_v788,
     winrate_text as _signal_wr_text_v788,
 )
@@ -28356,6 +28357,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
         "📊 <b>Общая статистика</b>",
         f"• Винрейт: <b>{wr}</b> {_signal_winrate_bar_v779(stats.get('winrate'))}",
         f"• Результаты: 🟢 {stats['wins']} WIN | 🔴 {stats['losses']} LOSS | ⚪ {stats['flats']} FLAT",
+        f"• Надёжность: {_ui_html(_signal_wr_sample_quality_text_v790(stats.get('counted')))}",
         f"• Матем. ожидание: {avg}",
         f"• На проверке: <b>{stats['pending']}</b>",
     ]
@@ -28386,7 +28388,7 @@ def format_signal_winrate_report_v777(chat_id, evaluate=True):
     return "\n".join(lines)
 
 
-BOT_VERSION_LABEL = "v7.89 Clear Win Rate Outcome Wording"
+BOT_VERSION_LABEL = "v7.90 Win Rate Sample Quality Wording"
 
 # Compatibility alias: older async layers used this name. Keep it explicit
 # so future edits fail less silently.
@@ -28502,6 +28504,7 @@ RUNTIME_LAYERS = [
     ("v7.87", "Telegram text-card helpers extracted to quant_bot.telegram_ui"),
     ("v7.88", "signal Win Rate formatting helpers extracted to quant_bot.signal_winrate"),
     ("v7.89", "clear Win Rate outcome wording for WIN, LOSS, FLAT and PENDING"),
+    ("v7.90", "clear Win Rate sample-size wording before trusting statistics"),
 ]
 
 ACTIVE_RUNTIME_FUNCTIONS = {
